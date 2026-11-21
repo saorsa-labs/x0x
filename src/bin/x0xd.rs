@@ -138,28 +138,15 @@ fn resolve_instance_startup(
     Ok((instance_name, connect_acl_path))
 }
 
-/// Stack size for every Tokio worker and blocking-pool thread.
-///
-/// The default is 2 MiB. On macOS arm64 a debug x0xd overflowed it when a
-/// group owner applied a TreeKEM join: the metadata-apply future chain plus
-/// `TreeKemGroup::add_member` signing with ML-DSA-65 (large stack arrays)
-/// needed more, and the daemon aborted. Release builds use less stack on
-/// this path, but the margin is not measured. 8 MiB matches the main-thread
-/// stack on macOS and Linux. It is a virtual reservation; pages are
-/// committed only when they are used.
-const DAEMON_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
-
 fn main() -> anyhow::Result<()> {
     if let Some(result) = x0x::upgrade::verification_probe::run_if_requested() {
         return result;
     }
     #[cfg(unix)]
     launcher::candidate_boot(env!("CARGO_PKG_VERSION"))?;
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(DAEMON_THREAD_STACK_BYTES)
-        .build()?
-        .block_on(run_daemon())
+    // #2083: the daemon runs on its own thread with an explicit stack, not
+    // on the main thread, whose stack the platform sets (1 MiB on Windows).
+    x0x::server::run_daemon_runtime(run_daemon)
 }
 
 async fn run_daemon() -> anyhow::Result<()> {

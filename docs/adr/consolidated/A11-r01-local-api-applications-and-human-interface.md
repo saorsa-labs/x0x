@@ -74,6 +74,8 @@ A remote public control service would simplify browser-only access but would cre
 
 The local API, embedded GUI, CLI registry and application integration exist. The agent-opened-view design remains on hold and has no route implementation. Scoped rider subscriptions require new work under [A04](A04-r01-agent-attachment-and-inbound-events.md).
 
+Daemon thread stack (21 Nov 2026, #2083; decided by the orchestrator session under A15, 21 Nov 2026). `x0xd` does not poll its top-level future on the process main thread, whose stack the platform sets (1 MiB on Windows, 8 MiB on Linux and macOS). `main` calls the additive library function `x0x::server::run_daemon_runtime`, which builds and polls that future on a new thread named `x0xd-main` with an explicit `DAEMON_THREAD_STACK_BYTES` (8 MiB) stack, on a multi-thread Tokio runtime whose worker and blocking-pool threads get the same size. A panic on that thread is returned to `main` as an error. Measured on a macOS arm64 debug test build: the `poll` frame of the `serve_with_options` future was 1,380,656 bytes before this change, so a debug `x0xd` on Windows overflowed at start; release frame sizes were not measured. The `serve_with_options` future that a caller holds is now small, because the startup future is built on the heap. Its `poll` frame is now 463,120 bytes on the same build, because the route table, the spawned tasks and the largest awaited futures are built in short frames of their own. A hermetic serve on a current-thread runtime then needs less than 1.5 MiB of stack; before, it needed more than 2 MiB. No route, wire format or stored format changes.
+
 ## Validation
 
 Check the token-class matrix for every route and event subscription. Verify that the CLI and GUI report the same underlying outcome.

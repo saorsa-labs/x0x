@@ -12,6 +12,8 @@ pub(crate) use auth::SESSION_TOKEN_TTL;
 pub use auth::{gui_idle_timeout, DEFAULT_GUI_IDLE_TIMEOUT_MINUTES, MAX_GUI_IDLE_TIMEOUT_MINUTES};
 pub mod config;
 mod crdt_subscriptions;
+mod daemon_runtime;
+pub use daemon_runtime::{run_daemon_runtime, DAEMON_MAIN_THREAD_NAME, DAEMON_THREAD_STACK_BYTES};
 mod data_read;
 mod delegations;
 mod delivery_gate;
@@ -129,7 +131,35 @@ pub use state::{
 };
 use state::{effective_self_update_enabled, AppState};
 
+/// Tear down what startup built after a startup error, and return the error.
+///
+/// #2083: a thin wrapper, so each of its many `.await` sites in
+/// [`serve_with_options`] holds a small future. The teardown future itself is
+/// built in [`boxed_future`]'s frame and lives on the heap.
 async fn finish_startup_error(
+    exec_service: &x0x::exec::ExecService,
+    agent: &x0x::Agent,
+    shutdown_notify: &watch::Sender<bool>,
+    forward_service: Option<&x0x::forward::ForwardService>,
+    socks: Option<&x0x::socks::SocksService>,
+    background_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    primary: anyhow::Error,
+) -> anyhow::Error {
+    boxed_future(|| {
+        finish_startup_error_inner(
+            exec_service,
+            agent,
+            shutdown_notify,
+            forward_service,
+            socks,
+            background_tasks,
+            primary,
+        )
+    })
+    .await
+}
+
+async fn finish_startup_error_inner(
     exec_service: &x0x::exec::ExecService,
     agent: &x0x::Agent,
     shutdown_notify: &watch::Sender<bool>,
@@ -511,6 +541,41 @@ async fn install_revocation_snapshot_authority(state: &Arc<AppState>) {
         .set_snapshot_authority(authority);
 }
 
+/// Spawn the future that `build` returns, building it in this function's
+/// stack frame and not in the caller's.
+///
+/// #2083: an unoptimised build gives every temporary of an `async fn` its own
+/// slot in the frame of that function's `poll`. A `tokio::spawn(async move
+/// { .. })` written inline in [`serve_with_options`] therefore kept a full
+/// copy of each spawned task's state in the startup frame. Here the caller
+/// keeps only the closure (its captures), and the task state lives in this
+/// short frame, which has returned before the next spawn.
+#[inline(never)]
+#[track_caller]
+fn spawn_built<F, Fut>(build: F) -> tokio::task::JoinHandle<Fut::Output>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    tokio::spawn(build())
+}
+
+/// Build the future that `build` returns in this function's stack frame and
+/// move it to the heap.
+///
+/// #2083: in an unoptimised build, `.await` on a call keeps copies of the
+/// callee's whole future in the frame of the caller's `poll`. Awaiting
+/// `boxed_future(|| callee(..))` keeps only the closure and a `Box` there.
+#[inline(never)]
+fn boxed_future<F, Fut>(build: F) -> std::pin::Pin<Box<Fut>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    Box::pin(build())
+}
+
 /// Start the x0x server in-process with explicit runtime options.
 ///
 /// All synchronous, fallible startup (data-dir create, identity load/gen,
@@ -518,7 +583,18 @@ async fn install_revocation_snapshot_authority(state: &Arc<AppState>) {
 /// here and surfaces as `Err` BEFORE any long-lived task is spawned. On success
 /// a single supervisor task is spawned and a [`ServerHandle`] is returned with
 /// the bound address already readable.
+///
+/// The returned future is small: the startup future is built on the heap
+/// (#2083), so a caller that awaits this on a small stack, such as a
+/// test thread, does not hold its state in its own frame.
 pub async fn serve_with_options(
+    config: DaemonConfig,
+    options: ServeOptions,
+) -> anyhow::Result<ServerHandle> {
+    boxed_future(|| serve_with_options_inner(config, options)).await
+}
+
+async fn serve_with_options_inner(
     config: DaemonConfig,
     options: ServeOptions,
 ) -> anyhow::Result<ServerHandle> {
@@ -774,9 +850,11 @@ pub async fn serve_with_options(
             treekem_dir.display()
         );
     }
-    recover_treekem_named_journals(&named_groups_path, &home_suite_groups_path, &treekem_dir)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
+    boxed_future(|| {
+        recover_treekem_named_journals(&named_groups_path, &home_suite_groups_path, &treekem_dir)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
     // Review r2 (#451): replay leftover Home-Suite sidecar journals before
     // the merged load, so a crash inside the atomic TreeKEM persist
     // transaction heals before the roster is read.
@@ -838,7 +916,9 @@ pub async fn serve_with_options(
     // any fallible step must run typed Agent shutdown on the error path so a
     // failure does not leak the agent/network/tasks or hide socket-release
     // failure from the startup error.
-    let agent = builder.build().await.context("failed to create agent")?;
+    let agent = boxed_future(|| builder.build())
+        .await
+        .context("failed to create agent")?;
 
     tracing::info!("Agent ID: {}", agent.agent_id());
     tracing::info!("Machine ID: {}", agent.machine_id());
@@ -880,7 +960,7 @@ pub async fn serve_with_options(
     if let Some(window) = config.zero_peer_restart_secs {
         let watchdog_agent = Arc::clone(&agent);
         let watchdog_shutdown = shutdown_tx.clone();
-        startup_tasks.push(tokio::spawn(async move {
+        startup_tasks.push(spawn_built(move || async move {
             let window = std::time::Duration::from_secs(window.max(60));
             let mut zero_since: Option<std::time::Instant> = None;
             tokio::time::sleep(window).await;
@@ -1373,7 +1453,7 @@ pub async fn serve_with_options(
     // containment from disk before any listener, worker or route can apply
     // or seal a commit. A recorded attestation conflict then bounds the
     // first commit after a restart.
-    routes::named_groups::restore_group_recovery_containment(&state).await;
+    boxed_future(|| routes::named_groups::restore_group_recovery_containment(&state)).await;
 
     // Startup recovery (engineer ruling 23 Oct 2026): a receipt-less
     // upgrade-flush.json or an upgrade-flush-rollback.json whose owning
@@ -1415,7 +1495,7 @@ pub async fn serve_with_options(
     if state.forward_service.is_some() {
         let restore_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut next = tokio::time::Instant::now();
             loop {
                 tokio::select! {
@@ -1458,7 +1538,7 @@ pub async fn serve_with_options(
             identity_dir.clone().or_else(crate::storage::x0x_home_dir),
         );
         let mut health_tracker = upgrade_health_commit::Tracker::default();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                 routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
             ));
@@ -1523,7 +1603,7 @@ pub async fn serve_with_options(
         let probe_agent = Arc::clone(&state.agent);
         let probe_snapshot = Arc::clone(&state.health_snapshot);
         let shutdown_rx = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             health_verdict::run_delivery_probe(probe_agent, probe_snapshot, shutdown_rx).await;
         }));
     }
@@ -1664,7 +1744,7 @@ pub async fn serve_with_options(
         routes::DaemonView::attach(sync, &state).await;
         let service = Arc::clone(sync);
         let shutdown_rx = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             service.spawn_periodic(shutdown_rx).await;
         }));
     }
@@ -1733,7 +1813,7 @@ pub async fn serve_with_options(
         )
         .await);
     }
-    if let Err(error) = load_predecessor_relay_outbox(&state).await {
+    if let Err(error) = boxed_future(|| load_predecessor_relay_outbox(&state)).await {
         let primary = anyhow::anyhow!("ADR 0028 startup: {error}");
         return Err(finish_startup_error(
             &exec_service,
@@ -1800,7 +1880,7 @@ pub async fn serve_with_options(
 
     routes::named_groups::refresh_group_rosters_for_gossip(&state).await;
     let roster_refresh_state = Arc::clone(&state);
-    bg_tasks.push(tokio::spawn(async move {
+    bg_tasks.push(spawn_built(move || async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             routes::named_groups::refresh_group_rosters_for_gossip(&roster_refresh_state).await;
@@ -1815,8 +1895,10 @@ pub async fn serve_with_options(
     // #824: creating a FRESH Home with no canonical pointer known is deferred
     // to a background task that first waits for owner sync, so the API
     // stays up while it waits.
-    if let Some(task) =
-        routes::home::provision_home_at_startup(&state, routes::home::HOME_POINTER_SYNC_WAIT).await
+    if let Some(task) = boxed_future(|| {
+        routes::home::provision_home_at_startup(&state, routes::home::HOME_POINTER_SYNC_WAIT)
+    })
+    .await
     {
         bg_tasks.push(task);
     }
@@ -1832,7 +1914,10 @@ pub async fn serve_with_options(
             // held, so the task-ingest drain can take its documented
             // `TaskList` → `named_groups` order.
             let mut cleared_quarantine = std::collections::BTreeSet::new();
-            replay_pending_causal_approvals(&state, &group_id, &mut cleared_quarantine).await;
+            boxed_future(|| {
+                replay_pending_causal_approvals(&state, &group_id, &mut cleared_quarantine)
+            })
+            .await;
             routes::named_groups::resume_task_ingest_after_durable_clear(
                 &state,
                 &cleared_quarantine,
@@ -1857,7 +1942,7 @@ pub async fn serve_with_options(
     let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(600);
     if republish_interval_secs > 0 {
         let state_for_republish = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut shutdown = state_for_republish.shutdown_notify.subscribe();
             loop {
@@ -1925,11 +2010,11 @@ pub async fn serve_with_options(
     // network needed) behind an unreachable bootstrap peer's full dial
     // schedule (~70s of "store not found").
     let crdt_rehydrate_state = Arc::clone(&state);
-    bg_tasks.push(tokio::spawn(async move {
+    bg_tasks.push(spawn_built(move || async move {
         crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
     }));
     let join_rekey_state = Arc::clone(&state);
-    bg_tasks.push(tokio::spawn(async move {
+    bg_tasks.push(spawn_built(move || async move {
         match join_agent.join_network().await {
             Ok(()) => {
                 tracing::info!("Network joined");
@@ -1957,7 +2042,7 @@ pub async fn serve_with_options(
     // records prevent cleanup. A validated legacy-only handoff can permit it.
     // Never delete recovery material merely to make configured startup succeed.
     let upgrade_record_root = config.data_dir.clone();
-    bg_tasks.push(tokio::spawn(async move {
+    bg_tasks.push(spawn_built(move || async move {
         let removed = x0x::history::run_blocking(move || {
             let exe = x0x::upgrade::apply::current_binary_path().ok()?;
             let dir = exe.parent()?.to_path_buf();
@@ -1986,7 +2071,7 @@ pub async fn serve_with_options(
         let startup_identity_dir = identity_dir.clone();
         #[cfg(unix)]
         let startup_machine_id = *state.agent.machine_id().as_bytes();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let data_dir = startup_check_config.data_dir.clone();
             #[cfg(unix)]
             let staging = match async {
@@ -2097,7 +2182,7 @@ pub async fn serve_with_options(
         let update_config = config.update.clone();
         let data_dir_for_broadcast = config.data_dir.clone();
         let self_published_for_broadcast = Arc::clone(&self_published_release_manifests);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             broadcast_current_manifest(
                 &agent_for_broadcast,
                 &update_config.repo,
@@ -2138,7 +2223,7 @@ pub async fn serve_with_options(
         let rendezvous_agent = Arc::clone(&state.agent);
         let validity_ms = config.rendezvous_validity_ms;
         let mut shutdown_rx = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let interval_secs = (validity_ms / 2).max(60_000) / 1000;
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
             ticker.tick().await;
@@ -2159,7 +2244,7 @@ pub async fn serve_with_options(
     {
         let diag_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.tick().await;
             loop {
@@ -2198,7 +2283,7 @@ pub async fn serve_with_options(
 
     {
         let file_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             if let Err(e) = crate::w3h_inline::fs::create_dir_all(&file_state.transfers_dir).await {
                 tracing::error!("Failed to create transfers dir: {e}");
             }
@@ -2222,7 +2307,7 @@ pub async fn serve_with_options(
 
     {
         let join_result_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut rx = join_result_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -2257,7 +2342,7 @@ pub async fn serve_with_options(
 
     {
         let welcome_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut rx = welcome_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -2283,7 +2368,7 @@ pub async fn serve_with_options(
     // stay free to receive their fetches and chunks.
     {
         let control_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut rx = control_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -2308,7 +2393,7 @@ pub async fn serve_with_options(
 
     {
         let catchup_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut rx = catchup_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -2329,7 +2414,7 @@ pub async fn serve_with_options(
 
     {
         let bootstrap_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut rx = bootstrap_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -2390,7 +2475,7 @@ pub async fn serve_with_options(
     // journal commit and the publish.
     {
         let rekey_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let shielded = Arc::clone(&rekey_state);
             let _ = rekey_state
                 .run_shielded(async move {
@@ -2409,7 +2494,7 @@ pub async fn serve_with_options(
 
     {
         let republish_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             routes::named_groups::republish_outstanding_keyless_seats(&republish_state).await;
         }));
     }
@@ -2424,7 +2509,7 @@ pub async fn serve_with_options(
 
     {
         let public_dm_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             while let Some(typed) = group_public_dm_rx.recv().await {
                 let Some(payload) = typed.payload.strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
                 else {
@@ -2464,7 +2549,7 @@ pub async fn serve_with_options(
     {
         let relay_state = Arc::clone(&state);
         let local_agent_hex = hex::encode(relay_state.agent.agent_id().as_bytes());
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             while let Some(typed) = predecessor_relay_dm_rx.recv().await {
                 let apply_state = Arc::clone(&relay_state);
                 let local_agent_hex = local_agent_hex.clone();
@@ -2487,7 +2572,7 @@ pub async fn serve_with_options(
 
     {
         let kv_delta_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             while let Some(typed) = kv_store_delta_dm_rx.recv().await {
                 if !typed.verified {
                     continue;
@@ -2524,7 +2609,7 @@ pub async fn serve_with_options(
 
     {
         let relay_step_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut shutdown_rx = relay_step_state.shutdown_notify.subscribe();
             loop {
                 let now_ms = now_millis_u64();
@@ -2555,7 +2640,7 @@ pub async fn serve_with_options(
 
     {
         let offer_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut shutdown_rx = offer_state.shutdown_notify.subscribe();
             let mut adverts = offer_state
                 .agent
@@ -2597,7 +2682,7 @@ pub async fn serve_with_options(
         let acks = state.agent.dm_inflight_acks();
         let mut orphan_acks = acks.subscribe_orphan_acks();
         let ack_tx = wake_tx.clone();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             loop {
                 match orphan_acks.recv().await {
                     Ok(ack) => {
@@ -2611,7 +2696,7 @@ pub async fn serve_with_options(
             }
         }));
         let mut adverts = state.agent.capability_store().subscribe_durable_adverts();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             loop {
                 match adverts.recv().await {
                     Ok(recipient) => {
@@ -2629,7 +2714,7 @@ pub async fn serve_with_options(
             }
         }));
         let send_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut shutdown_rx = send_state.shutdown_notify.subscribe();
             let transport = AgentDirectSendTransport(send_state.as_ref());
             let ledger = |request_id: &[u8; 16]| LedgerReceipt::of(&acks, request_id);
@@ -2649,7 +2734,7 @@ pub async fn serve_with_options(
 
     {
         let bootstrap_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
                 let apply_state = Arc::clone(&bootstrap_state);
                 let admitted = bootstrap_state
@@ -2666,7 +2751,7 @@ pub async fn serve_with_options(
 
     {
         let grant_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             while let Some(typed) = share_grant_dm_rx.recv().await {
                 let _ = dispatch_share_grant_typed(&grant_state, typed).await;
             }
@@ -2675,7 +2760,7 @@ pub async fn serve_with_options(
 
     {
         let push_agent = Arc::clone(&agent);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let limiter = tokio::sync::Mutex::new(x0x::revocation_push::PushRateLimiter::new());
             while let Some(typed) = revocation_push_dm_rx.recv().await {
                 let _ = push_agent
@@ -2691,7 +2776,7 @@ pub async fn serve_with_options(
 
     {
         let gui_show_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             while let Some(typed) = gui_show_dm_rx.recv().await {
                 crate::server::gui_show_remote::handle_gui_show_typed(&gui_show_state, typed).await;
             }
@@ -2701,7 +2786,7 @@ pub async fn serve_with_options(
     if let Some(grant_outbox) = agent.share_grant_outbox() {
         let grant_agent = Arc::clone(&agent);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut adverts = grant_agent
                 .capability_store()
                 .subscribe_obligation_adverts();
@@ -2730,7 +2815,7 @@ pub async fn serve_with_options(
             let mut events = network.subscribe();
             let nudge_agent = Arc::clone(&agent);
             let mut shutdown_rx = state.shutdown_notify.subscribe();
-            bg_tasks.push(tokio::spawn(async move {
+            bg_tasks.push(spawn_built(move || async move {
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
@@ -2750,7 +2835,7 @@ pub async fn serve_with_options(
 
     {
         let bootstrap_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
+        bg_tasks.push(spawn_built(move || async move {
             let mut shutdown_rx = bootstrap_state.shutdown_notify.subscribe();
             loop {
                 tokio::select! {
@@ -2775,7 +2860,224 @@ pub async fn serve_with_options(
         }));
     }
 
-    let app = Router::new()
+    let app = build_api_router(&state);
+
+    // Lifecycle: a CancellationToken drives library-initiated shutdown
+    // (ServerHandle::shutdown / Drop). The mpsc `/shutdown` HTTP path still
+    // works — the supervisor selects on both. Ctrl-C is deliberately NOT
+    // handled here: a library must not steal the host's signal. The daemon
+    // binary installs its own Ctrl-C handler around `ServerHandle::wait`.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let supervisor_cancel = cancel.clone();
+    #[cfg(test)]
+    let test_state = Arc::downgrade(&state);
+    #[cfg(test)]
+    let test_router = app.clone();
+
+    let task = spawn_built(move || async move {
+        // #645: the single-instance guards live HERE, in the supervisor
+        // task — not in the ServerHandle. Dropping the handle cancels this
+        // task, but the locks are only released once it has finished
+        // draining, so an embedded caller that drops and immediately
+        // re-serves the same data/identity dirs is refused rather than
+        // overlapping two servers on them.
+        let _instance_lock = instance_lock;
+        let _identity_lock = identity_lock;
+        let mut server_shutdown_rx = state.shutdown_notify.subscribe();
+        let mut server = spawn_built(move || async move {
+            // Before the accept loop. A `/health` success cannot precede this
+            // line, so a child log can show whether SIGTERM was registered first.
+            record_startup_diagnostic("http server accepting");
+            // Served with connect info so handlers can read the real peer
+            // address (`ConnectInfo<SocketAddr>`) — the /health detail gate
+            // decides loopback from it (David's 20 Oct 2026 ruling on
+            // #1480 Finding 3). Proxy headers are never consulted.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = server_shutdown_rx.changed().await;
+            })
+            .await
+        });
+
+        let mut server_result: Option<anyhow::Result<()>> = None;
+        tokio::select! {
+            _ = supervisor_cancel.cancelled() => {
+                tracing::info!("Received shutdown request (cancellation)");
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::info!("Received API shutdown request");
+            }
+            res = &mut server => {
+                server_result = Some(match res {
+                    Ok(Ok(())) => {
+                        tracing::info!("API server task ended on its own");
+                        Ok(())
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("API server exited with error: {e}");
+                        Err(anyhow::Error::new(e).context("API server error"))
+                    }
+                    Err(e) => {
+                        tracing::error!("API server task failed: {e}");
+                        Err(anyhow::Error::new(e).context("API server task failed"))
+                    }
+                });
+            }
+        }
+
+        let _ = state.shutdown_notify.send(true);
+
+        let (server_result, _http_drained) = match server_result {
+            Some(res) => (res, true),
+            None => drain_http_server(server).await,
+        };
+
+        // Fix C (Issue #110 Phase 2 + 2b): tear down the server-owned tasks, the
+        // ExecService loops, the Agent listeners, and the QUIC node so that when
+        // this supervisor returns, the HTTP/SSE server, the server-owned
+        // background tasks, the ExecService loops, the Agent-internal listeners,
+        // the gossip runtime, and the QUIC NetworkNode are all stopped/closed.
+        //
+        // 0. `ExecService::shutdown()` first (issue #116): stop the exec inbound,
+        //    peer-lifecycle, and session-idle loops while the Agent transport is
+        //    still alive, so in-flight sessions can cancel cleanly before the
+        //    network goes away.
+        state.exec_service.shutdown().await;
+        if let Some(forwarder) = &state.forward_service {
+            // Drain add/remove/restore before cancelling listeners. A
+            // transaction still inside bind publishes its accept loop
+            // before it returns; the release below then waits for that
+            // socket to drop. A bind that resumes after this cancel is
+            // refused.
+            forwarder.shutdown_and_release().await;
+        }
+        if let Some(socks) = &state.socks_service {
+            socks.shutdown_and_wait().await;
+        }
+        // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
+        //    Agent's shutdown token and close its tracked-task registry NOW,
+        //    BEFORE draining the server bg_tasks. A still-bootstrapping
+        //    `join_network` is one of those bg_tasks; cancelling first makes its
+        //    in-flight `start_identity_heartbeat`/`start_discovery_cache_reaper`/
+        //    presence-start/`start_capability_advert_service`/delayed-reannounce
+        //    no-op (each checks `is_cancelled()` under its handle lock), so it
+        //    cannot leak a dedicated-handle service past Agent shutdown.
+        state.agent.begin_shutdown();
+        // 2. Grace-await then abort every server background task, INCLUDING
+        //    join_network. Tasks tracked in the AppState handle maps (metadata /
+        //    public-message / directory shard listeners spawned at startup AND
+        //    by request handlers) are included so nothing leaks. The grace
+        //    window is a single bounded 2s budget across all tasks (not 2s each)
+        //    so shutdown stays prompt regardless of task count; any task still
+        //    running after the window is aborted. A cancelled/aborted task
+        //    returns a `JoinError`; that is expected, never unwrap it. Draining
+        //    here (after begin_shutdown, before Agent shutdown) guarantees
+        //    join_network has fully stopped before the Agent stops are run.
+        let _server_tasks_finished = drain_server_tasks(&state, bg_tasks).await;
+        let backfill_release_incomplete = ws::backfill_release_incomplete(&state.ws_outbound_stats);
+        // 3. Now that join_network is stopped (and the token cancelled so any
+        //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
+        //    reaper / DM-inbox / advert / presence, drain the Agent's own
+        //    tracked listener tasks, shut down the gossip runtime, and use the
+        //    typed QUIC shutdown path. A successful result proves ant-quic
+        //    released its socket; a failure is returned only after the rest of
+        //    this supervisor cleanup completes.
+        // #1288: a backfill still inside `Store::query` holds the connection
+        // mutex. This await drains the history writer. The writer's join is
+        // the drain grace, not an open-ended thread join: a write waiting on
+        // that mutex stays on the writer thread, and the await returns.
+        let agent_shutdown_result = state.agent.try_shutdown().await;
+        // A writer blocked in SQLite past the drain grace is not a finished
+        // shutdown, even when no WebSocket backfill is outstanding. The
+        // thread stays in custody and still holds `history.db`. Read the
+        // flag before dropping `state`: the agent's history handle shares it
+        // with the writer that just timed out.
+        let writer_shutdown_incomplete = state
+            .agent
+            .history()
+            .is_some_and(|history| history.writer_shutdown_incomplete());
+
+        let _ = crate::w3h_inline::fs::remove_file(&port_file).await;
+
+        // #661 r2: drop the captured AppState NOW, as the last statement,
+        // instead of leaving it to generator teardown. `state` holds the
+        // Agent, whose `history_handle` (and the DM-inbox clones) keep an
+        // `Arc<Store>` — the exclusive SQLite connection — open. As a task
+        // *capture*, `state` would otherwise drop only when the runtime
+        // tears the completed generator down, AFTER this body's locals —
+        // including the instance locks above — have already released. A
+        // restart that wins the lock in that gap would then fail its
+        // `history.db` open. With the drain having joined/aborted every
+        // server and agent task above, this is typically the last
+        // `Arc<AppState>`, so the Agent (and its exclusive handles) is
+        // destroyed here, deterministically BEFORE the locks drop. If some
+        // leaked holder outlives the drain, this degrades to the previous
+        // behaviour rather than anything worse.
+        std::mem::drop(state);
+        tracing::info!("Shutdown complete");
+        let server_result = if writer_shutdown_incomplete {
+            let writer = anyhow::anyhow!(
+                "history writer still owns the store after the shutdown grace; the write was left running"
+            );
+            Err(match server_result {
+                Ok(()) => writer,
+                Err(server) => server.context(format!("history writer also remained: {writer}")),
+            })
+        } else {
+            server_result
+        };
+        let server_result = if backfill_release_incomplete {
+            let backfill = anyhow::anyhow!(
+                "websocket history backfill still owns the store after the shutdown grace; the read was left running"
+            );
+            Err(match server_result {
+                Ok(()) => backfill,
+                Err(server) => server.context(format!(
+                    "websocket history backfill also remained: {backfill}"
+                )),
+            })
+        } else {
+            server_result
+        };
+        let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
+        #[cfg(any(unix, windows))]
+        if let Some(owner) = &upgrade_flush {
+            owner
+                .finish(
+                    &result,
+                    _server_tasks_finished && _http_drained,
+                    &supervisor_cancel,
+                )
+                .await;
+        }
+        result
+    });
+
+    Ok(ServerHandle {
+        local_addr: actual_api_addr,
+        cancel,
+        acl_admin,
+        task: Some(task),
+        #[cfg(test)]
+        test_state,
+        #[cfg(test)]
+        test_router,
+    })
+}
+
+/// The daemon API router: every route, the body limit, CORS and the auth
+/// layer.
+///
+/// #2083: built out of line so the temporaries of the route chain (one
+/// `MethodRouter` and handler value per route, each with its own slot in an
+/// unoptimised build) live in this short frame and not in the frame of the
+/// [`serve_with_options`] future's `poll`.
+#[inline(never)]
+fn build_api_router(state: &Arc<AppState>) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/agent", get(agent_info))
@@ -3113,215 +3415,10 @@ pub async fn serve_with_options(
                 .allow_headers(AllowHeaders::any())
         })
         .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&state),
+            Arc::clone(state),
             auth::auth_middleware,
         ))
-        .with_state(Arc::clone(&state));
-
-    // Lifecycle: a CancellationToken drives library-initiated shutdown
-    // (ServerHandle::shutdown / Drop). The mpsc `/shutdown` HTTP path still
-    // works — the supervisor selects on both. Ctrl-C is deliberately NOT
-    // handled here: a library must not steal the host's signal. The daemon
-    // binary installs its own Ctrl-C handler around `ServerHandle::wait`.
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let supervisor_cancel = cancel.clone();
-    #[cfg(test)]
-    let test_state = Arc::downgrade(&state);
-    #[cfg(test)]
-    let test_router = app.clone();
-
-    let task = tokio::spawn(async move {
-        // #645: the single-instance guards live HERE, in the supervisor
-        // task — not in the ServerHandle. Dropping the handle cancels this
-        // task, but the locks are only released once it has finished
-        // draining, so an embedded caller that drops and immediately
-        // re-serves the same data/identity dirs is refused rather than
-        // overlapping two servers on them.
-        let _instance_lock = instance_lock;
-        let _identity_lock = identity_lock;
-        let mut server_shutdown_rx = state.shutdown_notify.subscribe();
-        let mut server = tokio::spawn(async move {
-            // Before the accept loop. A `/health` success cannot precede this
-            // line, so a child log can show whether SIGTERM was registered first.
-            record_startup_diagnostic("http server accepting");
-            // Served with connect info so handlers can read the real peer
-            // address (`ConnectInfo<SocketAddr>`) — the /health detail gate
-            // decides loopback from it (David's 20 Oct 2026 ruling on
-            // #1480 Finding 3). Proxy headers are never consulted.
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = server_shutdown_rx.changed().await;
-            })
-            .await
-        });
-
-        let mut server_result: Option<anyhow::Result<()>> = None;
-        tokio::select! {
-            _ = supervisor_cancel.cancelled() => {
-                tracing::info!("Received shutdown request (cancellation)");
-            }
-            _ = shutdown_rx.recv() => {
-                tracing::info!("Received API shutdown request");
-            }
-            res = &mut server => {
-                server_result = Some(match res {
-                    Ok(Ok(())) => {
-                        tracing::info!("API server task ended on its own");
-                        Ok(())
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!("API server exited with error: {e}");
-                        Err(anyhow::Error::new(e).context("API server error"))
-                    }
-                    Err(e) => {
-                        tracing::error!("API server task failed: {e}");
-                        Err(anyhow::Error::new(e).context("API server task failed"))
-                    }
-                });
-            }
-        }
-
-        let _ = state.shutdown_notify.send(true);
-
-        let (server_result, _http_drained) = match server_result {
-            Some(res) => (res, true),
-            None => drain_http_server(server).await,
-        };
-
-        // Fix C (Issue #110 Phase 2 + 2b): tear down the server-owned tasks, the
-        // ExecService loops, the Agent listeners, and the QUIC node so that when
-        // this supervisor returns, the HTTP/SSE server, the server-owned
-        // background tasks, the ExecService loops, the Agent-internal listeners,
-        // the gossip runtime, and the QUIC NetworkNode are all stopped/closed.
-        //
-        // 0. `ExecService::shutdown()` first (issue #116): stop the exec inbound,
-        //    peer-lifecycle, and session-idle loops while the Agent transport is
-        //    still alive, so in-flight sessions can cancel cleanly before the
-        //    network goes away.
-        state.exec_service.shutdown().await;
-        if let Some(forwarder) = &state.forward_service {
-            // Drain add/remove/restore before cancelling listeners. A
-            // transaction still inside bind publishes its accept loop
-            // before it returns; the release below then waits for that
-            // socket to drop. A bind that resumes after this cancel is
-            // refused.
-            forwarder.shutdown_and_release().await;
-        }
-        if let Some(socks) = &state.socks_service {
-            socks.shutdown_and_wait().await;
-        }
-        // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
-        //    Agent's shutdown token and close its tracked-task registry NOW,
-        //    BEFORE draining the server bg_tasks. A still-bootstrapping
-        //    `join_network` is one of those bg_tasks; cancelling first makes its
-        //    in-flight `start_identity_heartbeat`/`start_discovery_cache_reaper`/
-        //    presence-start/`start_capability_advert_service`/delayed-reannounce
-        //    no-op (each checks `is_cancelled()` under its handle lock), so it
-        //    cannot leak a dedicated-handle service past Agent shutdown.
-        state.agent.begin_shutdown();
-        // 2. Grace-await then abort every server background task, INCLUDING
-        //    join_network. Tasks tracked in the AppState handle maps (metadata /
-        //    public-message / directory shard listeners spawned at startup AND
-        //    by request handlers) are included so nothing leaks. The grace
-        //    window is a single bounded 2s budget across all tasks (not 2s each)
-        //    so shutdown stays prompt regardless of task count; any task still
-        //    running after the window is aborted. A cancelled/aborted task
-        //    returns a `JoinError`; that is expected, never unwrap it. Draining
-        //    here (after begin_shutdown, before Agent shutdown) guarantees
-        //    join_network has fully stopped before the Agent stops are run.
-        let _server_tasks_finished = drain_server_tasks(&state, bg_tasks).await;
-        let backfill_release_incomplete = ws::backfill_release_incomplete(&state.ws_outbound_stats);
-        // 3. Now that join_network is stopped (and the token cancelled so any
-        //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
-        //    reaper / DM-inbox / advert / presence, drain the Agent's own
-        //    tracked listener tasks, shut down the gossip runtime, and use the
-        //    typed QUIC shutdown path. A successful result proves ant-quic
-        //    released its socket; a failure is returned only after the rest of
-        //    this supervisor cleanup completes.
-        // #1288: a backfill still inside `Store::query` holds the connection
-        // mutex. This await drains the history writer. The writer's join is
-        // the drain grace, not an open-ended thread join: a write waiting on
-        // that mutex stays on the writer thread, and the await returns.
-        let agent_shutdown_result = state.agent.try_shutdown().await;
-        // A writer blocked in SQLite past the drain grace is not a finished
-        // shutdown, even when no WebSocket backfill is outstanding. The
-        // thread stays in custody and still holds `history.db`. Read the
-        // flag before dropping `state`: the agent's history handle shares it
-        // with the writer that just timed out.
-        let writer_shutdown_incomplete = state
-            .agent
-            .history()
-            .is_some_and(|history| history.writer_shutdown_incomplete());
-
-        let _ = crate::w3h_inline::fs::remove_file(&port_file).await;
-
-        // #661 r2: drop the captured AppState NOW, as the last statement,
-        // instead of leaving it to generator teardown. `state` holds the
-        // Agent, whose `history_handle` (and the DM-inbox clones) keep an
-        // `Arc<Store>` — the exclusive SQLite connection — open. As a task
-        // *capture*, `state` would otherwise drop only when the runtime
-        // tears the completed generator down, AFTER this body's locals —
-        // including the instance locks above — have already released. A
-        // restart that wins the lock in that gap would then fail its
-        // `history.db` open. With the drain having joined/aborted every
-        // server and agent task above, this is typically the last
-        // `Arc<AppState>`, so the Agent (and its exclusive handles) is
-        // destroyed here, deterministically BEFORE the locks drop. If some
-        // leaked holder outlives the drain, this degrades to the previous
-        // behaviour rather than anything worse.
-        std::mem::drop(state);
-        tracing::info!("Shutdown complete");
-        let server_result = if writer_shutdown_incomplete {
-            let writer = anyhow::anyhow!(
-                "history writer still owns the store after the shutdown grace; the write was left running"
-            );
-            Err(match server_result {
-                Ok(()) => writer,
-                Err(server) => server.context(format!("history writer also remained: {writer}")),
-            })
-        } else {
-            server_result
-        };
-        let server_result = if backfill_release_incomplete {
-            let backfill = anyhow::anyhow!(
-                "websocket history backfill still owns the store after the shutdown grace; the read was left running"
-            );
-            Err(match server_result {
-                Ok(()) => backfill,
-                Err(server) => server.context(format!(
-                    "websocket history backfill also remained: {backfill}"
-                )),
-            })
-        } else {
-            server_result
-        };
-        let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
-        #[cfg(any(unix, windows))]
-        if let Some(owner) = &upgrade_flush {
-            owner
-                .finish(
-                    &result,
-                    _server_tasks_finished && _http_drained,
-                    &supervisor_cancel,
-                )
-                .await;
-        }
-        result
-    });
-
-    Ok(ServerHandle {
-        local_addr: actual_api_addr,
-        cancel,
-        acl_admin,
-        task: Some(task),
-        #[cfg(test)]
-        test_state,
-        #[cfg(test)]
-        test_router,
-    })
+        .with_state(Arc::clone(state))
 }
 
 const SHIELDED_APPLY_DRAIN_BOUND: Duration = Duration::from_secs(10);

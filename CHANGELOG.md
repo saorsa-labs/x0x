@@ -19,6 +19,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`x0xd` no longer runs its daemon on the process main thread (#2083; A11
+  paragraph of 21 Nov 2026).** The main-thread stack is 1 MiB on Windows,
+  and in a debug build the startup future's `poll` frame alone was 1.3 MB.
+  `x0xd` now runs the daemon on a thread named `x0xd-main` with an explicit
+  8 MiB stack, through the new `x0x::server::run_daemon_runtime`. The
+  `serve_with_options` future is now small (its state is on the heap), and
+  its debug `poll` frame is about a third of its old size. Release frame
+  sizes were not measured.
+
 - **A delta into a group store is measured in O(keys in the delta) (#2110
   item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
   length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta

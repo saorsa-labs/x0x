@@ -527,8 +527,44 @@ mod tests {
     /// api.port, history.db, and the peers cache). The lock now lives in
     /// the supervisor task: a re-serve is refused while the old server is
     /// still draining, and succeeds only after the drain has finished.
-    #[tokio::test]
-    async fn reserve_during_drain_is_refused_until_the_supervisor_finishes() {
+    ///
+    /// #2083: the body runs on an explicit 2 MiB thread, the libtest default.
+    /// The Windows lane ran it on that default and overflowed after #2056;
+    /// the other lanes raise `RUST_MIN_STACK` to 16 MiB and hid the growth.
+    /// The explicit size makes every lane fail if a serve again needs more.
+    #[test]
+    fn reserve_during_drain_is_refused_until_the_supervisor_finishes() {
+        on_libtest_default_stack(reserve_during_drain_body);
+    }
+
+    /// The libtest default test-thread stack (2 MiB).
+    const LIBTEST_DEFAULT_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+    /// Run `body` on a current-thread runtime (what `#[tokio::test]` builds)
+    /// on a new thread with [`LIBTEST_DEFAULT_STACK_BYTES`] of stack, whatever
+    /// `RUST_MIN_STACK` says.
+    fn on_libtest_default_stack<F, Fut>(body: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let worker = std::thread::Builder::new()
+            .name("libtest-default-stack".to_string())
+            .stack_size(LIBTEST_DEFAULT_STACK_BYTES)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("current-thread runtime")
+                    .block_on(body());
+            })
+            .expect("spawn the test thread");
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    async fn reserve_during_drain_body() {
         use tokio::io::AsyncWriteExt;
 
         let dir = tempfile::tempdir().expect("tempdir");

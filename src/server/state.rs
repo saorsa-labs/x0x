@@ -1634,6 +1634,10 @@ impl AppState {
             return false;
         };
         tasks.retain(|task| !task.is_finished());
+        // #2083: box the apply once here, so only a pointer moves through the
+        // scope wrapper and `tokio::spawn`. An unoptimised build otherwise
+        // keeps copies of the whole apply in each of those frames.
+        let task = Box::pin(task);
         // #1699: an apply that a staged re-seat join spawns stays in its scope.
         tasks.push(tokio::spawn(super::reseat_scope::inherit_reseat_scope(
             task,
@@ -1650,6 +1654,9 @@ impl AppState {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // #2083: box the apply before it is wrapped, so the wrapper below and
+        // `spawn_shielded` move a pointer and not the whole apply.
+        let task = Box::pin(task);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let admitted = self.spawn_shielded(async move {
             let _ = done_tx.send(task.await);

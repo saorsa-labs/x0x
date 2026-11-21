@@ -1288,7 +1288,9 @@ jobs:
     # test threads had the 2 MiB default: after #2056 (ant-quic 0.28.0)
     # `reserve_during_drain_is_refused_until_the_supervisor_finishes`, which
     # awaits `serve_with_options` three times, overflowed it
-    # (STATUS_STACK_OVERFLOW, job 134966531122).
+    # (STATUS_STACK_OVERFLOW, job 134966531122). #2083 shrank the serve
+    # frames, and that test now runs on an explicit 2 MiB thread in every
+    # lane; the 16 MiB default stays for the rest of this job.
     env:
       RUST_MIN_STACK: "16777216"
     steps:
@@ -1345,6 +1347,13 @@ jobs:
 
       - name: Run the instance-lock suite
         run: cargo test --lib instance_lock
+
+      # #2083: x0xd runs its daemon future on an explicit 8 MiB thread, not on
+      # the 1 MiB Windows main thread. These tests serve a hermetic loopback
+      # daemon (no bootstrap peers, no mDNS, no port mapping) through that
+      # runtime from a 256 KiB caller thread, and probe the thread stacks.
+      - name: Run the daemon-runtime suite
+        run: cargo test --lib daemon_runtime
 
       # #1588: the Windows flush owner (named pipe, boot clock, record
       # directory barrier) and the `x0x start --foreground` exit propagation
