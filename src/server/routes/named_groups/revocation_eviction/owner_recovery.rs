@@ -961,6 +961,33 @@ async fn recovery_write_allowed(state: &AppState, info: &GroupInfo, agent: &Agen
         && write_allowed(state, agent).await
 }
 
+/// #2139: a received TreeKEM recovery may remove the revoked seats' leaves
+/// and no other. A wire commit can add leaves and remove several, so the
+/// check is: every commit adds none and removes one, the tree's active
+/// leaf count falls by exactly the number of commits, and every non-revoked
+/// seat whose leaf was present before is still present after. The author
+/// (`commit_treekem`) makes one single-leaf removal per leafed revoked seat.
+fn recovery_commits_remove_only_revoked_leaves(
+    commits: &[Vec<u8>],
+    leaves_before: u32,
+    leaves_after: u32,
+    presence_before: &BTreeMap<String, Option<bool>>,
+    presence_after: &BTreeMap<String, Option<bool>>,
+    revoked: &BTreeSet<String>,
+) -> bool {
+    let one_removal_each = commits
+        .iter()
+        .all(|commit| matches!(x0x::mls::treekem::commit_leaf_changes(commit), Ok((0, 1))));
+    let count_matches = leaves_before
+        .checked_sub(leaves_after)
+        .is_some_and(|dropped| dropped as usize == commits.len());
+    let survivors_kept = presence_before
+        .iter()
+        .filter(|(seat, present)| **present == Some(true) && !revoked.contains(*seat))
+        .all(|(seat, _)| presence_after.get(seat) == Some(&Some(true)));
+    one_removal_each && count_matches && survivors_kept
+}
+
 fn recipient_expiry_due(info: &GroupInfo, agent: &AgentId, now_unix: u64) -> bool {
     info.members_v2
         .get(&hex::encode(agent.as_bytes()))
@@ -3740,6 +3767,8 @@ async fn receive_commit(
             let Ok(rollback_snapshot) = guard.to_snapshot_bytes() else {
                 return ReceiveOutcome::Retained { verified: true };
             };
+            let leaves_before = guard.member_count();
+            let presence_before = ng::roster_treekem_leaf_presence(guard, &info);
             let processed = commits
                 .iter()
                 .all(|treekem_commit| guard.process_commit(treekem_commit).is_ok());
@@ -3748,6 +3777,31 @@ async fn receive_commit(
             // a seat with no evidence keeps the frame pending (#1508
             // review P1).
             let presence = ng::roster_treekem_leaf_presence(guard, &info);
+            let removed_hex: BTreeSet<String> = removed
+                .iter()
+                .map(|agent| hex::encode(agent.as_bytes()))
+                .collect();
+            if processed
+                && !recovery_commits_remove_only_revoked_leaves(
+                    commits,
+                    leaves_before,
+                    guard.member_count(),
+                    &presence_before,
+                    &presence,
+                    &removed_hex,
+                )
+            {
+                ng::rollback_treekem_group_after_failed_install(
+                    state,
+                    &group_key,
+                    &next,
+                    &rollback_snapshot,
+                    guard,
+                    "owner_recovery_extra_leaf_change",
+                );
+                replay_log::rewrite_without(state, ext, held, &stable, at).await;
+                return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
+            }
             let leaves: Vec<Option<bool>> = removed
                 .iter()
                 .map(|agent| {

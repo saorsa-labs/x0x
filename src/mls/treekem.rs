@@ -124,6 +124,16 @@ pub fn commit_added_key_package_hashes(commit_bytes: &[u8]) -> Result<Vec<String
         .collect()
 }
 
+/// How many leaves an encoded commit adds and how many it removes, as
+/// `(added, removed)`. One commit can remove several leaves on the wire.
+///
+/// # Errors
+/// Returns [`MlsError`] if the commit bytes do not decode.
+pub fn commit_leaf_changes(commit_bytes: &[u8]) -> Result<(usize, usize)> {
+    let commit: TreeKemCommit = decode(commit_bytes, "commit")?;
+    Ok((commit.added.len(), commit.removed_leaves.len()))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedTreeKemSnapshot {
     version: u8,
@@ -623,6 +633,28 @@ mod tests {
     /// `derive_identity_seed(agent_secret, group_id)`).
     fn seed(id: u8) -> [u8; 32] {
         [id; 32]
+    }
+
+    /// #2139: a real remove, a real add, and a remove re-encoded with one
+    /// more removed leaf report their leaf changes.
+    #[test]
+    fn commit_leaf_changes_counts_added_and_removed_leaves() {
+        let mut admin = TreeKemMlsGroup::create(b"2139".to_vec(), agent(1), &seed(1)).unwrap();
+        for id in [2u8, 3] {
+            let prepared = TreeKemMlsGroup::prepare_member(agent(id), &seed(id)).unwrap();
+            let added = admin
+                .add_member(agent(id), prepared.key_package_bytes())
+                .unwrap();
+            assert_eq!(commit_leaf_changes(&added.commit).unwrap(), (1, 0));
+        }
+        let removal = admin.remove_member(agent(2)).unwrap();
+        assert_eq!(commit_leaf_changes(&removal).unwrap(), (0, 1));
+        let mut widened: TreeKemCommit = decode(&removal, "commit").unwrap();
+        let extra = widened.removed_leaves[0] + 1;
+        widened.removed_leaves.push(extra);
+        let widened = encode(&widened, "commit").unwrap();
+        assert_eq!(commit_leaf_changes(&widened).unwrap(), (0, 2));
+        assert!(commit_leaf_changes(b"not a commit").is_err());
     }
 
     #[test]

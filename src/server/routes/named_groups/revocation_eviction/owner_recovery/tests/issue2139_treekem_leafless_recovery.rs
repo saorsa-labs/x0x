@@ -1,7 +1,8 @@
 #![cfg(test)]
-//! #2139, daemon level: the TreeKEM known limits of #2133 that A09 (21 Nov
-//! 2026) keeps as accepted limits. These tests pin today's behaviour, so a
-//! later change to it is deliberate.
+//! #2139, daemon level: the TreeKEM gaps of #2133, which stay OPEN (A09,
+//! 21 Nov 2026). These tests show today's behaviour; a fix must change
+//! them. The last test pins the receiver's rule that a recovery removes
+//! only the revoked seats' leaves.
 //!
 //! - Limit (ii): a recovery whose revoked admins hold no TreeKEM leaf
 //!   carries no TreeKEM commit (`commit_treekem` skips every leafless
@@ -206,4 +207,88 @@ fn known_limit_2139_the_recovery_frame_gate_serves_a_seat_not_yet_due() {
             not_after as i64 - now as i64
         );
     }
+}
+
+/// #2139 receiver tightening: a received TreeKEM recovery may remove the
+/// revoked seats' leaves and no other. One wire commit can remove several
+/// leaves, or add one, so the commit count alone does not prove it.
+#[test]
+fn a_recovery_commit_may_remove_only_the_revoked_seats_leaves() {
+    let (admin_id, revoked_id, survivor_id) = (
+        AgentId([0xA1; 32]),
+        AgentId([0x51; 32]),
+        AgentId([0x5E; 32]),
+    );
+    let mut tree = TreeKemMlsGroup::create(b"2139-exact".to_vec(), admin_id, &[0xA1; 32]).unwrap();
+    for (id, seed) in [(revoked_id, 0x51u8), (survivor_id, 0x5E)] {
+        let prepared = TreeKemMlsGroup::prepare_member(id, &[seed; 32]).unwrap();
+        tree.add_member(id, prepared.key_package_bytes()).unwrap();
+    }
+    let before = tree.member_count();
+    let removal = tree.remove_member(revoked_id).unwrap();
+    let (revoked, survivor) = (
+        hex::encode(revoked_id.as_bytes()),
+        hex::encode(survivor_id.as_bytes()),
+    );
+    let presence = |revoked_present: bool, survivor_present: bool| {
+        BTreeMap::from([
+            (revoked.clone(), Some(revoked_present)),
+            (survivor.clone(), Some(survivor_present)),
+        ])
+    };
+    let revoked_set = BTreeSet::from([revoked.clone()]);
+    let exact = |commits: &[Vec<u8>], after: u32, survivor_after: bool| {
+        recovery_commits_remove_only_revoked_leaves(
+            commits,
+            before,
+            after,
+            &presence(true, true),
+            &presence(false, survivor_after),
+            &revoked_set,
+        )
+    };
+
+    assert!(
+        exact(std::slice::from_ref(&removal), before - 1, true),
+        "the honest single removal passes"
+    );
+    assert!(
+        recovery_commits_remove_only_revoked_leaves(
+            &[],
+            before,
+            before,
+            &presence(true, true),
+            &presence(true, true),
+            &BTreeSet::new(),
+        ),
+        "a leafless recovery with no commit passes"
+    );
+    // One commit that also removes the survivor's leaf.
+    let mut widened: saorsa_mls::treekem_group::TreeKemCommit =
+        postcard::from_bytes(&removal).unwrap();
+    let extra = widened.removed_leaves[0] + 1;
+    widened.removed_leaves.push(extra);
+    let widened = postcard::to_stdvec(&widened).unwrap();
+    assert!(
+        !exact(&[widened], before - 2, false),
+        "a commit that removes a second leaf is refused"
+    );
+    assert!(
+        !exact(std::slice::from_ref(&removal), before - 1, false),
+        "a surviving seat's leaf must still be present"
+    );
+    assert!(
+        !exact(std::slice::from_ref(&removal), before - 2, true),
+        "the leaf count must fall by exactly one per commit"
+    );
+    // An add in place of the removal.
+    let prepared = TreeKemMlsGroup::prepare_member(AgentId([0x77; 32]), &[0x77; 32]).unwrap();
+    let mut other = TreeKemMlsGroup::create(b"2139-add".to_vec(), admin_id, &[0xA2; 32]).unwrap();
+    let add = other
+        .add_member(AgentId([0x77; 32]), prepared.key_package_bytes())
+        .unwrap();
+    assert!(
+        !exact(&[add.commit], before - 1, true),
+        "a commit that adds a leaf is refused"
+    );
 }
