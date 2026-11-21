@@ -1089,7 +1089,9 @@ const BEACON_WAKE_GATE_CAP: usize = 1024;
 const BEACON_WAKE_GROUP_BUDGET: usize = 4;
 
 impl BeaconWakeGate {
-    fn should_wake(&mut self, author: AgentId, declared: [u8; 32], local: [u8; 32]) -> bool {
+    /// Whether [`Self::should_wake`] would grant this wake now. It changes
+    /// nothing.
+    fn would_wake(&self, author: AgentId, declared: [u8; 32], local: [u8; 32]) -> bool {
         let now = tokio::time::Instant::now();
         if let Some((prior_declared, prior_local, at)) = self.woken_for.get(&author) {
             if (*prior_declared, *prior_local) == (declared, local)
@@ -1106,18 +1108,28 @@ impl BeaconWakeGate {
             return false;
         }
         // Per-group budget (#1601): a sliding rate-cap window across
-        // authors. Expired entries leave first; a full budget then defers
-        // the wake without consuming anything, exactly like the per-author
-        // cap above — the same beacon re-earns its wake next window.
+        // authors. A full budget defers the wake without consuming
+        // anything, exactly like the per-author cap above — the same beacon
+        // re-earns its wake next window.
+        let live = self
+            .group_wakes
+            .iter()
+            .filter(|at| now < **at + KEY_GAP_REPAIR_RETRY_AFTER)
+            .count();
+        live < BEACON_WAKE_GROUP_BUDGET
+    }
+
+    fn should_wake(&mut self, author: AgentId, declared: [u8; 32], local: [u8; 32]) -> bool {
+        if !self.would_wake(author, declared, local) {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
         while self
             .group_wakes
             .front()
             .is_some_and(|at| now >= *at + KEY_GAP_REPAIR_RETRY_AFTER)
         {
             self.group_wakes.pop_front();
-        }
-        if self.group_wakes.len() >= BEACON_WAKE_GROUP_BUDGET {
-            return false;
         }
         if self.woken_for.len() >= BEACON_WAKE_GATE_CAP
             || self.last_wake.len() >= BEACON_WAKE_GATE_CAP
@@ -4557,8 +4569,12 @@ impl KvStoreSync {
                             (local_digest, wake)
                         };
                         let wake = match wake {
+                            // The window's one skip is spent only on a
+                            // wake the gate grants.
                             BeaconWake::SkipBackoff => {
-                                if responder_store.write().await.take_image_orset_skip(&author) {
+                                if beacon_wakes.would_wake(author, digest, local_digest)
+                                    && responder_store.write().await.take_image_orset_skip(&author)
+                                {
                                     BeaconWake::Wake
                                 } else {
                                     BeaconWake::Deferred
@@ -15910,6 +15926,15 @@ mod tests {
         f.p_sync.stop().await.expect("stop p");
     }
 
+    /// Moves the tokio clock past the wake gate's per-author gap without a
+    /// real-time wait. The back-off windows run on the wall clock, so they
+    /// stay open.
+    async fn pass_the_wake_gate_gap() {
+        tokio::time::pause();
+        tokio::time::advance(KEY_GAP_REPAIR_RETRY_AFTER + Duration::from_millis(500)).await;
+        tokio::time::resume();
+    }
+
     /// Through the real responder loop: a second OR-Set-matching beacon
     /// from Q in the same back-off window is deferred, even after the wake
     /// gate's per-author gap has passed. Q does not serve here, so nothing
@@ -15922,13 +15947,37 @@ mod tests {
         let base = f.counters();
         f.beacon(1, [0xA1; 32], f.orset).await;
         f.wait_for((base.0 + 1, base.1)).await;
-        tokio::time::sleep(KEY_GAP_REPAIR_RETRY_AFTER + Duration::from_millis(500)).await;
+        pass_the_wake_gate_gap().await;
         assert!(
             !f.p_sync.read().await.image_retry_due(&f.q_kp.agent_id()),
             "precondition: still inside Q's back-off window"
         );
         f.beacon(1, [0xA2; 32], f.orset).await;
         f.wait_for((base.0 + 1, base.1 + 1)).await;
+        f.p_sync.stop().await.expect("stop p");
+    }
+
+    /// Through the real responder loop: a matching beacon that the wake
+    /// gate defers does not spend the window's one skip. Q wakes P once
+    /// outside a back-off, then P refuses Q again: Q's matching beacon
+    /// inside the gate's per-author gap is deferred, and the next one after
+    /// the gap wakes.
+    #[tokio::test]
+    async fn a_gate_deferred_beacon_keeps_the_orset_skip() {
+        let f = beacon_fixture().await;
+        let q = f.q_kp.agent_id();
+        f.p_sync.write().await.clear_image_source_for_test(&q);
+        f.p_sync.start().await.expect("start p");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let base = f.counters();
+        f.beacon(1, [0xC1; 32], [0xEE; 32]).await;
+        f.wait_for((base.0 + 1, base.1)).await;
+        f.p_sync.write().await.refuse_image_source_for_test(q);
+        f.beacon(1, [0xC2; 32], f.orset).await;
+        f.wait_for((base.0 + 1, base.1 + 1)).await;
+        pass_the_wake_gate_gap().await;
+        f.beacon(1, [0xC3; 32], f.orset).await;
+        f.wait_for((base.0 + 2, base.1 + 1)).await;
         f.p_sync.stop().await.expect("stop p");
     }
 }
