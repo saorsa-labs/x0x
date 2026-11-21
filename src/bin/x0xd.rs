@@ -366,6 +366,8 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Apply instance-scoped defaults for data_dir and api_address when --name
     // is active but the config didn't explicitly set instance-scoped values.
+    // The launcher derives data_dir the same way
+    // (`src/upgrade/launcher/daemon_root.rs`, `tests/launcher_data_dir_parity.rs`).
     if let Some(ref name) = instance_name {
         let default_data_dir = x0x::server::default_data_dir();
         if config.data_dir == default_data_dir {

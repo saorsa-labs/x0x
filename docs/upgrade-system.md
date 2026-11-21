@@ -762,6 +762,27 @@ directory owned by root or the launcher's account that no other account can
 write; a sticky ancestor such as `/tmp` is allowed, since only an entry's
 owner may rename it there.
 
+The host root must also be the data directory of the daemon in the argv
+(#1378; it runs only once the launcher is turned on). Records read from
+another directory say nothing about this
+daemon: with no journal there, the start would pass through to a candidate
+swapped in under the daemon's own journal. The issuer derives that
+directory as x0xd does at startup, from the daemon arguments and the
+environment the launcher passes on to x0xd: the `data_dir` of the config
+file (`--config`, else the instance's default config file when it exists),
+else the default, renamed `x0x-<name>` for a named instance (`--name`, else
+the file's `instance_name`). The directory's parent is resolved but its
+last component is not followed, so a data directory that is a symlink does
+not match, even one that points at the host root. A mismatch is refused
+(78), as is a data directory that cannot be known from the argv: a
+relative one, a config file that is not valid TOML, an instance name x0xd
+would refuse, a repeated `--config` or `--name`, or the `--config=`
+spelling, which x0xd does not read. A config file that cannot be read is a
+failed read (75). The check runs before the records are read, and again
+when a passthrough that holds no install lock reads them again before its
+`exec`. `tests/launcher_data_dir_parity.rs` checks the derivation against
+`x0xd --check`.
+
 The issuer reads both records under the daemon install lock: the
 `.upgrade.lock` file beside the daemon's canonical path, the same file the
 prepare producer, the CLI self-update and the daemon's routes lock, so a
@@ -798,7 +819,13 @@ and daemon locks itself.
 - **Lock file it cannot use.** When this account cannot create or open
   the lock file (EACCES, EPERM, EROFS), the start is refused (78) with the
   remedy: let the launcher's account write the daemon's directory, or use
-  the plain launcher form. A passthrough without the lock is not safe
+  the plain launcher form. A lock file that root created (an upgrade run
+  under `sudo`, for example) is a common cause. While no upgrade runs, give
+  it to the launcher's account
+  (`sudo chown <account> <daemon>.upgrade.lock`, keeping mode 0600) or
+  remove it (`sudo rm <daemon>.upgrade.lock`) when the launcher's account
+  can write the daemon's directory, so the launcher creates it again; then
+  restart the unit. A passthrough without the lock is not safe
   there, because the CLI self-update can lock and swap as another account
   (root under `sudo`, for example). A symlink, a directory or another
   non-regular file at the lock path is refused (78) too.
@@ -871,13 +898,43 @@ TimeoutStopSec=60
 
 - The data root is the one x0xd reports for the unit's own arguments
   (`x0xd <args> --check`, run as the unit's user with that user's `HOME`;
-  it reads the config and writes nothing), resolved through symlinks. The
-  unit's user is the last `User=` in the unit and its other drop-ins
-  (`root` when none is set); the launcher drop-in itself is not read. As
-  root, the check runs through `runuser` (looked up in `/usr/sbin`, `/usr/bin`,
-  `/sbin` and `/bin`). The data root must exist, so x0xd must have started
-  once, and it must be owned by the unit's user and not writable by group or
-  others.
+  it reads the config and writes nothing), with its parent resolved
+  through symlinks. A data root that is itself a symlink is refused,
+  because the launcher does not follow it. As root, the check runs through
+  `runuser` (looked up in `/usr/sbin`, `/usr/bin`, `/sbin` and `/bin`). The
+  data root must exist, so x0xd must have started once, and it must be
+  owned by the unit's user and not writable by group or others.
+- The unit's user and `ExecStart` are the effective ones, read as systemd
+  reads them: the unit file, then every drop-in that systemd applies to it
+  (`<unit>.d/`, the dash-prefix directories such as `x0xd-.service.d/`,
+  and `service.d/`, under `/etc`, `/run` and `/usr/lib`), in file-name
+  order. The last `User=` wins (`root` when none, or an empty one, is
+  set); an empty `ExecStart=` clears the earlier ones, and exactly one
+  must be left. The launcher drop-in itself is removed first and not read.
+  The installer then asks systemd as well (`systemctl daemon-reload`, then
+  `systemctl show -p LoadState -p FragmentPath -p DropInPaths -p User -p
+  ExecStart`), and refuses when systemd's answer differs from the files,
+  systemd does not load the unit, or the reload or the query fails while
+  systemd runs (`/run/systemd/system` exists). Only without a running
+  systemd does it use the files alone, and it says so. A search directory
+  that resolves to one already read (`/lib` on a merged-`/usr` host) is
+  read once.
+- The installer's `--check` runs with only `HOME` and `PATH`, so it refuses
+  a unit whose environment could move the data directory: `HOME`,
+  `XDG_CONFIG_HOME` or `XDG_DATA_HOME` in `Environment=`, any
+  `EnvironmentFile=`, a relative `--config` (the unit's
+  `WorkingDirectory=` is not used), and the `--config=` spelling.
+- The installer refuses ambiguity: a unit file of the same name earlier in
+  systemd's search path (for example `/run/systemd/transient`), two
+  drop-ins with the same file name, another `30-x0x-launcher.conf` in any
+  drop-in directory, and a drop-in that sorts after the launcher drop-in
+  and sets `ExecStart`, `Restart`, `RestartPreventExitStatus`, `KillMode`,
+  `TimeoutStopSec` or `TimeoutSec`, which would undo it.
+- The launcher and the drop-in are each written as a new temporary file in
+  the target directory (`O_EXCL`, mode 0700, whatever the umask), given
+  their mode (0755 and 0644), synced, renamed over the target, and the
+  directory is synced. A failed directory sync is reported after the
+  rename, when the target is already the new file.
 - The instance is the manifest instance id.
 - An `ExecStart` token that needs systemd quoting (spaces, quotes, `$` or
   `%`), or an `ExecStart` that cannot be split, is refused; such a unit is
@@ -892,9 +949,12 @@ TimeoutStopSec=60
 
 The helper is `.deployment/launcher-dropin.py`. `tests/test_launcher_dropin.py`
 tests it and runs `install.sh --launcher` from a scratch copy of the
-deployment tree (fresh host, rerun, `User=` drop-ins, a failed rerun). Not done yet: an exit test of the
+deployment tree (fresh host, rerun, `User=` drop-ins, a failed rerun, an
+answer from systemd that agrees and one that does not), with the drop-in
+lookup over a scratch search path. Not done yet: a trial of a
+launcher-bound unit on a real systemd host, and an exit test of the
 supervised upgrade exit on a launcher-bound host, which needs a private
-testnet host.
+testnet host and the launcher turned on.
 
 #### 2. Restore the known-good binary
 
