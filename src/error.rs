@@ -86,6 +86,11 @@ pub enum IdentityError {
     /// Conflict.
     #[error("immutable key: {0} — append-only store; existing keys cannot be updated or deleted")]
     ImmutableKey(String),
+
+    /// The key is not held by this replica. The API layer maps this to
+    /// HTTP 404.
+    #[error("key not found: {0}")]
+    KeyNotFound(String),
 }
 
 /// Standard Result type for x0x identity operations.

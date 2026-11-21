@@ -2287,6 +2287,10 @@ enum StoreSub {
         store_id: String,
         /// Key name.
         key: String,
+        /// `publish`: when this replica does not hold the key, publish the
+        /// removal for the replicas that do.
+        #[arg(long, value_parser = ["publish"])]
+        absent: Option<String>,
     },
 }
 
@@ -3522,9 +3526,11 @@ async fn run(
             Some(StoreSub::Get { store_id, key }) => {
                 commands::store::get(&client, &store_id, &key).await
             }
-            Some(StoreSub::Rm { store_id, key }) => {
-                commands::store::rm(&client, &store_id, &key).await
-            }
+            Some(StoreSub::Rm {
+                store_id,
+                key,
+                absent,
+            }) => commands::store::rm(&client, &store_id, &key, absent.as_deref()).await,
         },
         Commands::Tasks { sub } => match sub {
             None => commands::tasks::list(&client).await,

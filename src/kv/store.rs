@@ -2506,6 +2506,12 @@ impl KvStore {
         }
     }
 
+    /// Whether this replica holds an entry for `key`: the test
+    /// [`Self::remove`] applies.
+    pub(crate) fn holds_entry(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Remove a key from the store.
     ///
     /// # Errors
@@ -2514,7 +2520,7 @@ impl KvStore {
     /// - [`KvError::ImmutableKey`] under [`AccessPolicy::AppendOnly`]: keys
     ///   can never be deleted, even by the owner.
     pub fn remove(&mut self, key: &str) -> Result<()> {
-        if !self.entries.contains_key(key) {
+        if !self.holds_entry(key) {
             return Err(KvError::KeyNotFound(key.to_string()));
         }
         if matches!(self.policy, AccessPolicy::AppendOnly) {
@@ -5132,6 +5138,84 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
         }
+    }
+
+    /// The removal an owner publishes for a key it does not hold
+    /// (#2110): it names only the key.
+    fn removal_by_key(key: &str) -> KvStoreDelta {
+        let mut delta = KvStoreDelta::new(1);
+        delta.removed.insert(key.to_string(), HashSet::new());
+        delta
+    }
+
+    /// #2110 item 3, group store: a holder that receives the removal
+    /// tombstones its tags, and a holder that was offline loses the key at
+    /// its next retained-image merge with it.
+    #[test]
+    fn removal_by_key_reaches_an_offline_holder_of_a_group_store() {
+        let owner = agent(1);
+        let ctx = TestCtx::new(7, &[owner]);
+        let mut holder =
+            KvStore::new_group_signed(store_id(8), "Wiki".to_string(), owner, vec![7u8; 16], ctx)
+                .expect("holder");
+        holder
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let mut offline = holder.clone();
+        holder
+            .merge_delta(&removal_by_key("k"), peer(2), Some(&owner))
+            .expect("removal");
+        assert!(holder.get("k").is_none(), "a live holder applies it");
+        offline
+            .merge_group_retained_image(&holder.served_image_for_test(), agent(7), peer(3))
+            .expect("retained image");
+        assert!(
+            offline.get("k").is_none(),
+            "the offline holder loses the key through the image tombstones"
+        );
+    }
+
+    /// #2110 item 3, plain store: cold sync is a full delta, which carries
+    /// no tombstones, so a holder that missed the removal keeps the key.
+    #[test]
+    fn removal_by_key_does_not_reach_an_offline_holder_of_a_plain_store() {
+        let owner = agent(1);
+        let mut holder = KvStore::new(
+            store_id(9),
+            "plain".to_string(),
+            owner,
+            AccessPolicy::Allowlisted,
+        )
+        .expect("holder");
+        holder
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let mut offline = holder.clone();
+        holder
+            .merge_delta(&removal_by_key("k"), peer(2), Some(&owner))
+            .expect("removal");
+        assert!(holder.get("k").is_none(), "a live holder applies it");
+        offline
+            .merge_delta(
+                &holder.full_delta().expect("full delta"),
+                peer(2),
+                Some(&owner),
+            )
+            .expect("cold sync");
+        assert!(
+            offline.get("k").is_some(),
+            "known limit: a full delta carries no tombstone"
+        );
     }
 
     #[test]

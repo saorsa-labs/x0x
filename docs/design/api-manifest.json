@@ -3290,7 +3290,15 @@
       "method": "DELETE",
       "path": "/stores/:id/:key",
       "request": {
-        "kind": "none"
+        "fields": [
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "absent",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
