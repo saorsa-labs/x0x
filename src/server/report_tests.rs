@@ -598,7 +598,7 @@ fn sent_report_withholds_log_and_listing_and_is_redacted() {
         assert!(local_text.contains(kept), "fixture: local keeps {kept}");
     }
 
-    let sent = build_sent_report(&inputs, &redactor_for(&p, &f)).unwrap();
+    let sent = build_sent_report(&inputs, &redactor_for(&p, &f), MAX_SENT_REPORT_BYTES).unwrap();
     assert!(sent.len() <= MAX_SENT_REPORT_BYTES);
     let text = String::from_utf8_lossy(&sent);
     for (label, secret) in p.all() {
@@ -620,7 +620,12 @@ fn sent_report_withholds_log_and_listing_and_is_redacted() {
 
     // Red proof: with the redactor off, the full agent id in the health
     // body reaches the sent bytes.
-    let leaky = build_sent_report(&inputs, &redactor_for(&p, &f).disabled_for_red_proof()).unwrap();
+    let leaky = build_sent_report(
+        &inputs,
+        &redactor_for(&p, &f).disabled_for_red_proof(),
+        MAX_SENT_REPORT_BYTES,
+    )
+    .unwrap();
     assert!(String::from_utf8_lossy(&leaky).contains(&p.agent_id_hex));
 }
 
@@ -633,7 +638,7 @@ fn sent_report_over_its_bound_is_refused() {
     let f = plant(&p);
     let mut inputs = inputs_for(&p, &f);
     inputs.health = serde_json::json!({ "pad": "word ".repeat(MAX_SENT_REPORT_BYTES / 5 + 1) });
-    match build_sent_report(&inputs, &redactor_for(&p, &f)) {
+    match build_sent_report(&inputs, &redactor_for(&p, &f), MAX_SENT_REPORT_BYTES) {
         Err(SentReportError::TooLarge(len)) => assert!(len > MAX_SENT_REPORT_BYTES),
         other => panic!("expected TooLarge, got {other:?}"),
     }
@@ -674,12 +679,19 @@ fn deliver_to_must_be_an_owner_device() {
         expired_entry,
     ];
     let code = |hex_id: &str| {
-        check_owner_recipient(hex_id, &own, &roster, 1_000)
+        check_owner_recipient(hex_id, &own, &roster, &[], 1_000)
             .err()
             .map(|(_, code, _)| code)
     };
     assert_eq!(
-        check_owner_recipient(&hex::encode([2; 32]).to_uppercase(), &own, &roster, 1_000).ok(),
+        check_owner_recipient(
+            &hex::encode([2; 32]).to_uppercase(),
+            &own,
+            &roster,
+            &[],
+            1_000
+        )
+        .ok(),
         Some(device)
     );
     assert_eq!(code("zz"), Some("invalid_agent_id"));
@@ -744,7 +756,12 @@ async fn sent_report_reaches_an_owner_device_that_was_offline() {
     use std::sync::atomic::Ordering;
     let p = Planted::new();
     let f = plant(&p);
-    let payload = build_sent_report(&inputs_for(&p, &f), &redactor_for(&p, &f)).unwrap();
+    let payload = build_sent_report(
+        &inputs_for(&p, &f),
+        &redactor_for(&p, &f),
+        MAX_SENT_REPORT_BYTES,
+    )
+    .unwrap();
     let sender = crate::identity::AgentId([1; 32]);
     let device = crate::identity::AgentId([2; 32]);
     let now_ms = super::super::routes::direct_outbox::now_unix_ms();
@@ -801,7 +818,11 @@ async fn sent_report_reaches_an_owner_device_that_was_offline() {
 
 /// A route state whose daemon has an owner identity, plus the agent id of
 /// a second owner device on the owner's certificate journal.
-async fn owner_route_state() -> (Arc<AppState>, tempfile::TempDir, crate::identity::AgentId) {
+async fn owner_route_state() -> (
+    Arc<AppState>,
+    tempfile::TempDir,
+    crate::identity::AgentKeypair,
+) {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_path_buf();
     let seed = [0x5A; 32];
@@ -831,7 +852,7 @@ async fn owner_route_state() -> (Arc<AppState>, tempfile::TempDir, crate::identi
         crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(&data_dir, agent)
             .await
             .unwrap();
-    (state, dir, device.agent_id())
+    (state, dir, device)
 }
 
 /// The real route with a durable-owner actor, for requests with a body.
@@ -860,6 +881,7 @@ async fn post_report_http(
 #[tokio::test]
 async fn post_report_deliver_to_queues_the_sent_copy() {
     let (state, _dir, device) = owner_route_state().await;
+    let device = device.agent_id();
     let device_hex = hex::encode(device.as_bytes());
     let (status, body) = post_report_http(
         &state,
@@ -944,4 +966,178 @@ async fn post_report_deliver_to_needs_an_owner_identity() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "no_owner_identity");
+}
+
+/// WHY (#2156 review): the roster resets the mode of a renewed or
+/// live-announced certificate to ACP, so a rider would pass on the roster
+/// mode alone. Any journal line of this owner in rider mode refuses it;
+/// another owner's rider lines do not count.
+#[test]
+fn a_rider_reset_to_acp_on_the_roster_is_still_refused() {
+    use crate::identity::AgentId;
+    use crate::profile::{CertMode, IssuedCertRecord};
+    let own = AgentId([1; 32]);
+    let rider = AgentId([3; 32]);
+    let roster = vec![roster_entry(&rider, CertMode::Acp)];
+    let line = |user: &str, mode| IssuedCertRecord {
+        user_id: user.to_string(),
+        agent_id: hex::encode(rider.as_bytes()),
+        cert_digest: "11".repeat(32),
+        issued_at: 1,
+        not_after: None,
+        mode,
+        label: None,
+        cert_b64: None,
+    };
+    let owner_hex = "aa".repeat(32);
+    let journal = vec![
+        line(&owner_hex, CertMode::Rider),
+        line(&owner_hex, CertMode::Acp),
+        line(&"bb".repeat(32), CertMode::Rider),
+    ];
+    let riders = journal_riders(&journal, &owner_hex);
+    assert_eq!(riders, vec![hex::encode(rider.as_bytes())]);
+    let rider_hex = hex::encode(rider.as_bytes());
+    assert_eq!(
+        check_owner_recipient(&rider_hex, &own, &roster, &riders, 1_000)
+            .err()
+            .map(|(_, code, _)| code),
+        Some("not_an_owner_device")
+    );
+    assert!(journal_riders(&journal[1..2], &owner_hex).is_empty());
+    assert!(journal_riders(&journal[2..], &owner_hex).is_empty());
+}
+
+/// WHY (#2156 review): a recipient the owner revoked (owner delete, lost
+/// device) or the contact store blocked can never take the copy, so the
+/// route refuses it before the slot is taken and queues nothing.
+#[tokio::test]
+async fn post_report_refuses_a_revoked_or_blocked_device() {
+    let (state, _dir, device) = owner_route_state().await;
+    let device_id = device.agent_id();
+    let body = serde_json::json!({ "deliver_to": hex::encode(device_id.as_bytes()) }).to_string();
+
+    let record = crate::revocation::RevocationRecord::sign(
+        crate::revocation::RevokedSubject::Agent(device_id),
+        device.public_key(),
+        device.secret_key(),
+        1_000,
+        None,
+    )
+    .unwrap();
+    assert!(state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, None)
+        .unwrap());
+    let (status, reply) = post_report_http(&state, Some(&body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+    assert_eq!(reply["error"], "recipient_revoked");
+
+    let (state, _dir, device) = owner_route_state().await;
+    let device_id = device.agent_id();
+    let body = serde_json::json!({ "deliver_to": hex::encode(device_id.as_bytes()) }).to_string();
+    state
+        .contacts
+        .write()
+        .await
+        .set_trust(&device_id, crate::contacts::TrustLevel::Blocked);
+    let (status, reply) = post_report_http(&state, Some(&body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+    assert_eq!(reply["error"], "recipient_blocked");
+    assert!(state.direct_send_outbox.snapshot().await.is_empty());
+    assert!(!state.data_dir.join(REPORTS_DIR).exists());
+    assert!(claim_report_slot(report_slots(), &state.data_dir, Instant::now()).is_ok());
+}
+
+/// WHY (#2156 review): a sent copy over its bound stores nothing, queues
+/// nothing and gives the one-per-minute slot back.
+#[tokio::test]
+async fn post_report_too_large_to_send_stores_nothing_and_frees_the_slot() {
+    let (state, _dir, device) = owner_route_state().await;
+    sent_limit_overrides()
+        .lock()
+        .unwrap()
+        .insert(state.data_dir.clone(), 16);
+    let body =
+        serde_json::json!({ "deliver_to": hex::encode(device.agent_id().as_bytes()) }).to_string();
+    let (status, reply) = post_report_http(&state, Some(&body)).await;
+    sent_limit_overrides()
+        .lock()
+        .unwrap()
+        .remove(&state.data_dir);
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{reply}");
+    assert_eq!(reply["error"], "report_too_large_to_send");
+    assert!(!state.data_dir.join(REPORTS_DIR).exists());
+    assert!(state.direct_send_outbox.snapshot().await.is_empty());
+    assert!(claim_report_slot(report_slots(), &state.data_dir, Instant::now()).is_ok());
+}
+
+/// WHY (#2156 review): when the outbox refuses the copy (here: full for
+/// the device), the stored bundle is kept, its path is in the body, and
+/// the slot goes back so the owner can retry.
+#[tokio::test]
+async fn post_report_failed_enqueue_keeps_the_bundle_and_frees_the_slot() {
+    use super::super::routes::direct_outbox::{
+        EnqueueOutcome, LedgerReceipt, DIRECT_SEND_OUTBOX_CAPS,
+    };
+    let (state, _dir, device) = owner_route_state().await;
+    let device_id = device.agent_id();
+    let now_ms = super::super::routes::direct_outbox::now_unix_ms();
+    for i in 0..DIRECT_SEND_OUTBOX_CAPS.per_partition {
+        let filler =
+            report_obligation(state.agent.agent_id(), device_id, i as u64, vec![0], now_ms)
+                .unwrap();
+        let none = LedgerReceipt {
+            status: crate::dm::DmReceiptStatus::Unknown,
+            digest: None,
+            machine: None,
+        };
+        assert_eq!(
+            state.direct_send_outbox.enqueue(filler, none).await,
+            EnqueueOutcome::Queued
+        );
+    }
+    let body = serde_json::json!({ "deliver_to": hex::encode(device_id.as_bytes()) }).to_string();
+    let (status, reply) = post_report_http(&state, Some(&body)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{reply}");
+    assert_eq!(reply["error"], "outbox_full");
+    assert!(reply["delivery"].is_null());
+    assert!(PathBuf::from(reply["path"].as_str().unwrap()).exists());
+    assert!(claim_report_slot(report_slots(), &state.data_dir, Instant::now()).is_ok());
+}
+
+/// WHY (#2156 review): `outbox_not_durable` means the copy is held and may
+/// still be sent, so the refusal keeps the slot (an at-once retry would
+/// queue a second report) and still describes the held delivery; every
+/// other refusal gives the slot back.
+#[test]
+fn queue_refusals_keep_the_slot_only_when_the_copy_may_still_be_sent() {
+    use super::super::routes::direct_outbox::EnqueueOutcome;
+    let delivery = || serde_json::json!({ "outcome": "queued", "logical_id": "x0x-report-1" });
+    let held = queue_outcome(EnqueueOutcome::NotDurable("fsync".into()), delivery()).unwrap_err();
+    assert_eq!(held.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(held.code, "outbox_not_durable");
+    assert!(held.keep_slot);
+    assert_eq!(held.delivery.unwrap()["outcome"], "held_not_durable");
+    for (outcome, code) in [
+        (EnqueueOutcome::Full, "outbox_full"),
+        (EnqueueOutcome::Conflict, "idempotency_conflict"),
+        (EnqueueOutcome::InFlight, "idempotency_conflict"),
+        (
+            EnqueueOutcome::WriteFailed("disk".into()),
+            "outbox_write_failed",
+        ),
+    ] {
+        let refusal = queue_outcome(outcome, delivery()).unwrap_err();
+        assert_eq!(refusal.code, code);
+        assert!(!refusal.keep_slot, "{code} must give the slot back");
+        assert!(refusal.delivery.is_none());
+    }
+    assert_eq!(
+        queue_outcome(EnqueueOutcome::Queued, delivery()).unwrap()["outcome"],
+        "queued"
+    );
 }

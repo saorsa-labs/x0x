@@ -602,10 +602,11 @@ pub(crate) enum SentReportError {
 /// four-word addresses and free text in log lines, and file names. The
 /// rest (generator, host, id prefixes, the redacted `/health` body that
 /// any caller may read) passes the same [`Redactor`]. Compact JSON, at
-/// most [`MAX_SENT_REPORT_BYTES`].
+/// most `limit` bytes ([`sent_report_limit`]).
 pub(crate) fn build_sent_report(
     inputs: &ReportInputs,
     redactor: &Redactor,
+    limit: usize,
 ) -> std::result::Result<Vec<u8>, SentReportError> {
     let mut value = bundle_value(inputs, &[], "", &[], 0);
     if let Some(map) = value.as_object_mut() {
@@ -630,10 +631,33 @@ pub(crate) fn build_sent_report(
     redactor.scrub_value(&mut value);
     let bytes =
         serde_json::to_vec(&value).map_err(|e| SentReportError::Serialize(e.to_string()))?;
-    if bytes.len() > MAX_SENT_REPORT_BYTES {
+    if bytes.len() > limit {
         return Err(SentReportError::TooLarge(bytes.len()));
     }
     Ok(bytes)
+}
+
+/// The byte bound of the sent copy for `data_dir`: [`MAX_SENT_REPORT_BYTES`].
+/// Tests set a smaller bound for one data directory to reach the `413`
+/// path through the route.
+pub(crate) fn sent_report_limit(data_dir: &Path) -> usize {
+    #[cfg(test)]
+    if let Some(limit) = sent_limit_overrides()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(data_dir)
+    {
+        return *limit;
+    }
+    let _ = data_dir;
+    MAX_SENT_REPORT_BYTES
+}
+
+/// Test-only per-data-directory bounds for [`sent_report_limit`].
+#[cfg(test)]
+pub(crate) fn sent_limit_overrides() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static OVERRIDES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// A refused `deliver_to`: status, error code and detail.
@@ -644,10 +668,15 @@ pub(crate) type RecipientRefusal = (StatusCode, &'static str, String);
 /// issued-certificate roster, which keeps offline agents), not this
 /// daemon's own agent, not a rider (a rider is hosted by this daemon, it
 /// is not a device), and with a certificate not expired at `now_secs`.
+/// `journal_riders` are the agents (hex) any journal line of this owner
+/// records in rider mode: the roster resets the mode of a renewed or
+/// live-announced certificate to ACP, so the roster mode alone is not
+/// enough to refuse a rider.
 pub(crate) fn check_owner_recipient(
     recipient_hex: &str,
     own_agent: &crate::identity::AgentId,
     roster: &[crate::OwnerIssuedCert],
+    journal_riders: &[String],
     now_secs: u64,
 ) -> std::result::Result<crate::identity::AgentId, RecipientRefusal> {
     let bytes = hex::decode(recipient_hex.trim()).map_err(|e| {
@@ -690,7 +719,11 @@ pub(crate) fn check_owner_recipient(
         .iter()
         .find(|c| c.agent_id.eq_ignore_ascii_case(&hex_id))
         .ok_or_else(not_owned)?;
-    if entry.mode == crate::profile::CertMode::Rider {
+    if entry.mode == crate::profile::CertMode::Rider
+        || journal_riders
+            .iter()
+            .any(|rider| rider.eq_ignore_ascii_case(&hex_id))
+    {
         return Err(not_owned());
     }
     if entry.not_after.is_some_and(|t| t <= now_secs) {
@@ -961,22 +994,55 @@ struct DeliveryTarget {
     recipient: crate::identity::AgentId,
 }
 
-/// Resolve `deliver_to` against the owner roster and the contact store.
+/// The agents (hex) that any line of this owner's certificate journal
+/// records in rider mode.
+pub(crate) fn journal_riders(
+    records: &[crate::profile::IssuedCertRecord],
+    owner_hex: &str,
+) -> Vec<String> {
+    records
+        .iter()
+        .filter(|r| r.user_id == owner_hex && r.mode == crate::profile::CertMode::Rider)
+        .map(|r| r.agent_id.clone())
+        .collect()
+}
+
+/// Resolve `deliver_to` against the owner roster, the certificate
+/// journal, the owner's revocation set and the contact store.
 async fn delivery_target(
     state: &Arc<AppState>,
     recipient_hex: &str,
 ) -> std::result::Result<DeliveryTarget, RecipientRefusal> {
-    if state.agent.identity().user_keypair().is_none() {
+    let Some(owner) = state.agent.identity().user_id() else {
         return Err((
             StatusCode::CONFLICT,
             "no_owner_identity",
             "deliver_to needs an owner (user) identity on this daemon".to_string(),
         ));
-    }
+    };
     let sender = state.agent.agent_id();
     let roster = state.agent.owner_issued_certificates().await;
+    let journal = match state.agent.cert_journal_path() {
+        Some(path) => crate::profile::IssuedCertRecord::load(path).await,
+        None => Vec::new(),
+    };
+    let riders = journal_riders(&journal, &hex::encode(owner.as_bytes()));
     let now_secs = super::routes::direct_outbox::now_unix_ms() / 1000;
-    let recipient = check_owner_recipient(recipient_hex, &sender, &roster, now_secs)?;
+    let recipient = check_owner_recipient(recipient_hex, &sender, &roster, &riders, now_secs)?;
+    if state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .is_agent_revoked(&recipient)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "recipient_revoked",
+            "deliver_to is revoked (for example by DELETE /owner/agents/:id or a lost device)"
+                .to_string(),
+        ));
+    }
     {
         let contacts = state.contacts.read().await;
         if contacts.trust_level(&recipient) == crate::contacts::TrustLevel::Blocked
@@ -992,24 +1058,89 @@ async fn delivery_target(
     Ok(DeliveryTarget { sender, recipient })
 }
 
-/// Queue `obligation` and describe it, or the refusal as
-/// `(status, code, detail)`.
+/// A queue refusal: status, code, detail, the delivery description when
+/// the copy may still be sent, and whether the rate slot stays claimed.
+#[derive(Debug)]
+pub(crate) struct QueueRefusal {
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) detail: String,
+    /// `Some` when the copy is held and may still be sent.
+    pub(crate) delivery: Option<serde_json::Value>,
+    /// `true` keeps the one-per-minute slot: the held copy may still be
+    /// sent, and an at-once retry would queue a second report.
+    pub(crate) keep_slot: bool,
+}
+
+/// Map an enqueue outcome to the `delivery` value or a [`QueueRefusal`].
+/// `delivery` describes the obligation as queued.
+pub(crate) fn queue_outcome(
+    outcome: super::routes::direct_outbox::EnqueueOutcome,
+    mut delivery: serde_json::Value,
+) -> std::result::Result<serde_json::Value, QueueRefusal> {
+    use super::routes::direct_outbox::EnqueueOutcome;
+    let refuse = |status, code, detail| QueueRefusal {
+        status,
+        code,
+        detail,
+        delivery: None,
+        keep_slot: false,
+    };
+    match outcome {
+        EnqueueOutcome::Queued => Ok(delivery),
+        EnqueueOutcome::AlreadyQueued { deliver_until_ms } => {
+            delivery["deliver_until_ms"] = serde_json::json!(deliver_until_ms);
+            Ok(delivery)
+        }
+        EnqueueOutcome::Conflict | EnqueueOutcome::InFlight => Err(refuse(
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+            "a report with this logical_id is already queued or sent to this device".to_string(),
+        )),
+        EnqueueOutcome::Full => Err(refuse(
+            StatusCode::TOO_MANY_REQUESTS,
+            "outbox_full",
+            "the durable send outbox is full for this device or daemon; retry later".to_string(),
+        )),
+        EnqueueOutcome::NotDurable(detail) => {
+            delivery["outcome"] = serde_json::json!("held_not_durable");
+            Err(QueueRefusal {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "outbox_not_durable",
+                detail: format!(
+                    "the sent copy is held and may still be sent, but its durability is not \
+                     confirmed: {detail}; check GET /direct/receipts/{{logical_id}} before \
+                     making another report"
+                ),
+                delivery: Some(delivery),
+                keep_slot: true,
+            })
+        }
+        EnqueueOutcome::WriteFailed(detail) => Err(refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "outbox_write_failed",
+            detail,
+        )),
+    }
+}
+
+/// Queue `obligation` and describe it, or refuse with a [`QueueRefusal`].
 async fn queue_report(
     state: &Arc<AppState>,
     obligation: super::routes::direct_outbox::DirectSendObligation,
-) -> std::result::Result<serde_json::Value, RecipientRefusal> {
-    use super::routes::direct_outbox::{EnqueueOutcome, LedgerReceipt};
-    let ledger = match obligation.request_id_bytes() {
-        Some(rid) => LedgerReceipt::of(&state.agent.dm_inflight_acks(), &rid),
-        None => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "report_failed",
-                "report request id is not 16 bytes of hex".to_string(),
-            ))
-        }
+) -> std::result::Result<serde_json::Value, QueueRefusal> {
+    use super::routes::direct_outbox::LedgerReceipt;
+    let Some(rid) = obligation.request_id_bytes() else {
+        return Err(QueueRefusal {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "report_failed",
+            detail: "report request id is not 16 bytes of hex".to_string(),
+            delivery: None,
+            keep_slot: false,
+        });
     };
-    let mut delivery = serde_json::json!({
+    let ledger = LedgerReceipt::of(&state.agent.dm_inflight_acks(), &rid);
+    let delivery = serde_json::json!({
         "outcome": "queued",
         "agent_id": obligation.recipient,
         "logical_id": obligation.logical_id,
@@ -1017,33 +1148,10 @@ async fn queue_report(
         "deliver_until_ms": obligation.deliver_until_ms,
         "size_bytes": obligation.payload.len(),
     });
-    match state.direct_send_outbox.enqueue(obligation, ledger).await {
-        EnqueueOutcome::Queued => Ok(delivery),
-        EnqueueOutcome::AlreadyQueued { deliver_until_ms } => {
-            delivery["deliver_until_ms"] = serde_json::json!(deliver_until_ms);
-            Ok(delivery)
-        }
-        EnqueueOutcome::Conflict | EnqueueOutcome::InFlight => Err((
-            StatusCode::CONFLICT,
-            "idempotency_conflict",
-            "a report with this logical_id is already queued or sent to this device".to_string(),
-        )),
-        EnqueueOutcome::Full => Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "outbox_full",
-            "the durable send outbox is full for this device or daemon; retry later".to_string(),
-        )),
-        EnqueueOutcome::NotDurable(detail) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "outbox_not_durable",
-            format!("the sent copy is held but its durability is not confirmed: {detail}"),
-        )),
-        EnqueueOutcome::WriteFailed(detail) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "outbox_write_failed",
-            detail,
-        )),
-    }
+    queue_outcome(
+        state.direct_send_outbox.enqueue(obligation, ledger).await,
+        delivery,
+    )
 }
 
 /// Parse the optional body: no JSON content type means the default.
@@ -1141,6 +1249,7 @@ pub(super) async fn create_report(
     };
     let data_dir = state.data_dir.clone();
     let send = target.is_some();
+    let sent_limit = sent_report_limit(&state.data_dir);
     let built = tokio::task::spawn_blocking(move || -> Result<BuiltLocalAndSent> {
         let home = dirs::home_dir();
         let mut all_secrets = secrets;
@@ -1155,7 +1264,7 @@ pub(super) async fn create_report(
         // The sent copy is built before anything is stored, so a copy
         // over its bound refuses the whole request.
         let sent = if send {
-            match build_sent_report(&inputs, &redactor) {
+            match build_sent_report(&inputs, &redactor, sent_limit) {
                 Ok(bytes) => Some(bytes),
                 Err(e) => return Ok(BuiltLocalAndSent::SentRefused(e)),
             }
@@ -1182,7 +1291,7 @@ pub(super) async fn create_report(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "report_too_large_to_send",
                     format!(
-                        "the sent copy is {len} bytes, over the {MAX_SENT_REPORT_BYTES}-byte \
+                        "the sent copy is {len} bytes, over the {sent_limit}-byte \
                          bound; nothing was stored or queued"
                     ),
                 ),
@@ -1219,20 +1328,29 @@ pub(super) async fn create_report(
                     super::routes::direct_outbox::now_unix_ms(),
                 ) {
                     Ok(obligation) => queue_report(&state, obligation).await,
-                    Err(detail) => {
-                        Err((StatusCode::INTERNAL_SERVER_ERROR, "report_failed", detail))
-                    }
+                    Err(detail) => Err(QueueRefusal {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        code: "report_failed",
+                        detail,
+                        delivery: None,
+                        keep_slot: false,
+                    }),
                 };
                 match queued {
                     Ok(delivery) => body["delivery"] = delivery,
-                    Err((status, code, detail)) => {
-                        // The bundle is stored; only the queue failed. Give
-                        // the slot back so the owner can retry at once.
-                        release_report_slot(slots, &data_dir, claimed);
+                    Err(refusal) => {
+                        // The bundle is stored; only the queue failed. The
+                        // slot goes back unless the copy may still be sent.
+                        if !refusal.keep_slot {
+                            release_report_slot(slots, &data_dir, claimed);
+                        }
                         body["ok"] = serde_json::json!(false);
-                        body["error"] = serde_json::json!(code);
-                        body["detail"] = serde_json::json!(detail);
-                        return (status, Json(body)).into_response();
+                        body["error"] = serde_json::json!(refusal.code);
+                        body["detail"] = serde_json::json!(refusal.detail);
+                        if let Some(delivery) = refusal.delivery {
+                            body["delivery"] = delivery;
+                        }
+                        return (refusal.status, Json(body)).into_response();
                     }
                 }
             }

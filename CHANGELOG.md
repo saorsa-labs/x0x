@@ -222,13 +222,16 @@ All notable changes to this project will be documented in this file.
   queues a sent copy to the named device on the durable direct-send
   outbox (#1109), which retries it while the device is offline, for up to
   24 hours. The device must hold a certificate this owner issued (not a
-  rider, not this daemon, not expired). The sent copy leaves out the log
+  rider, not this daemon, not expired, not revoked by the owner or
+  blocked); these checks run at request time only. The sent copy leaves out the log
   tail and the data-directory listing, holds the rest of the bundle after
   the same redactor, and is at most 32 KiB (`413
   report_too_large_to_send` otherwise). It is an ordinary direct message
   with logical id `x0x-report-<unix-secs>`; follow it with
   `GET /direct/receipts/{logical_id}?agent_id=<device>`. A refused target
-  does not use the one-per-minute slot. Nothing goes to the maintainers.
+  does not use the one-per-minute slot. The receiving device gets a plain
+  direct message; nothing there recognises or shows a report yet, and
+  nothing goes to the maintainers (#2157).
 
 - **Local problem reports: `POST /report` and `x0x report` (#1354 slice 2;
   A14 amendment of 20 Nov 2026).** The daemon builds a redacted
