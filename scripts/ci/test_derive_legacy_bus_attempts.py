@@ -96,7 +96,7 @@ class DerivationControls(unittest.TestCase):
         workspace = Path(__file__).resolve().parents[2]
         cargo = (workspace / "Cargo.toml").read_bytes()
         rust = (workspace / "src/legacy_bus_interop_tests.rs").read_bytes()
-        registry_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.95"\n'
+        registry_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.96"\n'
         git_pin_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.85"\n'
 
         def git_cargo(rev):
@@ -108,10 +108,10 @@ class DerivationControls(unittest.TestCase):
         module.validate_source_premise(git_cargo(module.GIT_PUBSUB_REV_ACCOUNTING), rust)
         for cargo_input, rust_input, code in (
             # The previous exact pin is rejected.
-            (cargo.replace(b'saorsa-gossip-pubsub = "=0.5.95"',
-                           b'saorsa-gossip-pubsub = "=0.5.94"'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (cargo.replace(b'saorsa-gossip-pubsub = "=0.5.96"',
+                           b'saorsa-gossip-pubsub = "=0.5.95"'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
             (git_cargo("0" * 40), rust, "WORKSPACE_PUBSUB_PATCH_MISMATCH"),
-            (registry_cargo.replace(b'=0.5.95', b'0.5.95'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (registry_cargo.replace(b'=0.5.96', b'0.5.96'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
             (cargo, rust.replace(b'const GIT_PUBSUB_VERSION: &str = "0.5.85"',
                                  b'const GIT_PUBSUB_VERSION: &str = "0.5.86"'), "RUST_GIT_PUBSUB_VERSION_MISMATCH"),
             (cargo, rust.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64, 1), "RUST_REGISTRY_PUBSUB_SHA_MISMATCH"),
@@ -143,41 +143,45 @@ class DerivationControls(unittest.TestCase):
             GIT_LOCK + GIT_LOCK,
             LOCK.replace(module.REGISTRY_PUBSUB_SOURCE.encode(), b'registry+https://example.invalid'),
             LOCK.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64),
-            # The 0.5.94 registry package (same pubsub sources) is not the
+            # The 0.5.95 registry package (same pubsub sources) is not the
             # reviewed producer.
-            LOCK.replace(b'0.5.95', b'0.5.94').replace(
+            LOCK.replace(b'0.5.96', b'0.5.95').replace(
+                module.REGISTRY_PUBSUB_SHA.encode(),
+                b"e4a433ec9d2b31bc1f47a12c512c14fb3bdcb765ccd393183d88d5a51948ece6"),
+            # Nor is 0.5.94 (same pubsub sources).
+            LOCK.replace(b'0.5.96', b'0.5.94').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"beb6146f3e75f1ffbcc97bc1e69c2a0ba77dc22cfd5736ffd2239c6f596ec75c"),
             # Nor is 0.5.93 (same pubsub sources).
-            LOCK.replace(b'0.5.95', b'0.5.93').replace(
+            LOCK.replace(b'0.5.96', b'0.5.93').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"a127ad3e5303d41dbe36a477b584e6a57821d9ae01445a692cff3c2f58a69920"),
             # Nor is the prior 0.5.92 one.
-            LOCK.replace(b'0.5.95', b'0.5.92').replace(
+            LOCK.replace(b'0.5.96', b'0.5.92').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"63b4b434fcce9f2cd5efb0d502dca6a6b75987c170f93ede8dafa7db3c4fea62"),
             # Nor is 0.5.91.
-            LOCK.replace(b'0.5.95', b'0.5.91').replace(
+            LOCK.replace(b'0.5.96', b'0.5.91').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"f69989fc3f21060f6294a359eb1ca15e0ccede5065bb8f92d75ed8fa703867e6"),
             # Nor is 0.5.90.
-            LOCK.replace(b'0.5.95', b'0.5.90').replace(
+            LOCK.replace(b'0.5.96', b'0.5.90').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"ae450e28dd005cd606e006815fde51e515c6c0dc671a94e5fc044e35228320b0"),
             # Nor is 0.5.89.
-            LOCK.replace(b'0.5.95', b'0.5.89').replace(
+            LOCK.replace(b'0.5.96', b'0.5.89').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"f3bec1a8233738b93f847040e7618e4f06d1e275e002845e558fef956412edb6"),
             # Nor is 0.5.88.
-            LOCK.replace(b'0.5.95', b'0.5.88').replace(
+            LOCK.replace(b'0.5.96', b'0.5.88').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097"),
             # Nor is 0.5.87.
-            LOCK.replace(b'0.5.95', b'0.5.87').replace(
+            LOCK.replace(b'0.5.96', b'0.5.87').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"d3d61f1e611205b38c896d61c7082d3c18f804a5417e02c28a6dcf3c954f3502"),
             # Nor is the earlier 0.5.86 one.
-            LOCK.replace(b'0.5.95', b'0.5.86').replace(
+            LOCK.replace(b'0.5.96', b'0.5.86').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
                 b"6325b0efd16dc1d1cafc33da30921bd6bf9009026ca36906dcc3eac73225aa82"),
         )
