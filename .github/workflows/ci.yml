@@ -113,14 +113,30 @@ jobs:
   # (the library test crate plus every integration-test binary) ran out of
   # memory there: the runner stopped with exit 143 while rustc built the
   # test graph (#1789; run 44976569803). This job runs the x0x library unit
-  # tests only, except the W3-H cases, built with the bounded `ci-hosted`
-  # profile (Cargo.toml) and extra swap. The full suite runs on the studio1 trains (the merge gate)
-  # and in ci-full.yml (nightly and on dispatch). The main ruleset requires
-  # the check name `Test Suite`.
+  # tests only, built with the bounded `ci-hosted` profile (Cargo.toml) and
+  # extra swap. It skips the W3-H cases and the slow tests named in
+  # X0X_HOSTED_SKIP below. The full suite, those tests included, runs on
+  # the studio1 trains (the merge gate) and in ci-full.yml (nightly and on
+  # dispatch). The main ruleset requires the check name `Test Suite`.
+  #
+  # Measured on 96519ee1 (job 137137607557): the cold ci-hosted build took
+  # 11m31s with swap near zero, and 4,876 of 7,807 tests ran in 786 s.
+  # That projects to about 21 min for the whole set, or about 18 min
+  # without the skipped slow tests. The test deadline (2400 s) and the job
+  # limit leave at least 2x that.
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
+    env:
+      # The one list of lib tests too slow for the hosted run (each took
+      # 60 s or more on a hosted runner: 459 s, 76 s and 62 s in job
+      # 137137607557). ci-full.yml runs them in `Test Suite (full)`.
+      # docs/cicd.md lists them; keep the two in step.
+      X0X_HOSTED_SKIP: >-
+        test(=evidence_wire::lookup::tests::s4_machine_resolution_work_is_independent_of_registry_size)
+        | test(=evidence_wire::admission_tests::issue1207_late_readiness_preserves_denials)
+        | test(=gossip::pubsub::tests::slice1_pinned_sg_concurrent_publishers_after_maintenance_timers)
     steps:
       - uses: actions/checkout@v5
 
@@ -189,16 +205,18 @@ jobs:
           free -m
           df -h /
 
-      # The W3-H cases are ~190 lib tests of up to 6 min each (about 95 min
-      # of test time in job 137015743935). They run 20 times each in the
-      # ci-full.yml shards, so this job skips them. The other ~7,800 lib
-      # tests took about 48 min of test time there, about 12 min on 4 threads.
+      # The W3-H cases (`(^|::)w3h_`, the same set as the `w3h-gate`
+      # default filter) run 20 times each in the ci-full.yml shards, so this
+      # job skips them. Other unit tests under src/server/w3h/ still run.
       - name: Run library unit tests
         id: tests
         env:
           X0X_ISOLATION_ROLE: hosted-lib
-          X0X_RUNTIME_TIMEOUT_SECONDS: 1500
-        run: bash scripts/ci/nextest-isolated.sh --locked --all-features --lib --cargo-profile ci-hosted -- --no-tests=fail -E 'not test(/w3h/)'
+          X0X_RUNTIME_TIMEOUT_SECONDS: 2400
+        run: >-
+          bash scripts/ci/nextest-isolated.sh --locked --all-features --lib --cargo-profile ci-hosted --
+          --no-tests=fail --no-fail-fast
+          -E "not test(/(^|::)w3h_/) and not (${X0X_HOSTED_SKIP})"
 
       - name: Upload test results
         if: always()
@@ -226,6 +244,36 @@ jobs:
           free -m
           df -h /
           du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+
+  # Inert controls for the scripts behind the ci-full.yml jobs. They take
+  # seconds and need no Rust build, so a change that breaks one fails here
+  # on the PR, not only in the nightly run. The moved jobs keep their own
+  # copies of these steps.
+  script-controls:
+    name: Inert CI script controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: W3-H shard plan and trace gate
+        run: |
+          python3 -B scripts/ci/test_w3h_shards.py -v
+          python3 -B scripts/ci/test_w3h_trace_check.py -v
+
+      - name: Linux systemd acceptance controls
+        run: |
+          python3 -B scripts/ci/test_systemd_literals.py --self-test
+          python3 -B scripts/ci/test_linux690_systemd_acceptance.py -v
+
+      - name: M2 release signing gate controls
+        run: python3 -B .github/scripts/test_m2_release_signing_gate.py -v
+
+      - name: Signing path 100k proof validator
+        run: python3 -B scripts/ci/validate-703-signing-proof.py --self-test
+
+      - name: Coverage Gate step controls
+        run: bash scripts/ci/test_coverage_gate.sh
 
   doc:
     name: Documentation

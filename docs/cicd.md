@@ -3,7 +3,7 @@
 The main workflows in `.github/workflows/`:
 
 - **ci.yml**: the slim hosted set on pushes to `main` and on PRs: fmt, clippy, the library unit tests
-  (`Test Suite`), doc, API/GUI parity, deployment authority, skill token budget
+  (`Test Suite`), inert CI script controls, doc, API/GUI parity, deployment authority, skill token budget
 - **ci-full.yml** (`CI (full)`): the heavy suites, nightly on `main` and on `workflow_dispatch`: the full
   workspace Test Suite, the W3-H shards and determinism gate, the released-binary rows, the Linux systemd and
   100k signing acceptances, Windows, and the Coverage Gate
@@ -44,15 +44,34 @@ H-S3-rm rows and the Coverage Gate lost their runners ("lost communication with 
 was green on studio1. The likely cause is memory exhaustion on the runner; the logs end without a
 compiler or test error.
 
-- `ci.yml` runs only what fits a hosted runner with a wide margin. Its `Test Suite` job runs the x0x library
-  unit tests (`--all-features --lib`) in the isolated namespace. It builds them with the `ci-hosted` Cargo
-  profile (no debuginfo, x0x at `opt-level = 0` with 256 codegen units) and adds 12 GB of swap.
+- `ci.yml` runs only what fits a hosted runner. Its `Test Suite` job runs the x0x library unit tests
+  (`--all-features --lib`) in the isolated namespace, with `--no-fail-fast`. It builds them with the
+  `ci-hosted` Cargo profile (no debuginfo, x0x at `opt-level = 0` with 256 codegen units) and adds 12 GB of
+  swap. It skips two sets of lib tests:
+  - the W3-H cases (`(^|::)w3h_`, the `w3h-gate` default filter). Other unit tests under `src/server/w3h/`
+    still run;
+  - the tests that took 60 s or more on a hosted runner, named in `X0X_HOSTED_SKIP` in `ci.yml`:
+    `evidence_wire::lookup::tests::s4_machine_resolution_work_is_independent_of_registry_size` (459 s),
+    `evidence_wire::admission_tests::issue1207_late_readiness_preserves_denials` (76 s) and
+    `gossip::pubsub::tests::slice1_pinned_sg_concurrent_publishers_after_maintenance_timers` (62 s).
+  Keep this list and `X0X_HOSTED_SKIP` in step.
+- Measured on a hosted runner (job 137137607557): the cold `ci-hosted` build took 11m31s with swap near
+  zero, and 4,876 of 7,807 tests ran in 786 s. That projects to about 21 min for all of them, or about
+  18 min without the skipped slow tests. The test deadline is 2400 s and the job limit is 75 min, at least
+  2x the projection.
+- The `Inert CI script controls` job runs the script self-tests behind the `ci-full.yml` jobs (W3-H shard
+  plan and trace gate, systemd acceptance, M2 signing gate, the #703 proof validator, the Coverage Gate
+  step controls) on every PR. They take seconds.
 - The studio1 trains run the full suite and are the merge gate.
-- `ci-full.yml` runs the heavy jobs nightly on `main` and on `workflow_dispatch` for any branch. A
-  harness-first PR gets its 20 W3-H CI reruns (A08, D196) by dispatching `CI (full)` on its branch.
+- `ci-full.yml` runs the heavy jobs nightly on `main` and on `workflow_dispatch` for any branch. They gate
+  neither merges nor releases. That includes `Test Suite (Windows)` and the `Coverage Gate`, which no
+  longer run on PRs at all.
+- The 20 W3-H reruns that D196 (A08) requires for a harness case are not automatic on a PR. Someone must
+  dispatch `CI (full)` on the PR branch by hand.
 - `integration.yml`, `build.yml` and `security.yml` still run on every PR (ADR 0087 rule 1).
 - Every PR workflow cancels an older run for the same PR. Push runs on `main` are never cancelled, so each
-  merge commit keeps a terminal `ci.yml` result for the release gate.
+  merge commit keeps a terminal `ci.yml` result for the release gate. `ci-full.yml` cancels only an older
+  run of the same event on the same ref, so a dispatch never cancels a nightly run.
 
 ## Release CI Gate (#128)
 

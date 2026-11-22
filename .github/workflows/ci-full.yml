@@ -28,9 +28,11 @@ env:
   CMAKE_x86_64_unknown_linux_gnu: ${{ github.workspace }}/scripts/ci/cmake-policy-min.sh
   RUST_BACKTRACE: 1
 
-# A newer run for the same ref replaces an older one still in flight.
+# A newer run of the same event on the same ref replaces an older one
+# still in flight. The event is in the group, so a dispatch on main never
+# cancels an in-flight nightly run, and a nightly never cancels a dispatch.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

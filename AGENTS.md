@@ -13,8 +13,10 @@ Docs are in `docs/` (start with `docs/api-reference.md`); test detail is in
 - Required checks on `main`: Format Check, Clippy Lint
   (`cargo clippy --all-targets --all-features -- -D warnings`), Test Suite,
   Documentation (`RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`)
-  and Build linux-x64-gnu. CI runs more jobs than these (coverage, parity,
-  integration, deployment authority); see `.github/workflows/`.
+  and Build linux-x64-gnu. PR CI also runs parity, integration and
+  deployment authority. Hosted `Test Suite` is the lib unit tests only; the
+  full suite, W3-H shards, Windows and coverage run in `ci-full.yml`
+  (nightly and on dispatch) and on the studio1 trains (`docs/cicd.md`).
 - `ant-quic` and `saorsa-gossip-*` are exact-pinned crates.io versions and
   `Cargo.lock` is tracked; CI builds with `--locked`. A local `[patch]` to a
   sibling checkout must not be committed.
