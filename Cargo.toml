@@ -1,6 +1,6 @@
 [package]
 name = "x0x"
-version = "0.49.0"
+version = "0.49.1"
 edition = "2021"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
@@ -12,10 +12,23 @@ readme = "README.md"
 keywords = ["gossip", "ai-agents", "p2p", "decentralised", "post-quantum"]
 categories = ["network-programming", "asynchronous"]
 authors = ["David Irvine <david@saorsalabs.com>"]
-# Proof artefacts are committed to the git repo for reviewers + CI but are
-# not needed to compile the crate. Excluding them keeps the published
-# tarball under crates.io's 10 MB limit.
-exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
+exclude = [
+    "proofs/**",
+    "tests/**",
+    "!tests/voice_e2e.rs",
+    "!tests/voice_datagram_e2e.rs",
+    "docs/**",
+    "issues/**",
+    "scripts/**",
+    ".github/**",
+    ".claude/**",
+    "agent/**",
+    "*.bak",
+    "*.bak-*",
+    "autoresearch.jsonl",
+    "TEST_SUITE_GUIDE.md",
+    "target/**",
+]
 
 [dependencies]
 anyhow = "1.0"
