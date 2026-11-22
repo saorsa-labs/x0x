@@ -487,11 +487,35 @@ fn saved_heads(row: &x0x::groups::eviction::ObligationRow) -> Option<(String, St
     Some((parent, result, false))
 }
 
-/// #2135: whether `marker` names a competing child of `parent`, so that a
-/// saved transition `parent` → `result` is on a branch the marker forks.
-fn marker_competes(marker: &x0x::groups::ForkQuarantine, parent: &str, result: &str) -> bool {
-    let conflicting = &marker.snapshot.conflicting_commit;
-    conflicting.prev_state_hash.as_deref() == Some(parent) && conflicting.state_hash != result
+/// #2135: whether `marker` competes with a saved transition that ends at
+/// `result`, so that the transition is on a branch the marker forks. The
+/// marker is unrelated only when its competing commit chains on `result`
+/// itself or on a later commit of this node's chain above it: then the
+/// transition is common ancestry of both branches. Any other marker, a
+/// sibling of the transition or a commit deeper in a competing branch,
+/// competes. The walk reads only this node's retained chain.
+fn marker_competes(marker: &x0x::groups::ForkQuarantine, info: &GroupInfo, result: &str) -> bool {
+    let Some(fork_parent) = marker
+        .snapshot
+        .conflicting_commit
+        .prev_state_hash
+        .as_deref()
+    else {
+        return true;
+    };
+    if fork_parent == result {
+        return false;
+    }
+    let revision_of = |hash: &str| {
+        info.commit_log
+            .iter()
+            .find(|retained| retained.commit.state_hash == hash)
+            .map(|retained| retained.commit.revision)
+    };
+    match (revision_of(result), revision_of(fork_parent)) {
+        (Some(result_revision), Some(fork_revision)) => fork_revision <= result_revision,
+        _ => true,
+    }
 }
 
 /// The stored fork wait of a row and the competing committer it names, if
@@ -558,7 +582,7 @@ pub(super) fn settle_forked_saves(
             let mut waiting = WaitingState::cause(WaitingCause::WaitingForForkResolution);
             if heads
                 .as_ref()
-                .is_some_and(|(parent, result, _)| marker_competes(marker, parent, result))
+                .is_some_and(|(_, result, _)| marker_competes(marker, info, result))
             {
                 if let Ok(signer) = super::super::parse_agent_id_hex(&marker.committed_by) {
                     waiting.named = vec![*signer.as_bytes()];
@@ -572,6 +596,9 @@ pub(super) fn settle_forked_saves(
             continue;
         }
         changed = true;
+        if let Some(row) = store.get_mut(&key) {
+            row.waiting = None;
+        }
         let Some((parent, result, is_removal)) = heads else {
             continue;
         };
@@ -1401,9 +1428,9 @@ mod tests {
         assert!(store.get(&key).expect("row").outgoing_event.is_none());
     }
 
-    /// #2173 review: a marker for another conflict (its competing commit is
-    /// not a child of the saved event's parent). After the clear the saved
-    /// removal is this node's committed head, so it resumes its delivery
+    /// #2173 review: a marker for another conflict (its competing commit
+    /// chains on the saved removal's own result, so the removal is common
+    /// ancestry). After the clear the saved removal resumes its delivery
     /// (after the head sync) instead of being dropped.
     #[test]
     fn an_unrelated_marker_clear_resumes_the_saved_removal() {
@@ -1411,7 +1438,7 @@ mod tests {
         let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
         let mut unrelated = marked(info.clone());
         if let Some(marker) = unrelated.fork_quarantine.as_mut() {
-            marker.snapshot.conflicting_commit = commit("x", "y");
+            marker.snapshot.conflicting_commit = commit("r", "z");
         }
         let held = vec![("g".to_string(), unrelated)];
         settle_forked_saves(&held, &[1; 32], &mut store, &mut removals, &mut ce_state);
@@ -1496,7 +1523,7 @@ mod tests {
             let mut held = marked(info.clone());
             if !competing {
                 if let Some(marker) = held.fork_quarantine.as_mut() {
-                    marker.snapshot.conflicting_commit = commit("x", "y");
+                    marker.snapshot.conflicting_commit = commit("r", "z");
                 }
             }
             let held = vec![("g".to_string(), held)];
@@ -1508,6 +1535,53 @@ mod tests {
             assert_eq!(kept, !competing, "competing: {competing}");
             assert_eq!(ce_state.delivering().contains(&key), !competing);
         }
+    }
+
+    /// #2173 review: a competing commit deeper in another branch (its parent
+    /// is not on this node's chain) competes like a direct sibling, so the
+    /// saved removal is dropped after the clear, never resumed.
+    #[test]
+    fn a_deeper_competing_descendant_still_competes() {
+        let info = info_with_log("r", &[("p", "r")]);
+        let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
+        let mut deeper = marked(info.clone());
+        if let Some(marker) = deeper.fork_quarantine.as_mut() {
+            marker.snapshot.conflicting_commit = commit("x", "y");
+        }
+        let held = vec![("g".to_string(), deeper)];
+        settle_forked_saves(&held, &[1; 32], &mut store, &mut removals, &mut ce_state);
+        let cleared = vec![("g".to_string(), with_members(info))];
+        settle_forked_saves(&cleared, &[1; 32], &mut store, &mut removals, &mut ce_state);
+        assert!(store.get(&key).expect("row").outgoing_event.is_none());
+        assert!(removals.is_empty());
+    }
+
+    /// #2173 review: a saved event that cannot be decoded is released once
+    /// after the clear; later passes change nothing.
+    #[test]
+    fn an_undecodable_saved_event_is_released_once() {
+        let info = info_with_log("r", &[("p", "r")]);
+        let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
+        if let Some(row) = store.get_mut(&key) {
+            row.outgoing_event = Some(b"not an event".to_vec());
+        }
+        let held = vec![("g".to_string(), marked(info.clone()))];
+        settle_forked_saves(&held, &[1; 32], &mut store, &mut removals, &mut ce_state);
+        let cleared = vec![("g".to_string(), info)];
+        assert!(settle_forked_saves(
+            &cleared,
+            &[1; 32],
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+        assert!(!settle_forked_saves(
+            &cleared,
+            &[1; 32],
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
     }
 
     /// #2163 review blocker: the competing child is on this node's chain

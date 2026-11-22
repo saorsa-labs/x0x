@@ -353,80 +353,72 @@ pub struct CapabilityStore {
 /// #2135: the application-registry bits the store keeps for an agent after
 /// its verified advert expires. A gate that must not fall back while a peer
 /// is only offline or withholding its advert reads them through
-/// [`CapabilityStore::registry_bit_seen`].
+/// [`CapabilityStore::registry_bit_ready`].
 pub const STICKY_REGISTRY_BITS: u64 = crate::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
 
-/// #2135: the most agents [`CapabilityStore`] keeps sticky bits for; the
-/// agent seen longest ago is dropped first.
-pub const STICKY_REGISTRY_CAP: usize = 16_384;
-
-/// #2135: one agent's sticky registry bits and when a verified advert last
-/// showed them.
+/// #2135: one agent's sticky registry bits and the signed timestamp of the
+/// verified advert that last set them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StickySeen {
     /// The [`STICKY_REGISTRY_BITS`] the agent's verified advert showed.
     pub bits: u64,
-    /// Local time of that advert (Unix ms).
-    pub last_seen_unix_ms: u64,
+    /// The advert's own signed `created_at` (Unix ms). Only a verified
+    /// advert signed later may drop the bits, so a replayed older advert
+    /// never clears them.
+    pub advert_created_at_unix_ms: u64,
 }
 
+/// #2135: the sticky record. It holds only agents in `scope`, the members
+/// of this node's groups that the daemon sets
+/// ([`CapabilityStore::set_sticky_scope`]), so adverts from the rest of the
+/// mesh never add or push out a record. Its size is the local membership.
 #[derive(Default)]
 struct StickyRegistry {
     seen: HashMap<[u8; 32], StickySeen>,
-    /// Bumped when an agent or its bits are added or dropped, not when only
-    /// `last_seen_unix_ms` moves, so a writer persists on change only.
+    scope: std::collections::HashSet<[u8; 32]>,
+    /// Bumped on every change, so a writer persists on change only.
     generation: u64,
 }
 
 impl StickyRegistry {
-    fn note(&mut self, agent: [u8; 32], registry: crate::dm::CapabilityRegistry, now_ms: u64) {
-        let shown = if registry.version == 1 {
+    fn shown(registry: crate::dm::CapabilityRegistry) -> u64 {
+        if registry.version == 1 {
             registry.bits & STICKY_REGISTRY_BITS
         } else {
             0
-        };
-        if shown == 0 {
-            // A current verified advert without the bits: the agent runs a
-            // binary that does not have them (a downgrade).
-            if self.seen.remove(&agent).is_some() {
-                self.generation += 1;
-            }
+        }
+    }
+
+    /// A verified advert of `agent` signed at `created_at` with `registry`.
+    fn note(&mut self, agent: [u8; 32], registry: crate::dm::CapabilityRegistry, created_at: u64) {
+        if !self.scope.contains(&agent) {
             return;
         }
-        match self.seen.get_mut(&agent) {
-            Some(entry) if entry.bits == shown => {
-                entry.last_seen_unix_ms = now_ms;
-                return;
+        let shown = Self::shown(registry);
+        match self.seen.get(&agent).copied() {
+            Some(entry) if created_at <= entry.advert_created_at_unix_ms => {}
+            Some(entry) if shown == entry.bits => {
+                if let Some(stored) = self.seen.get_mut(&agent) {
+                    stored.advert_created_at_unix_ms = created_at;
+                }
             }
-            Some(entry) => {
-                entry.bits = shown;
-                entry.last_seen_unix_ms = now_ms;
+            Some(_) if shown == 0 => {
+                // A newer verified advert without the bits: the agent runs a
+                // binary that does not have them (a downgrade).
+                self.seen.remove(&agent);
+                self.generation += 1;
             }
-            None => {
+            _ if shown == 0 => {}
+            _ => {
                 self.seen.insert(
                     agent,
                     StickySeen {
                         bits: shown,
-                        last_seen_unix_ms: now_ms,
+                        advert_created_at_unix_ms: created_at,
                     },
                 );
-                self.evict_over_cap();
+                self.generation += 1;
             }
-        }
-        self.generation += 1;
-    }
-
-    fn evict_over_cap(&mut self) {
-        while self.seen.len() > STICKY_REGISTRY_CAP {
-            let Some(oldest) = self
-                .seen
-                .iter()
-                .min_by_key(|(id, entry)| (entry.last_seen_unix_ms, **id))
-                .map(|(id, _)| *id)
-            else {
-                return;
-            };
-            self.seen.remove(&oldest);
         }
     }
 }
@@ -650,18 +642,65 @@ impl CapabilityStore {
         Some(entry.capabilities.application_registry.supports(bit))
     }
 
-    /// #2135: whether a verified advert of this agent has shown `bit` (one
-    /// of [`STICKY_REGISTRY_BITS`]) and no later verified advert dropped it.
-    /// It stays true after the advert expires and after a restart that
-    /// seeded the record ([`Self::seed_sticky`]).
+    /// #2135: whether `agent` takes `bit` (one of [`STICKY_REGISTRY_BITS`]):
+    /// its current verified advert sets it, or, with no current advert or a
+    /// replayed older one, the sticky record holds it. A newer verified
+    /// advert without the bit drops the record, so a downgrade that
+    /// advertises means not ready.
     #[must_use]
-    pub fn registry_bit_seen(&self, agent_id: &AgentId, bit: u64) -> bool {
-        self.sticky.lock().is_ok_and(|sticky| {
-            sticky
-                .seen
-                .get(agent_id.as_bytes())
-                .is_some_and(|entry| entry.bits & bit == bit)
-        })
+    pub fn registry_bit_ready(&self, agent_id: &AgentId, bit: u64) -> bool {
+        self.verified_registry_supports(agent_id, bit) == Some(true)
+            || self.sticky.lock().is_ok_and(|sticky| {
+                sticky
+                    .seen
+                    .get(agent_id.as_bytes())
+                    .is_some_and(|entry| entry.bits & bit == bit)
+            })
+    }
+
+    /// #2135: set the agents the sticky record may hold: the members of
+    /// this node's groups. A record outside the new scope is dropped. An
+    /// agent new to the scope whose current verified advert shows a sticky
+    /// bit is recorded at once, so a member whose advert arrived before it
+    /// joined is not missed.
+    pub fn set_sticky_scope(&self, scope: impl IntoIterator<Item = AgentId>) {
+        let scope: std::collections::HashSet<[u8; 32]> =
+            scope.into_iter().map(|agent| agent.0).collect();
+        let current: Vec<([u8; 32], crate::dm::CapabilityRegistry, u64)> = {
+            let Ok(inner) = self.inner.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            inner
+                .adverts
+                .iter()
+                .filter(|(id, entry)| {
+                    scope.contains(*id)
+                        && entry.verified_advert
+                        && entry.machine_id != [0; 32]
+                        && now <= entry.expires_at
+                })
+                .map(|(id, entry)| {
+                    (
+                        *id,
+                        entry.capabilities.application_registry,
+                        entry.created_at_unix_ms,
+                    )
+                })
+                .collect()
+        };
+        let Ok(mut sticky) = self.sticky.lock() else {
+            return;
+        };
+        let before = sticky.seen.len();
+        sticky.seen.retain(|id, _| scope.contains(id));
+        if sticky.seen.len() != before {
+            sticky.generation += 1;
+        }
+        sticky.scope = scope;
+        for (id, registry, created_at) in current {
+            sticky.note(id, registry, created_at);
+        }
     }
 
     /// #2135: the sticky record and its generation, for a writer that
@@ -680,23 +719,31 @@ impl CapabilityStore {
         (sticky.generation, entries)
     }
 
-    /// #2135: load a persisted sticky record at startup. An agent this
-    /// store already knows keeps its in-memory entry; only the bits in
-    /// [`STICKY_REGISTRY_BITS`] are kept.
+    /// #2135: load a persisted sticky record at startup, after
+    /// [`Self::set_sticky_scope`]. Entries outside the scope are not kept;
+    /// an entry the store already holds keeps the one with the later advert.
     pub fn seed_sticky(&self, entries: impl IntoIterator<Item = (AgentId, StickySeen)>) {
         let Ok(mut sticky) = self.sticky.lock() else {
             return;
         };
         for (agent, entry) in entries {
             let bits = entry.bits & STICKY_REGISTRY_BITS;
-            if bits != 0 {
-                sticky.seen.entry(agent.0).or_insert(StickySeen {
-                    bits,
-                    last_seen_unix_ms: entry.last_seen_unix_ms,
-                });
+            if bits == 0 || !sticky.scope.contains(&agent.0) {
+                continue;
+            }
+            let newer = sticky.seen.get(&agent.0).is_none_or(|held| {
+                entry.advert_created_at_unix_ms > held.advert_created_at_unix_ms
+            });
+            if newer {
+                sticky.seen.insert(
+                    agent.0,
+                    StickySeen {
+                        bits,
+                        advert_created_at_unix_ms: entry.advert_created_at_unix_ms,
+                    },
+                );
             }
         }
-        sticky.evict_over_cap();
     }
 
     /// Whether the newest CURRENT VERIFIED advert signed by `machine`
@@ -882,7 +929,7 @@ impl CapabilityStore {
                 sticky.note(
                     *agent_id.as_bytes(),
                     capabilities.application_registry,
-                    now_unix_ms(),
+                    created_at_unix_ms,
                 );
             }
         }
@@ -1210,6 +1257,111 @@ pub fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registry_caps(bits: u64) -> DmCapabilities {
+        let mut caps = DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        caps.application_registry = crate::dm::CapabilityRegistry { version: 1, bits };
+        caps
+    }
+
+    const STICKY_BIT: u64 = crate::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
+
+    /// #2173 review (blocker 1): 20,000 adverts from agents outside this
+    /// node's groups neither record nor push out a member's sticky bit, so
+    /// mesh growth or a flood of fresh keys cannot bring back the legacy
+    /// binding.
+    #[test]
+    fn non_member_adverts_never_touch_a_members_sticky_record() {
+        let store = CapabilityStore::new();
+        let member = AgentId([1; 32]);
+        store.set_sticky_scope([member]);
+        let now = now_unix_ms();
+        assert!(store.insert(member, MachineId([4; 32]), registry_caps(STICKY_BIT), now));
+        for n in 0..20_000u32 {
+            let mut id = [0xee; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            store.insert(
+                AgentId(id),
+                MachineId([4; 32]),
+                registry_caps(STICKY_BIT),
+                now,
+            );
+        }
+        let (_, entries) = store.sticky_snapshot();
+        assert_eq!(entries.len(), 1, "only the member is recorded");
+        assert_eq!(entries[0].0, member);
+    }
+
+    /// A member that leaves every local group loses its record; the other
+    /// member keeps its own.
+    #[test]
+    fn a_member_that_leaves_every_group_is_dropped() {
+        let store = CapabilityStore::new();
+        let (stays, leaves) = (AgentId([1; 32]), AgentId([2; 32]));
+        store.set_sticky_scope([stays, leaves]);
+        let now = now_unix_ms();
+        for agent in [stays, leaves] {
+            assert!(store.insert(agent, MachineId([4; 32]), registry_caps(STICKY_BIT), now));
+        }
+        store.set_sticky_scope([stays]);
+        let (_, entries) = store.sticky_snapshot();
+        assert_eq!(
+            entries.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![stays]
+        );
+    }
+
+    /// A member whose advert arrived before it joined is recorded when it
+    /// enters the scope.
+    #[test]
+    fn an_advert_seen_before_joining_counts_at_join() {
+        let store = CapabilityStore::new();
+        let member = AgentId([3; 32]);
+        assert!(store.insert(
+            member,
+            MachineId([4; 32]),
+            registry_caps(STICKY_BIT),
+            now_unix_ms()
+        ));
+        assert!(store.sticky_snapshot().1.is_empty(), "not a member yet");
+        store.set_sticky_scope([member]);
+        assert_eq!(store.sticky_snapshot().1.len(), 1);
+    }
+
+    /// #2173 review (item 4): after a restart, a replayed advert older than
+    /// the one that set the record, without the bit, neither clears the
+    /// record nor makes the member not ready. A newer advert without the
+    /// bit (a real downgrade) does both.
+    #[test]
+    fn only_a_newer_advert_without_the_bit_clears_the_record() {
+        let member = AgentId([5; 32]);
+        let now = now_unix_ms();
+        let before = CapabilityStore::new();
+        before.set_sticky_scope([member]);
+        assert!(before.insert(
+            member,
+            MachineId([4; 32]),
+            registry_caps(STICKY_BIT),
+            now - 1_000
+        ));
+        let (_, saved) = before.sticky_snapshot();
+
+        let after = CapabilityStore::new();
+        after.set_sticky_scope([member]);
+        after.seed_sticky(saved);
+        assert!(after.insert(member, MachineId([4; 32]), registry_caps(0), now - 2_000));
+        assert!(
+            after.registry_bit_ready(&member, STICKY_BIT),
+            "a replay changes nothing"
+        );
+        assert_eq!(after.sticky_snapshot().1.len(), 1);
+        assert!(after.insert(member, MachineId([4; 32]), registry_caps(0), now));
+        assert!(
+            !after.registry_bit_ready(&member, STICKY_BIT),
+            "a downgrade clears it"
+        );
+        assert!(after.sticky_snapshot().1.is_empty());
+    }
 
     /// #1776: a binding is gossip-usable only with a real machine, the
     /// gossip-inbox capability and KEM material. Each missing part alone

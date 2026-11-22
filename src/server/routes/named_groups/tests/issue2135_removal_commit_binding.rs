@@ -53,7 +53,7 @@ fn seed_sticky(state: &AppState, agent: &AgentId) {
         *agent,
         x0x::dm_capability::StickySeen {
             bits: x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1,
-            last_seen_unix_ms: 1,
+            advert_created_at_unix_ms: 1,
         },
     )]);
 }
@@ -295,6 +295,10 @@ async fn fixture(l: Advert, target: Advert) -> Result<Fixture> {
             .await
             .insert(GROUP.to_string(), Arc::new(tokio::sync::Mutex::new(tree)));
     }
+    // The scope the daemon's writer sets: the members of A's groups.
+    a.agent
+        .capability_store()
+        .set_sticky_scope([a_id, d_id, l_id, t_id]);
     seed_advert(&a, &a_id, all_bits());
     seed_advert(&a, &d_id, all_bits());
     apply_advert(&a, &l_id, l);
@@ -445,9 +449,9 @@ async fn an_expired_advert_keeps_the_commit_bound_form() -> Result<()> {
         l_id,
         x0x::identity::MachineId([4; 32]),
         caps,
-        x0x::dm::now_unix_ms() - ttl_ms + 300,
+        x0x::dm::now_unix_ms() - ttl_ms + 2_000,
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
     let bit = x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
     assert_eq!(
         store.verified_registry_supports(&l_id, bit),
@@ -584,7 +588,7 @@ async fn a_member_applies_a_commit_bound_ban_and_refuses_other_bytes() -> Result
 async fn a_failed_seal_rolls_the_tree_back() -> Result<()> {
     for ban in [false, true] {
         let f = fixture(ready(), ready()).await?;
-        arm_removal_seal_fault_for_test(GROUP);
+        arm_removal_seal_fault_for_test(&f.a);
         let (status, body) = if ban {
             ban_via_route(&f.a, &f.target_hex()).await
         } else {
@@ -608,26 +612,99 @@ async fn a_failed_seal_rolls_the_tree_back() -> Result<()> {
     Ok(())
 }
 
-/// The sticky record survives a restart through its file.
+/// #2173 review (item 3): the persistence through the daemon's startup
+/// path and the real file. A record for L (no advert at all) written before
+/// startup makes L ready after it; the writer then writes the scoped record
+/// (D and T, whose adverts were cached); when L leaves the group, the next
+/// write drops L and keeps the others.
 #[tokio::test]
-async fn the_sticky_record_survives_a_restart() -> Result<()> {
-    let (before, dir) = secure_endpoint_test_state().await?;
-    let peer = AgentKeypair::generate()?.agent_id();
-    seed_advert(&before, &peer, all_bits());
-    let (_, entries) = before.agent.capability_store().sticky_snapshot();
-    crate::server::sticky_capabilities::write(dir.path(), &entries).await?;
-    let (after, _after_dir) = secure_endpoint_test_state().await?;
+async fn the_sticky_record_survives_a_restart_through_startup() -> Result<()> {
+    let f = fixture(Advert::Never, ready()).await?;
+    let l_id = f.l.agent.agent_id();
     let bit = x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
-    assert!(!after.agent.capability_store().registry_bit_seen(&peer, bit));
-    let bytes = tokio::fs::read(crate::server::sticky_capabilities::path_in(dir.path())).await?;
-    let restored: serde_json::Value = serde_json::from_slice(&bytes)?;
-    assert_eq!(
-        restored["entries"][0]["agent_id"],
-        hex::encode(peer.as_bytes())
+    let path = crate::server::sticky_capabilities::path_in(&f.a.data_dir);
+    crate::server::sticky_capabilities::write(
+        &f.a.data_dir,
+        &[(
+            l_id,
+            x0x::dm_capability::StickySeen {
+                bits: bit,
+                advert_created_at_unix_ms: 1,
+            },
+        )],
+    )
+    .await?;
+    let store = f.a.agent.capability_store();
+    store.set_sticky_scope([]);
+    assert!(!store.registry_bit_ready(&l_id, bit));
+
+    let writer = crate::server::sticky_capabilities::start_with_interval(
+        &f.a,
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+    assert!(
+        store.registry_bit_ready(&l_id, bit),
+        "the startup load seeds L"
     );
-    crate::server::sticky_capabilities::load_into(dir.path(), &after.agent.capability_store())
-        .await;
-    assert!(after.agent.capability_store().registry_bit_seen(&peer, bit));
+    let on_disk = |want: Vec<AgentId>, gone: Vec<AgentId>| {
+        let path = path.clone();
+        async move {
+            for _ in 0..200 {
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    let text = String::from_utf8_lossy(&bytes).to_string();
+                    let has = |id: &AgentId| text.contains(&hex::encode(id.as_bytes()));
+                    if want.iter().all(has) && !gone.iter().any(has) {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            false
+        }
+    };
+    let d_id = f.d_kp.agent_id();
+    let t_id = f.target();
+    assert!(
+        on_disk(vec![l_id, d_id, t_id], vec![]).await,
+        "the writer writes the scoped record"
+    );
+    {
+        let mut groups = f.a.named_groups.write().await;
+        if let Some(info) = groups.get_mut(GROUP) {
+            info.remove_member(&Fixture::hex(&l_id), None);
+        }
+    }
+    assert!(
+        on_disk(vec![d_id, t_id], vec![l_id]).await,
+        "L left the group: its record is dropped, the others stay"
+    );
+    writer.abort();
+    Ok(())
+}
+
+/// #2173 review (item 5): the seal fails and the restore fails too. The
+/// route answers `treekem_rollback_failed` and the tree is already unloaded
+/// when the reply arrives, so no request can use the advanced tree.
+#[tokio::test]
+async fn a_failed_restore_answers_treekem_rollback_failed_and_unloads_the_tree() -> Result<()> {
+    for ban in [false, true] {
+        let f = fixture(ready(), ready()).await?;
+        arm_removal_seal_fault_for_test(&f.a);
+        arm_rollback_restore_fault_for_test(&f.a);
+        let (status, body) = if ban {
+            ban_via_route(&f.a, &f.target_hex()).await
+        } else {
+            remove_via_route(&f.a, &f.target_hex()).await
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"], TREEKEM_ROLLBACK_FAILED);
+        assert!(
+            !f.a.treekem_groups.read().await.contains_key(GROUP),
+            "the tree is unloaded before the reply"
+        );
+        assert_eq!(f.head(&f.a).await.state_hash, f.parent.state_hash);
+    }
     Ok(())
 }
 
