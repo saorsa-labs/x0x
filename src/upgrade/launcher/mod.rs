@@ -20,6 +20,8 @@ pub(crate) mod forward;
 pub(crate) mod issuer;
 #[path = "../journal.rs"]
 mod journal;
+#[path = "../plan_binding.rs"]
+mod plan_binding;
 #[path = "../probe.rs"]
 mod probe;
 mod recovery;
