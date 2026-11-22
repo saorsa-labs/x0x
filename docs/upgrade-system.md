@@ -481,6 +481,66 @@ launcher's `Host::new` and the arm handler read. No apply path calls it yet.
   canonical running executable, so a daemon started through a symlink is
   compared by the file it runs.
 
+#### Plan binding (#2012, B4, dormant)
+
+The journal's own shape cannot change (`JournalRecord` refuses unknown
+fields), so two more records bind it (`upgrade::plan_binding`):
+
+- **Plan anchor.** A JSON file that root writes when it installs the
+  launcher. It names the approved install:
+
+  ```json
+  {"schema": 1, "record_kind": "plan_anchor",
+   "daemon_target": "/opt/x0x/x0xd", "cli_target": "/opt/x0x/x0x",
+   "participants": [{"instance_id": "x0xd", "data_root": "/var/lib/x0x"}]}
+  ```
+
+  The launcher argv names it with `--plan-anchor <absolute path>`. No
+  installer writes one yet; the drop-in installer will (a later step of
+  the launcher enable plan on #2012).
+- **Plan binding.** `<data_root>/upgrade-plan-binding.json`, mode 0600,
+  beside the journal: `{schema: 1, record_kind: "plan_binding",
+  transaction_id, generation, plan_sha256, anchor_sha256}`. `plan_sha256`
+  is the SHA-256 of the frozen plan's JSON (the digest the trial binding
+  uses); `anchor_sha256` is the SHA-256 of the anchor file's bytes.
+
+`Prepared::stage` takes the read anchor by type. It refuses a plan whose
+daemon target, CLI target, or set of (instance id, data root) is not
+exactly the anchor's, before it writes anything. It writes the binding,
+then the Staged journal. The binding stays the same for the whole
+transaction.
+
+The issuer checks both only where it would give a trial. Each failure is a
+typed refusal (78):
+
+- the argv names no `--plan-anchor`;
+- the anchor path is not absolute and canonical, or an ancestor is not a
+  directory of root that no group or other account can write (a sticky
+  directory is allowed);
+- the anchor, opened once without following a symlink, is not a regular
+  file of root that no group or other account can write, is over 64 KiB,
+  or does not parse as schema 1;
+- the binding, opened through the checked host root without following a
+  symlink, is missing or not a 0600 regular file of the launcher's
+  account;
+- the binding names another transaction, generation, plan or anchor, or
+  the plan names another install pair or other participants than the
+  anchor.
+
+An I/O error while reading either file is a failed read (75). A
+passthrough needs neither file, so a unit without `--plan-anchor` (one an
+older installer wrote) still starts, but can never own a trial.
+
+**Limit.** The binding fixes which install a plan can name: the install
+pair, the participants and their data roots. The daemon's account cannot
+change those. It does not authenticate the artifact hashes, versions,
+arguments or environment inside the plan: anything that runs as the
+daemon's account, the candidate included, can still write a journal and a
+matching binding for the anchored install. On macOS the launchd plist is
+the user's own file, so an anchor there could only be tamper-evidence; the
+launcher accepts only a root-owned anchor on every platform for now
+(#1379).
+
 ## Restart ownership is resolved before mutation (ADR-0061, #493)
 
 The daemon resolves and validates the whole restart contract **before it
@@ -710,7 +770,7 @@ argv contract and the exit codes are provisional and dormant. They are
 frozen before `ENABLED = true`, like the fd 3 boot contract. The main
 loop (`start.rs`, #1378) owns the trial only when the engine is enabled
 and the issuer gives it a host. Only the trial form of the argv,
-`x0x-launcher --host-root /abs/data-root --instance ID -- /abs/x0xd [args]`,
+`x0x-launcher --host-root /abs/data-root --instance ID [--plan-anchor /abs/anchor] -- /abs/x0xd [args]`,
 consults the issuer (`issuer.rs`): it opens `<host-root>/upgrade-journal.json`
 once without following a symlink and requires, on that descriptor, a
 regular file of the launcher's account with mode exactly 0600, in a
@@ -727,11 +787,12 @@ non-regular or oversized trial record) exits 78; a failed read exits 75,
 and so does a plan path that is missing, since it may appear by itself (a
 volume not yet mounted at boot). Only the issuer's typed refusal exits 78;
 an untyped I/O error is a failed read. The journal
-has no hash or signature: anything that runs as the launcher's account,
-the candidate daemon included, is trusted to write it, until the producer
-(#2012) adds an integrity binding. The writer of that journal is the M2
-prepare producer (#2012), which does not exist yet, so with the engine
-held every start is still the passthrough. An owned start installs its SIGTERM and
+has no hash or signature of its own. A trial also needs the plan anchor
+and the plan binding (see [Plan binding](#plan-binding-2012-b4-dormant)):
+without `--plan-anchor`, or with an anchor or binding that does not check,
+an in-flight journal is a typed refusal (78), never a trial. The writer of
+that journal is the M2 prepare producer (#2012), which no apply path calls
+yet, so with the engine held every start is still the passthrough. An owned start installs its SIGTERM and
 SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
 exits or a step can be retried (an issuer error never falls back to the
 passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
@@ -846,8 +907,10 @@ and the daemon's routes) creates it with mode 0600 and does not follow a
 symlink at its path.
 
 Still open under #2012: wiring the producer into the apply path, the
-multi-instance journal copies, an integrity binding for the journal, and
-leaving an old `INVOCATION_ID` out of a trial child's captured environment.
+multi-instance journal copies, the installer that writes the plan anchor
+(the binding itself is in [Plan binding](#plan-binding-2012-b4-dormant)),
+and leaving an old `INVOCATION_ID` out of a trial child's captured
+environment.
 
 No tracked unit binds the launcher yet, and default builds do not build it
 (it needs the `m2-launcher` feature). ADR 0094 §5 preconditions for

@@ -50,12 +50,47 @@ impl start::Issuer for JournalIssuer<'_> {
         issue_held(
             self.args,
             command,
-            uid,
-            uid,
+            Owners {
+                root: uid,
+                record: uid,
+                anchor: anchor_owner(),
+            },
             &mut self.held.borrow_mut(),
             false,
             &process_data_dir,
         )
+    }
+}
+
+/// The accounts that must own what the issuer reads: the host root and its
+/// records (the launcher's account) and the plan anchor (root).
+#[derive(Clone, Copy)]
+struct Owners {
+    root: u32,
+    record: u32,
+    anchor: u32,
+}
+
+impl Owners {
+    /// Root, records and anchor all of `uid` (unprivileged tests).
+    #[cfg(test)]
+    fn of(uid: u32) -> Self {
+        Self {
+            root: uid,
+            record: uid,
+            anchor: uid,
+        }
+    }
+}
+
+/// Root owns a plan anchor (`plan_binding::ANCHOR_OWNER`). Unit tests run
+/// unprivileged, so they expect their own account; a test that needs a
+/// foreign anchor passes the owner itself (`issue_owned`).
+fn anchor_owner() -> u32 {
+    if cfg!(test) {
+        effective_uid()
+    } else {
+        plan_binding::ANCHOR_OWNER
     }
 }
 
@@ -85,10 +120,22 @@ fn issue_with(
     root_uid: u32,
     record_uid: u32,
 ) -> io::Result<Option<start::Issued>> {
+    let owners = Owners {
+        root: root_uid,
+        record: record_uid,
+        anchor: anchor_owner(),
+    };
+    issue_owned(args, command, owners)
+}
+
+/// As `issue_with`, with every expected owner given.
+fn issue_owned(
+    args: &TrialArgs,
+    command: &forward::DaemonCommand,
+    owners: Owners,
+) -> io::Result<Option<start::Issued>> {
     let data_dir = |_: &forward::DaemonCommand| Ok(args.host_root.clone());
-    issue_held(
-        args, command, root_uid, record_uid, &mut None, false, &data_dir,
-    )
+    issue_held(args, command, owners, &mut None, false, &data_dir)
 }
 
 /// Read the host journal and the trial record under the daemon install
@@ -107,17 +154,19 @@ fn issue_with(
 /// #1378): records read from any other directory say nothing about this
 /// daemon, so a mismatch could pass through to a candidate swapped in under
 /// another journal. It is a typed refusal.
-#[allow(clippy::too_many_arguments)]
+///
+/// A trial needs the plan anchor the argv names and the plan binding
+/// beside the journal (#2012, B4): see `check_binding`.
 fn issue_held(
     args: &TrialArgs,
     command: &forward::DaemonCommand,
-    root_uid: u32,
-    record_uid: u32,
+    owners: Owners,
     held: &mut Option<File>,
     retired: bool,
     data_dir: DataDir<'_>,
 ) -> io::Result<Option<start::Issued>> {
-    let root = open_root(&args.host_root, root_uid)?;
+    let record_uid = owners.record;
+    let root = open_root(&args.host_root, owners.root)?;
     let daemon_data = data_dir(command)?;
     if !daemon_root::names_root(&daemon_data, &args.host_root)? {
         return Err(start::refused(format!(
@@ -172,6 +221,7 @@ fn issue_held(
             "launcher argv does not match its participant in the host journal",
         ));
     }
+    check_binding(args, &root, &record, owners)?;
     // Canonical install and participant paths (`Host::new`). A plan path
     // that is not canonical stays so on a restart: `Host::new` returns a
     // typed refusal (78). A missing path may appear by itself (a data root
@@ -299,7 +349,12 @@ pub(super) fn relock(
         return Ok(());
     }
     let uid = effective_uid();
-    match issue_held(args, command, uid, uid, held, true, &process_data_dir)? {
+    let owners = Owners {
+        root: uid,
+        record: uid,
+        anchor: anchor_owner(),
+    };
+    match issue_held(args, command, owners, held, true, &process_data_dir)? {
         None => Ok(()),
         Some(_) => Err(io::Error::other(
             "a trial is now in flight; the next start owns it",
@@ -345,6 +400,82 @@ fn read_journal(root: &File, uid: u32) -> io::Result<Option<journal::JournalReco
             "host journal is corrupt or of an unknown schema",
         )),
     }
+}
+
+/// The journal's integrity binding (#2012, B4). The argv must name a plan
+/// anchor; the anchor must be root's and unchangeable by the launcher's
+/// account (`plan_binding::read_anchor`); the plan binding beside the
+/// journal must be a 0600 regular file of the launcher's account, read
+/// through the checked host root; and it must bind this journal's
+/// transaction, generation and plan to that anchor, whose install the plan
+/// names exactly. Every failure is a typed refusal (78): none of them
+/// clears by itself. Only an I/O error while reading is a failed read (75).
+fn check_binding(
+    args: &TrialArgs,
+    root: &File,
+    record: &journal::JournalRecord,
+    owners: Owners,
+) -> io::Result<()> {
+    let Some(anchor_path) = &args.plan_anchor else {
+        return Err(start::refused(
+            "a launcher trial needs --plan-anchor; this unit can only pass through",
+        ));
+    };
+    let anchor = plan_binding::read_anchor(anchor_path, owners.anchor).map_err(|error| {
+        if fixed(&error) {
+            start::refused(format!("plan anchor {}: {error}", anchor_path.display()))
+        } else {
+            error
+        }
+    })?;
+    let bytes = match read_owned_at(root, plan_binding::BINDING_FILE_NAME, owners.record) {
+        Ok(bytes) => bytes,
+        Err(error) if fixed(&error) => {
+            return Err(start::refused(format!("plan binding: {error}")));
+        }
+        Err(error) => return Err(error),
+    };
+    let binding =
+        plan_binding::parse_binding(&bytes).map_err(|error| start::refused(error.to_string()))?;
+    anchor
+        .verify(&binding, record)
+        .map_err(|error| start::refused(error.to_string()))
+}
+
+/// An error no restart changes: a missing, symlinked, foreign or malformed
+/// anchor or binding.
+fn fixed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::PermissionDenied
+    ) || error.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// A record of this account in the checked directory: opened once without
+/// following a symlink, a regular file of `uid` with mode 0600 within the
+/// size limit, checked and read on that descriptor. A failed check is
+/// `InvalidData`.
+fn read_owned_at(root: &File, name: &str, uid: u32) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = open_at(root, name)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.len() > plan_binding::MAX_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} must be a regular file of this account with mode 0600"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(plan_binding::MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// No in-flight journal names this launcher. That is an ordinary start
@@ -545,6 +676,7 @@ mod tests {
             Some(TrialArgs {
                 host_root: "/var/lib/x0x".into(),
                 instance: "alice".into(),
+                plan_anchor: None,
             })
         );
         assert_eq!(parsed.command.executable, "/usr/bin/x0xd");
@@ -604,6 +736,7 @@ mod tests {
             TrialArgs {
                 host_root: alice.data_root.clone(),
                 instance: alice.instance_id.clone(),
+                plan_anchor: Some(alice.data_root.join(plan_binding::TEST_ANCHOR_NAME)),
             },
             forward::DaemonCommand {
                 executable: alice.executable.clone().into_os_string(),
@@ -657,6 +790,8 @@ mod tests {
         use super::super::prepare::tests as producer;
         let (_dir, root) = producer::root();
         let prepared = producer::prepared_in(&root, producer::input_in(&root));
+        // The installer's anchor for the same install (#2012, B4).
+        plan_binding::write_test_anchor(&root, &prepared.record().plan);
         let (args, command) = matching(prepared.record());
         let issued = issue_as(&args, &command, effective_uid())
             .unwrap()
@@ -670,6 +805,148 @@ mod tests {
             .err()
             .expect("refused");
         assert!(start::is_refusal(&error), "{error}");
+    }
+
+    /// #2012 (B4): a trial needs the plan anchor the argv names. Without
+    /// `--plan-anchor` (a unit an older installer wrote) an in-flight
+    /// journal is a fixed refusal, never a trial and never a passthrough.
+    #[test]
+    fn a_trial_needs_its_plan_anchor() {
+        let (_dir, _root, record) = rooted(journal::Phase::SwappedCli);
+        let (mut args, command) = matching(&record);
+        args.plan_anchor = None;
+        let error = issue_as(&args, &command, effective_uid())
+            .err()
+            .expect("refused");
+        assert!(start::is_refusal(&error), "{error}");
+        assert!(error.to_string().contains("--plan-anchor"), "{error}");
+    }
+
+    /// #2012 (B4): the anchor must be root's (here: the expected owner),
+    /// not writable by group or others, and not a symlink.
+    #[test]
+    fn a_foreign_writable_or_linked_anchor_is_refused() {
+        let (dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (mut args, command) = matching(&record);
+        let uid = effective_uid();
+        let foreign = Owners {
+            anchor: uid + 1,
+            ..Owners::of(uid)
+        };
+        assert!(refused(issue_owned(&args, &command, foreign)), "foreign");
+        let anchor = root.join(plan_binding::TEST_ANCHOR_NAME);
+        std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(refused(issue_as(&args, &command, uid)), "writable");
+        std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().canonicalize().unwrap().join("anchor-link");
+        std::os::unix::fs::symlink(&anchor, &link).unwrap();
+        args.plan_anchor = Some(link);
+        assert!(refused(issue_as(&args, &command, uid)), "symlink");
+        args.plan_anchor = Some(root.join("no-such-anchor"));
+        assert!(refused(issue_as(&args, &command, uid)), "missing");
+    }
+
+    /// #2012 (B4): a missing plan binding, or one that is not a 0600 file
+    /// of this account, is a fixed refusal.
+    #[test]
+    fn a_missing_or_loose_plan_binding_is_refused() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        let binding = root.join(plan_binding::BINDING_FILE_NAME);
+        std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(refused(issue_as(&args, &command, effective_uid())), "0644");
+        let uid = effective_uid();
+        std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(issue_as(&args, &command, uid).unwrap().is_some());
+        std::fs::remove_file(&binding).unwrap();
+        std::os::unix::fs::symlink(root.join(journal::JOURNAL_FILE_NAME), &binding).unwrap();
+        assert!(refused(issue_as(&args, &command, uid)), "symlink");
+        std::fs::remove_file(&binding).unwrap();
+        assert!(refused(issue_as(&args, &command, uid)), "missing");
+    }
+
+    /// #2012 (B4): the binding must bind this journal's plan, transaction
+    /// and generation to this anchor, and the plan must name exactly the
+    /// anchored install.
+    #[test]
+    fn a_binding_that_does_not_bind_this_journal_is_refused() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        let uid = effective_uid();
+        let journal_path = root.join(journal::JOURNAL_FILE_NAME);
+        assert!(issue_as(&args, &command, uid).unwrap().is_some());
+
+        // The plan changed after the binding was written.
+        let mut changed = record.clone();
+        changed.plan.candidate_version = "9.9.10".into();
+        journal::write_record(&journal_path, &changed).unwrap();
+        assert!(refused(issue_as(&args, &command, uid)), "plan");
+
+        // Another transaction, then another generation.
+        let mut other = record.clone();
+        other.transaction_id = "another-transaction".into();
+        journal::write_record(&journal_path, &other).unwrap();
+        assert!(refused(issue_as(&args, &command, uid)), "transaction");
+        let mut other = record.clone();
+        other.generation = 2;
+        journal::write_record(&journal_path, &other).unwrap();
+        assert!(refused(issue_as(&args, &command, uid)), "generation");
+
+        // The anchor changed after the binding was written.
+        journal::write_record(&journal_path, &record).unwrap();
+        assert!(issue_as(&args, &command, uid).unwrap().is_some());
+        let anchor = root.join(plan_binding::TEST_ANCHOR_NAME);
+        let mut text = std::fs::read_to_string(&anchor).unwrap();
+        text.push('\n');
+        std::fs::write(&anchor, text).unwrap();
+        assert!(refused(issue_as(&args, &command, uid)), "anchor");
+    }
+
+    /// #2012 (B4): an anchor for another install pair or another set of
+    /// participants refuses the plan, even with a binding made against it.
+    #[test]
+    fn a_plan_outside_the_anchored_install_is_refused() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        let uid = effective_uid();
+        let anchor = root.join(plan_binding::TEST_ANCHOR_NAME);
+        let edits: [fn(&mut serde_json::Value); 3] = [
+            |a| a["cli_target"] = "/usr/local/bin/other-x0x".into(),
+            |a| {
+                a["participants"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"instance_id": "bob", "data_root": "/var/lib/bob"}))
+            },
+            |a| a["participants"][0]["data_root"] = "/var/lib/elsewhere".into(),
+        ];
+        for edit in edits {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&anchor).unwrap()).unwrap();
+            edit(&mut value);
+            std::fs::write(&anchor, serde_json::to_vec(&value).unwrap()).unwrap();
+            let anchored = plan_binding::read_test_anchor(&anchor);
+            // A binding made against the edited anchor, bypassing the
+            // producer's own check.
+            let binding = plan_binding::PlanBinding {
+                schema: 1,
+                record_kind: "plan_binding".into(),
+                transaction_id: record.transaction_id.clone(),
+                generation: record.generation,
+                plan_sha256: plan_binding::plan_sha256(&record.plan).unwrap(),
+                anchor_sha256: anchored.sha256(),
+            };
+            journal::write_auxiliary_record(
+                &root.join(plan_binding::BINDING_FILE_NAME),
+                &binding,
+                plan_binding::validate_binding,
+            )
+            .unwrap();
+            let error = issue_as(&args, &command, uid).err().expect("refused");
+            assert!(start::is_refusal(&error), "{error}");
+            assert!(error.to_string().contains("anchored"), "{error}");
+            bind(&root, &record);
+        }
     }
 
     #[test]
@@ -693,6 +970,13 @@ mod tests {
         }
         std::fs::remove_file(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
         assert!(issue_as(&args, &command, effective_uid())
+            .unwrap()
+            .is_none());
+        // A passthrough needs no anchor and no binding (#2012, B4).
+        std::fs::remove_file(root.join(plan_binding::BINDING_FILE_NAME)).unwrap();
+        let mut unanchored = args.clone();
+        unanchored.plan_anchor = None;
+        assert!(issue_as(&unanchored, &command, effective_uid())
             .unwrap()
             .is_none());
     }
@@ -769,8 +1053,7 @@ mod tests {
         let error = issue_held(
             &args,
             &command,
-            uid,
-            uid,
+            Owners::of(uid),
             &mut None,
             false,
             &process_data_dir,
@@ -808,8 +1091,7 @@ mod tests {
         let error = issue_held(
             &args,
             &command,
-            uid,
-            uid,
+            Owners::of(uid),
             &mut None,
             false,
             &process_data_dir,
@@ -821,8 +1103,7 @@ mod tests {
         assert!(issue_held(
             &args,
             &command,
-            uid,
-            uid,
+            Owners::of(uid),
             &mut None,
             false,
             &process_data_dir
@@ -890,8 +1171,7 @@ mod tests {
         assert!(issue_held(
             &args,
             &command,
-            uid,
-            uid,
+            Owners::of(uid),
             &mut held,
             false,
             &process_data_dir
@@ -909,8 +1189,7 @@ mod tests {
         assert!(issue_held(
             &args,
             &command,
-            uid,
-            uid,
+            Owners::of(uid),
             &mut held,
             false,
             &process_data_dir
@@ -935,8 +1214,7 @@ mod tests {
             let issued = issue_held(
                 &args,
                 &command,
-                uid,
-                uid,
+                Owners::of(uid),
                 &mut None,
                 false,
                 &process_data_dir,
@@ -972,8 +1250,7 @@ mod tests {
             let issued = issue_held(
                 &args,
                 &command,
-                uid,
-                uid,
+                Owners::of(uid),
                 &mut held,
                 false,
                 &process_data_dir,
@@ -1022,8 +1299,7 @@ mod tests {
             assert!(issue_held(
                 &args,
                 &command,
-                uid,
-                uid,
+                Owners::of(uid),
                 &mut held,
                 false,
                 &process_data_dir
@@ -1536,6 +1812,7 @@ mod tests {
         let missing = TrialArgs {
             host_root: root.join("missing"),
             instance: "alice".into(),
+            plan_anchor: None,
         };
         assert_eq!(exit(&missing), start::Start::Exit(start::EXIT_TEMPFAIL));
     }
@@ -1548,6 +1825,7 @@ mod tests {
         let (_dir, root, mut record) = rooted(journal::Phase::SwappedCli);
         record.plan.cli.backup_path = root.join("missing-backup");
         journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+        bind(&root, &record);
         let (args, command) = matching(&record);
         let error = issue_as(&args, &command, effective_uid())
             .err()
@@ -1561,6 +1839,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         record.plan.cli.backup_path = link;
         journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+        bind(&root, &record);
         assert!(refused(issue_as(&args, &command, effective_uid())));
     }
 

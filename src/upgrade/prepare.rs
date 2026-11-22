@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use super::install_lock::InstallLock;
 use super::journal::{self, ArtifactPlan, FrozenPlan, JournalRecord, Participant, Phase};
+use super::plan_binding::{self, Anchored};
 
 /// What the apply path knows when it prepares: the release, the two
 /// staged artifacts and the participants it observed.
@@ -397,12 +398,22 @@ impl Prepared {
     /// in-flight or unreadable one is refused. The check and the write are
     /// both under `lock`, so of two concurrent runs the second sees the
     /// first's journal in flight and is refused.
+    ///
+    /// The plan must name exactly the install that `anchor` approves
+    /// (#2012, B4). Before the Staged journal it writes the plan binding
+    /// (`upgrade-plan-binding.json`, mode 0600) beside it: the transaction,
+    /// the generation, the plan digest and the anchor digest. The binding
+    /// does not change for the rest of the transaction. A crash between
+    /// the two writes leaves a binding for a journal that was never
+    /// written; a launcher reads a binding only for an in-flight journal,
+    /// and the next stage replaces it.
     #[cfg(unix)]
     pub(crate) fn stage(
         lock: &HostLock,
         data_root: &Path,
         transaction_id: &str,
         plan: FrozenPlan,
+        anchor: &Anchored,
     ) -> io::Result<Self> {
         lock.covers(&plan)?;
         check_root(data_root)?;
@@ -435,6 +446,14 @@ impl Prepared {
         }
         let record = record(transaction_id, plan, Phase::Staged);
         checked(&record)?;
+        let binding = anchor
+            .bind(&record.transaction_id, record.generation, &record.plan)
+            .map_err(|error| refused(error.to_string()))?;
+        journal::write_auxiliary_record(
+            &data_root.join(plan_binding::BINDING_FILE_NAME),
+            &binding,
+            plan_binding::validate_binding,
+        )?;
         journal::write_record(&path, &record)?;
         Ok(Self { path, record })
     }
@@ -592,11 +611,23 @@ pub(crate) mod tests {
         (dir, root)
     }
 
+    /// `Prepared::stage` with an anchor for `plan`'s own install (#2012,
+    /// B4).
+    pub(crate) fn stage(
+        lock: &HostLock,
+        data_root: &Path,
+        transaction_id: &str,
+        plan: FrozenPlan,
+    ) -> io::Result<Prepared> {
+        let anchor = plan_binding::test_anchored(&plan);
+        Prepared::stage(lock, data_root, transaction_id, plan, &anchor)
+    }
+
     /// Stage, then move through every forward phase to `SwappedCli`.
     pub(crate) fn prepared_in(root: &Path, input: PlanInput) -> Prepared {
         let plan = freeze_plan(input).unwrap();
         let lock = HostLock::acquire(&plan).unwrap();
-        let mut prepared = Prepared::stage(&lock, root, "tx-2012", plan).unwrap();
+        let mut prepared = stage(&lock, root, "tx-2012", plan).unwrap();
         for phase in [
             Phase::Probed,
             Phase::Prepared,
@@ -627,6 +658,36 @@ pub(crate) mod tests {
             read.daemon_progress.observed_sha256,
             Some(read.plan.daemon.candidate_sha256)
         );
+    }
+
+    /// #2012 (B4): staging writes the plan binding (0600) that binds the
+    /// Staged journal to the anchor, and it refuses a plan the anchor does
+    /// not name, before it writes anything.
+    #[test]
+    fn staging_binds_the_plan_to_the_anchor() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let binding_path = root.join(plan_binding::BINDING_FILE_NAME);
+        let journal_path = root.join(journal::JOURNAL_FILE_NAME);
+
+        let mut other_install = plan.clone();
+        other_install.participants[0].instance_id = "bob".into();
+        let foreign = plan_binding::test_anchored(&other_install);
+        assert!(Prepared::stage(&lock, &root, "tx", plan.clone(), &foreign).is_err());
+        assert!(!binding_path.exists() && !journal_path.exists());
+
+        let anchor = plan_binding::test_anchored(&plan);
+        let prepared = Prepared::stage(&lock, &root, "tx", plan, &anchor).unwrap();
+        let mode = std::fs::metadata(&binding_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let binding = plan_binding::parse_binding(&std::fs::read(&binding_path).unwrap()).unwrap();
+        anchor.verify(&binding, prepared.record()).unwrap();
+        assert!(foreign.verify(&binding, prepared.record()).is_err());
     }
 
     #[test]
@@ -683,16 +744,16 @@ pub(crate) mod tests {
         let lock = HostLock::acquire(&plan).unwrap();
         let other = root.join("other");
         std::fs::create_dir(&other).unwrap();
-        assert!(Prepared::stage(&lock, &other, "tx", plan.clone()).is_err());
+        assert!(stage(&lock, &other, "tx", plan.clone()).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(Prepared::stage(&lock, &root, "tx", plan.clone()).is_err());
+        assert!(stage(&lock, &root, "tx", plan.clone()).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(Prepared::stage(&lock, &root, " ", plan.clone()).is_err());
+        assert!(stage(&lock, &root, " ", plan.clone()).is_err());
         // The host lock of another install pair does not cover this plan.
         let (_other_dir, other_root) = super::tests::root();
         let other_plan = freeze_plan(input_in(&other_root)).unwrap();
         let other_lock = HostLock::acquire(&other_plan).unwrap();
-        assert!(Prepared::stage(&other_lock, &root, "tx", plan).is_err());
+        assert!(stage(&other_lock, &root, "tx", plan).is_err());
     }
 
     #[test]
@@ -701,13 +762,13 @@ pub(crate) mod tests {
         let prepared = prepared_in(&root, input_in(&root));
         let plan = prepared.record().plan.clone();
         let lock = HostLock::acquire(&plan).unwrap();
-        assert!(Prepared::stage(&lock, &root, "tx-next", plan.clone()).is_err());
+        assert!(stage(&lock, &root, "tx-next", plan.clone()).is_err());
         // A settled journal may be replaced.
         let mut settled = prepared.record().clone();
         settled.phase = Phase::HostCommitted;
         settled.sequence += 1;
         journal::write_record(prepared.path(), &settled).unwrap();
-        assert!(Prepared::stage(&lock, &root, "tx-next", plan).is_ok());
+        assert!(stage(&lock, &root, "tx-next", plan).is_ok());
     }
 
     /// #2065 review: two concurrent runs. The second waits for the host
@@ -723,14 +784,14 @@ pub(crate) mod tests {
         let racer = std::thread::spawn(move || {
             let lock = HostLock::acquire(&racer_plan).unwrap();
             acquired.send(()).unwrap();
-            Prepared::stage(&lock, &racer_root, "tx-racer", racer_plan).map(|_| ())
+            stage(&lock, &racer_root, "tx-racer", racer_plan).map(|_| ())
         });
         let wait = std::time::Duration::from_millis(300);
         assert!(
             waiting.recv_timeout(wait).is_err(),
             "the racer did not wait"
         );
-        let first = Prepared::stage(&held, &root, "tx-first", plan).unwrap();
+        let first = stage(&held, &root, "tx-first", plan).unwrap();
         drop(held);
         waiting
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -762,7 +823,7 @@ pub(crate) mod tests {
         let Ok(adopted) = HostLock::adopt(&plan, cli, daemon) else {
             panic!("adopt the caller's own locks");
         };
-        Prepared::stage(&adopted, &root, "tx", plan.clone()).unwrap();
+        stage(&adopted, &root, "tx", plan.clone()).unwrap();
         let waited = HostLock::acquire_within(&plan, std::time::Duration::from_millis(200));
         assert_eq!(
             waited.err().map(|error| error.kind()),
@@ -796,7 +857,7 @@ pub(crate) mod tests {
         let (_dir, root) = root();
         let plan = freeze_plan(input_in(&root)).unwrap();
         let lock = HostLock::acquire(&plan).unwrap();
-        let mut prepared = Prepared::stage(&lock, &root, "tx", plan).unwrap();
+        let mut prepared = stage(&lock, &root, "tx", plan).unwrap();
         let edits: [fn(&mut JournalRecord); 3] = [
             |r: &mut JournalRecord| r.transaction_id = "tx-other".into(),
             |r: &mut JournalRecord| r.phase = Phase::Probed,
@@ -829,7 +890,7 @@ pub(crate) mod tests {
         let (_dir, root) = root();
         let plan = freeze_plan(input_in(&root)).unwrap();
         let lock = HostLock::acquire(&plan).unwrap();
-        let mut prepared = Prepared::stage(&lock, &root, "tx", plan).unwrap();
+        let mut prepared = stage(&lock, &root, "tx", plan).unwrap();
         // No swap before Prepared, and no CLI swap before the daemon's.
         assert!(prepared.advance(&lock, Phase::SwappedDaemon).is_err());
         prepared.advance(&lock, Phase::Prepared).unwrap();

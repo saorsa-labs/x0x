@@ -104,8 +104,29 @@ pub(super) fn fixture_with(
     };
     edit(&mut record);
     journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+    bind(&root, &record);
     let host = recovery::Host::new(root.clone(), record.clone()).unwrap();
     (dir, root, host, record)
+}
+
+/// Write the plan anchor for `record`'s install in `root`
+/// (`plan_binding::TEST_ANCHOR_NAME`) and the plan binding beside the
+/// journal, as the installer and the prepare producer do (#2012, B4).
+pub(super) fn bind(root: &Path, record: &journal::JournalRecord) {
+    // The file is what the issuer reads; the binding hashes the same
+    // bytes. It is not read back here: the fixture root's mode follows
+    // the umask until a test tightens it.
+    plan_binding::write_test_anchor(root, &record.plan);
+    let anchor = plan_binding::test_anchored(&record.plan);
+    let binding = anchor
+        .bind(&record.transaction_id, record.generation, &record.plan)
+        .unwrap();
+    journal::write_auxiliary_record(
+        &root.join(plan_binding::BINDING_FILE_NAME),
+        &binding,
+        plan_binding::validate_binding,
+    )
+    .unwrap();
 }
 
 /// Seed the candidate release's probe record, as staging leaves it.
