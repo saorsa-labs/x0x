@@ -53,6 +53,16 @@ All notable changes to this project will be documented in this file.
   every other seat's leaf must survive; if not, the recovery is refused as
   `recovery_proof_invalid`. Every sender this release ships already meets
   it; a peer on an earlier release does not check it.
+- **A joiner held because no admin is eligible is told so (#2135 item 1;
+  A08 amendment of 21 Nov 2026).** When the inviter withholds an
+  admission because verified revocations cover every admin seat, it serves
+  the signed join pending notice with cause `no_eligible_admin` on the
+  joiner's poll, for an attempt that would otherwise be admitted.
+  `GET /groups/:id/join-status` shows it as `pending_cause.cause`, and the
+  attempt times out with `reason` `no_eligible_admin` instead of
+  `no_admission_result`. No new wire or API field; released joiners keep
+  the old behaviour. A joiner whose inviter is offline still ends with
+  `no_admission_result`.
 - **A delta into a group store is measured in O(keys in the delta) (#2110
   item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
   length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta

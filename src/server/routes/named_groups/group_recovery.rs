@@ -3473,6 +3473,22 @@ pub(in crate::server) async fn note_attested_for_test(
         });
 }
 
+/// Test hook: mark the group's #1941 revocation as pending in memory, as
+/// [`load_sidecars`] does when the marker is on disk.
+#[cfg(test)]
+pub(in crate::server) async fn mark_revoke_pending_for_test(
+    state: &AppState,
+    stable_group_id: &str,
+) {
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .revoke_pending
+        .insert(stable_group_id.to_string());
+}
+
 /// Test hook: store `ata` as the group's active admin ATA, as an
 /// `attested` answer's arm does.
 #[cfg(test)]

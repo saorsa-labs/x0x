@@ -46,10 +46,11 @@
 //!   seated and active, and no history.
 //!
 //! Not covered by this case (named remainders of the row in #1581):
-//! the D late-evidence variant and the joiner-J variant. The J variant
-//! needs new production behaviour (ADR 0108's signed `JoinPendingNotice`
-//! with cause `no_eligible_admin` is not served on the join-result poll
-//! for this cause today). The D variant (B derives the refusal on a head
+//! the D late-evidence variant and the joiner-J variant. The J variant is
+//! not built here: since #2135 the inviter serves ADR 0108's signed
+//! `JoinPendingNotice` with cause `no_eligible_admin` for a withheld
+//! admission (unit tests in `join_pending_no_eligible_admin_2135`); the
+//! member-signed half of D154 is not built. The D variant (B derives the refusal on a head
 //! that lacks a promoted D, then clears when D's head lands) cannot be
 //! built with fabric-level faults as the transport stands: pubsub frames
 //! are anti-entropy frames that re-carry the retained topic state, so
