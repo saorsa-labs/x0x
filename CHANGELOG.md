@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.49.0] - 2026-11-22
+
+### Upgrade notes
+
+Breaking and operator-visible changes in this release. Each item names the
+number its entry below cites; the entries hold the detail.
+
+- **Dependency pins:** `ant-quic =0.29.0` and all eleven `saorsa-gossip-*`
+  crates `=0.5.95` (v0.48.1 shipped `=0.27.61` and `=0.5.90`). The entry
+  under Changed names the step from 0.28.0 and 0.5.92 to 0.29.0 and 0.5.94
+  (PR #2126); 0.5.95 came with #2110 item 1 (PR #2147). ant-quic 0.29.0 changes packets on the wire (path-MTU probes
+  to 1452 B, ECN, bounded relay queues of 256 packets); soak before a fleet
+  rollout. The optional `voice` feature still pulls ant-quic 0.28.0 into
+  `Cargo.lock`.
+- **Rust API:** `IdentityError::KeyNotFound` is a new variant and
+  `KvRemoveOutcome` has a new public field `held` (#2110 item 3); neither
+  type is `#[non_exhaustive]`, so an exhaustive `match` or a struct literal
+  must change. `NetworkConfig.relay_service_enabled` is a new field
+  (#1642). `DmError::RecipientMachineRevoked` is a new variant (#1597
+  item 4).
+- **Exit code:** a panic on the daemon thread makes `x0xd` exit with code 1,
+  not 101; the thread is now `x0xd-main` (#2083).
+- **CLI:** `x0xd --check-updates` only reports; it no longer installs
+  (#1370). `x0x autostart`, `--repair` and `--remove` refuse to run as root
+  or under `sudo` (#1379); `--launcher` refuses a daemon inside a versioned
+  Homebrew keg (#1379, #2111).
+- **REST API:** deleting a key this replica does not hold answers 404
+  `key not found`, not 500; `?absent=publish` publishes the removal and
+  replies `"held": false` (#2110 item 3). A join attempt held because no
+  admin is eligible times out with `reason` `no_eligible_admin`, not
+  `no_admission_result` (#2135 item 1). `POST /groups/:id/send` returns
+  `fallback_topic: null` when no global copy was sent (#1964).
+  `GET /groups/:id/messages` can answer `429` `public_listener_cap` (#2124).
+  A group store refuses a local put past 12 MiB and a remote merge past
+  16 MiB, with HTTP 507 (#1970). `POST /grants` refuses a window above
+  90 days (#1350) or a start more than 600 s in the future (#1350
+  follow-up).
+- **Sessions:** a GUI session ends after `gui_idle_timeout_minutes`
+  (default 60) without activity; a refresh without `idle_ms`, including
+  `x0x auth refresh` without `--idle-ms`, no longer gives 12 h (#2070). A
+  session's SSE streams and WebSockets close when the session ends; a
+  WebSocket closes with code `1008` (#2079).
+- **Network and config:** a `Leaf` daemon with no `relay_service_enabled`
+  key stops serving relay sessions (403) and still uses relays (#1642).
+  The two Hetzner seeds are gone from `DEFAULT_BOOTSTRAP_PEERS` (24 → 16
+  addresses) and from the seed PeerId pin table (#2094).
+- **Wire:** the digest beacon carries one trailing optional field that older
+  peers ignore (#2110 item 2). Group-store entries carry a writer mark in
+  reserved `x0x.writer.*` metadata keys (#1094 slice P1). A receiver refuses
+  a TreeKEM owner recovery that removes any leaf other than the revoked
+  seats'; peers on earlier releases do not check this (#2139).
+- **Data directory:** new local files `treekem-catchup-log/`,
+  `treekem-alive` and `treekem-catchup-pending` (#1427), and
+  `user-consent.bin` in the identity directory (#1107).
+
 ### Behaviour now documented (no code change)
 
 - **TreeKEM does not yet meet the "no new keys" rule for an expired
