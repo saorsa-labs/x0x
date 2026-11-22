@@ -336,6 +336,128 @@ fn pubsub_delivered(sim: &Sim, src: &str, dst: &str, cut: usize, needle: &[u8]) 
         .count())
 }
 
+/// What identifies O's r+1 in a frame (#2149). The event bytes are the
+/// commit itself; every later commit names r+1's state hash as its
+/// `prev_state_hash`, so a hash match alone does not mean r+1 was carried.
+const R1_EVENT: &str = "r+1 event bytes";
+const R1_HASH_HEX: &str = "r+1 state hash (hex)";
+const R1_HASH_RAW: &str = "r+1 state hash (raw 32 bytes)";
+
+/// Hash-only matches shown in a receipt note; event-bytes matches are
+/// always shown in full.
+const HASH_ONLY_SHOWN: usize = 20;
+
+/// One delivery to the observed node: sender label, write, trace position
+/// and delivery time.
+struct Delivery {
+    src: String,
+    write: crate::network::sim::Write,
+    position: usize,
+    delivered: Duration,
+}
+
+/// The deliveries that carry O's r+1 or its state hash, in delivery order:
+/// event-bytes matches, hash-only matches, and how many frames matched each
+/// needle.
+#[derive(Debug, Default, PartialEq)]
+struct Carriers {
+    event: Vec<String>,
+    hash_only: Vec<String>,
+    per_needle: Vec<(&'static str, usize)>,
+}
+
+impl Carriers {
+    fn describe(&self) -> String {
+        let shown: Vec<&String> = self.hash_only.iter().take(HASH_ONLY_SHOWN).collect();
+        let empty = self.event.is_empty() && self.hash_only.is_empty();
+        format!(
+            "per needle {:?}; with the event bytes {} {:?}; with the state hash only {} \
+             (first {HASH_ONLY_SHOWN}) {shown:?}{}",
+            self.per_needle,
+            self.event.len(),
+            self.event,
+            self.hash_only.len(),
+            if empty {
+                "; none in clear: an encrypted lane, a re-encoded copy (JSON-escaped, base64) \
+                 or a state J read from a node"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+/// Sort `deliveries` into delivery order and classify each frame by the
+/// `needles` it carries (#2149: which delivery brought O's r+1 to J). Each
+/// entry reads `"<sender>-><dst> <lane> seq=<n> delivered=<us>us sent=<us>us
+/// len=<n> by=<needles>"`.
+fn carriers(
+    mut deliveries: Vec<Delivery>,
+    dst: &str,
+    needles: &[(&'static str, Vec<u8>)],
+) -> Carriers {
+    deliveries.sort_by_key(|d| d.position);
+    let mut out = Carriers {
+        per_needle: needles.iter().map(|(name, _)| (*name, 0)).collect(),
+        ..Carriers::default()
+    };
+    for d in &deliveries {
+        let hits: Vec<&'static str> = needles
+            .iter()
+            .filter(|(_, n)| !n.is_empty() && d.write.bytes.windows(n.len()).any(|x| x == n))
+            .map(|(name, _)| *name)
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        for (name, count) in &mut out.per_needle {
+            if hits.contains(name) {
+                *count += 1;
+            }
+        }
+        let entry = format!(
+            "{}->{dst} {:?} seq={} delivered={}us sent={}us len={} by={}",
+            d.src,
+            d.write.lane.class,
+            d.write.seq,
+            d.delivered.as_micros(),
+            d.write.at.as_micros(),
+            d.write.bytes.len(),
+            hits.join("+")
+        );
+        if hits.contains(&R1_EVENT) {
+            out.event.push(entry);
+        } else {
+            out.hash_only.push(entry);
+        }
+    }
+    out
+}
+
+/// The frames delivered to `dst` from any node since write `cut` that
+/// carry one of `needles`.
+fn delivered_carriers(
+    sim: &Sim,
+    dst: &str,
+    cut: usize,
+    needles: &[(&'static str, Vec<u8>)],
+) -> Result<Carriers> {
+    let to = sim.peer(dst)?;
+    let mut deliveries = Vec::new();
+    for src in sim.labels().into_iter().filter(|l| l != dst) {
+        let from = sim.peer(&src)?;
+        for (write, position, delivered) in sim.fabric().deliveries_after(&from, &to, cut) {
+            deliveries.push(Delivery {
+                src: src.clone(),
+                write,
+                position,
+                delivered,
+            });
+        }
+    }
+    Ok(carriers(deliveries, dst, needles))
+}
+
 /// The `MemberAdded(member)` events `src` wrote since write `cut`: how
 /// many, and whether any carried a `reseat_mandate` or an `owner_mandate`.
 fn member_added_mandates(
@@ -382,6 +504,11 @@ struct Prefix {
     held_to_j: Arc<std::sync::atomic::AtomicUsize>,
     /// H-S3-c2: re-published canonical r+1 frames delivered to J.
     canonical: usize,
+    /// The fabric write index when X published r+1′.
+    forked_at: usize,
+    /// What identifies O's r+1 in a frame: its recorded event bytes and
+    /// its state hash, as hex and as raw bytes (#2149).
+    r1_needles: Vec<(&'static str, Vec<u8>)>,
 }
 
 /// The H-S3-c setup up to J on X's fork r+1′ (ADR 0109 §10), shared by the
@@ -822,6 +949,15 @@ async fn fork_prefix_with(
         j_out_held,
         held_to_j,
         canonical,
+        forked_at,
+        r1_needles: vec![
+            (R1_EVENT, removal_bytes.to_vec()),
+            (R1_HASH_HEX, removal.state_hash.as_bytes().to_vec()),
+            (
+                R1_HASH_RAW,
+                hex::decode(&removal.state_hash).unwrap_or_default(),
+            ),
+        ],
     }))
 }
 
@@ -886,6 +1022,18 @@ async fn advance(
     seen.verify("the gate window")?;
     let j_status = status(sim, "J", &group).await?;
     let j1 = view(sim, "J", &group).await?;
+    if !both && j1.marker.is_some() {
+        // #2149: a marker here means a canonical commit that conflicts with
+        // J's fork reached J during the advance. Name each delivery to J
+        // that carried O's r+1 or its state hash, so a hit shows its path.
+        // The verdict does not change.
+        let found = delivered_carriers(sim, "J", p.forked_at, &p.r1_needles)?;
+        receipt.note(format!(
+            "J holds a marker after the advance; frames carrying O's r+1 or its state hash \
+             delivered to J since r+1′, in delivery order: {}",
+            found.describe()
+        ));
+    }
     if both {
         // H-S3-c2 prerequisite: canonical r+1 reached J, so J holds both
         // the marker and the gap record before the re-seat. A missing one
@@ -1860,4 +2008,107 @@ fn w3h_1356_staging_containment_mutation_proof() {
         4,
     );
     assert_eq!(receipt.verdict(), Some(Verdict::Infra));
+}
+
+/// #2149: a deliberate relay. A node other than O delivers O's r+1 bytes to
+/// J in a reply; later commits carry only r+1's state hash, which must not
+/// crowd the event-bytes carrier out of the note.
+#[test]
+fn carriers_name_each_delivery_of_o_r1_to_j() {
+    use crate::network::sim::{LaneClass, LaneKey, Write};
+    let delivery =
+        |src: &str, class, seq, sent_ms: u64, delivered_ms: u64, position, bytes: &[u8]| Delivery {
+            src: src.to_string(),
+            write: Write {
+                lane: LaneKey {
+                    src: [1; 32],
+                    dst: [9; 32],
+                    class,
+                },
+                seq,
+                pair_ordinal: 0,
+                at: Duration::from_millis(sent_ms),
+                bytes: bytes.into(),
+            },
+            position,
+            delivered: Duration::from_millis(delivered_ms),
+        };
+    let event = br#"{"member_removed":"x","rev":12}"#.to_vec();
+    let hex = b"7970b640bdabc33e".to_vec();
+    let raw = vec![0x79, 0x70, 0xb6, 0x40, 0xbd, 0xab, 0xc3, 0x3e];
+    let needles = vec![
+        (R1_EVENT, event.clone()),
+        (R1_HASH_HEX, hex.clone()),
+        (R1_HASH_RAW, raw.clone()),
+    ];
+    let with = |prefix: &[u8], needle: &[u8]| [prefix, needle].concat();
+    // 25 successor commits naming r+1 as their previous state, delivered
+    // first; then A's held reply, sent before them; O's unrelated frame;
+    // and a raw-hash page from M1, sent first of all and delivered last.
+    let mut deliveries: Vec<Delivery> = (0..25)
+        .map(|i| {
+            delivery(
+                "X",
+                LaneClass::PubSub,
+                i,
+                1_000,
+                1_000 + i,
+                i as usize,
+                &with(b"prev:", &hex),
+            )
+        })
+        .collect();
+    let reply = with(b"reply:", &event);
+    let page = with(b"page:", &raw);
+    deliveries.push(delivery("M1", LaneClass::Bulk, 2, 100, 1_900, 40, &page));
+    deliveries.push(delivery("A", LaneClass::Direct, 4, 500, 1_700, 30, &reply));
+    deliveries.push(delivery(
+        "O",
+        LaneClass::PubSub,
+        7,
+        1_600,
+        1_600,
+        35,
+        b"unrelated",
+    ));
+    let found = carriers(deliveries, "J", &needles);
+    assert_eq!(
+        found.event,
+        vec![format!(
+            "A->J Direct seq=4 delivered=1700000us sent=500000us len={} by=r+1 event bytes",
+            reply.len()
+        )]
+    );
+    assert_eq!(found.hash_only.len(), 26);
+    assert_eq!(
+        found.hash_only.last().map(String::as_str),
+        Some(
+            format!(
+                "M1->J Bulk seq=2 delivered=1900000us sent=100000us len={} by=r+1 state hash (raw 32 bytes)",
+                page.len()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        found.per_needle,
+        vec![(R1_EVENT, 1), (R1_HASH_HEX, 25), (R1_HASH_RAW, 1)]
+    );
+    let note = found.describe();
+    assert!(note.contains("with the event bytes 1"), "{note}");
+    assert!(note.contains("A->J Direct"), "the relay is named: {note}");
+    let none = carriers(
+        vec![delivery(
+            "O",
+            LaneClass::PubSub,
+            7,
+            1_600,
+            1_600,
+            1,
+            b"unrelated",
+        )],
+        "J",
+        &needles,
+    );
+    assert!(none.describe().contains("none in clear"));
 }

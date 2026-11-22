@@ -2719,6 +2719,11 @@ impl Sim {
         Ok(self.node(label)?.index)
     }
 
+    /// The labels of this case's nodes.
+    pub(crate) fn labels(&self) -> Vec<String> {
+        self.nodes.keys().cloned().collect()
+    }
+
     /// The node's transport peer id.
     pub(crate) fn peer(&self, label: &str) -> Result<ant_quic::PeerId> {
         Ok(self.node(label)?.peer)
