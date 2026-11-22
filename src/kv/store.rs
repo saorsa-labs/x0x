@@ -36,7 +36,7 @@ use crate::kv::image_admission::{
     SOFT_IMAGE_LIMIT_BYTES,
 };
 use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
-use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister, OrSet};
+use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister, OrSet, OrSetUndo};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -702,8 +702,21 @@ const ORSET_TAG_BYTES: u64 = 40;
 thread_local! {
     /// Whole-store content measures on this thread (#2110 tests).
     pub(crate) static FULL_MEASURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Rollback snapshots taken on this thread (#2110 tests).
+    /// Rollback snapshots that copy the whole OR-Set, taken on this thread
+    /// (#2110 tests). The bounded delta path takes none (#2146).
     pub(crate) static SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// OR-Set elements saved in delta undo logs on this thread (#2146
+    /// tests): one per touched key of each delta that took the undo path.
+    pub(crate) static DELTA_UNDO_SAVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// What [`KvStore::rollback`] puts back besides the journaled entries.
+enum Rollback {
+    /// The store without its entries; the OR-Set is a whole copy.
+    Copy(Box<KvStore>),
+    /// The store without its entries and without its OR-Set, and an undo
+    /// log for the OR-Set elements the merge may touch (#2146).
+    Undo(Box<KvStore>, OrSetUndo<String>),
 }
 
 /// Encoded bytes of a writer mark (#1094 P1): agent id, signature, version
@@ -2425,19 +2438,56 @@ impl KvStore {
     }
 
     /// A copy of this store without its entries, for [`Self::rollback`].
-    /// The OR-Set is copied (tags only, no values).
-    fn snapshot_without_entries(&mut self) -> Box<Self> {
+    /// The OR-Set is copied (tags only, no values): O(tags in the store).
+    /// Image merges and snapshot adoption use it; their input is a whole
+    /// image, so the merge itself is of that order too.
+    fn snapshot_without_entries(&mut self) -> Rollback {
         #[cfg(test)]
         SNAPSHOTS.with(|n| n.set(n.get() + 1));
         let entries = std::mem::take(&mut self.entries);
         let snapshot = Box::new(self.clone());
         self.entries = entries;
-        snapshot
+        Rollback::Copy(snapshot)
+    }
+
+    /// Rollback state for a delta that touches only the OR-Set elements
+    /// `touched` (#2146): a copy of this store without its entries and
+    /// without its OR-Set, and an OR-Set undo log holding the slots of each
+    /// touched key. Cost: O(touched keys and their tags + changelog
+    /// entries); the caller compacts the changelog first, so it does not
+    /// depend on the size of the store.
+    ///
+    /// Undo-log rule: the delta may change no OR-Set element outside
+    /// `touched` before [`Self::rollback`] or before the log is dropped.
+    /// [`Self::apply_delta_content`] changes only the keys of a delta's
+    /// `added` and `removed`, and [`Self::settle_and_measure`] only
+    /// compacts the changelog, which the undo log allows.
+    fn snapshot_for_delta(&mut self, touched: &[String]) -> Rollback {
+        let mut undo = self.keys.begin_undo();
+        for key in touched {
+            self.keys.save_for_undo(&mut undo, key);
+        }
+        #[cfg(test)]
+        DELTA_UNDO_SAVES.with(|n| n.set(n.get() + undo.saved_len() as u64));
+        let entries = std::mem::take(&mut self.entries);
+        let keys = std::mem::take(&mut self.keys);
+        let rest = Box::new(self.clone());
+        self.entries = entries;
+        self.keys = keys;
+        Rollback::Undo(rest, undo)
     }
 
     /// Undo a merge: put back every entry `journal` saw change and every
-    /// other field from `snapshot`.
-    fn rollback(&mut self, snapshot: Box<Self>, journal: EntryJournal) {
+    /// other field from `snapshot`. For [`Rollback::Undo`] the OR-Set is
+    /// put back from its undo log.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::Merge`] when the OR-Set undo log does not come from this
+    /// set (its version is later than the set's). That cannot happen on
+    /// the delta path, which only moves the set's version forward; the
+    /// error is reported rather than hidden.
+    fn rollback(&mut self, snapshot: Rollback, journal: EntryJournal) -> Result<()> {
         for (key, prior) in journal.priors {
             match prior {
                 EntryPrior::Absent => {
@@ -2454,8 +2504,21 @@ impl KvStore {
             }
         }
         let entries = std::mem::take(&mut self.entries);
-        *self = *snapshot;
-        self.entries = entries;
+        match snapshot {
+            Rollback::Copy(snapshot) => {
+                *self = *snapshot;
+                self.entries = entries;
+                Ok(())
+            }
+            Rollback::Undo(rest, undo) => {
+                let mut keys = std::mem::take(&mut self.keys);
+                *self = *rest;
+                self.entries = entries;
+                let undone = keys.undo(undo);
+                self.keys = keys;
+                undone.map_err(|e| KvError::Merge(format!("OR-Set undo failed: {e}")))
+            }
+        }
     }
 
     /// #1970 admission rule, on a merge already applied in place and
@@ -2467,7 +2530,7 @@ impl KvStore {
     /// caller kept it; `None` measures it.
     fn admit_or_rollback(
         &mut self,
-        snapshot: Box<Self>,
+        snapshot: Rollback,
         journal: EntryJournal,
         source: Option<AgentId>,
         before: u64,
@@ -2485,13 +2548,13 @@ impl KvStore {
         let (content, rest, retained) = match measured {
             Ok(sizes) => sizes,
             Err(e) => {
-                self.rollback(snapshot, journal);
+                self.rollback(snapshot, journal)?;
                 return Err(e);
             }
         };
         let image = content.saturating_add(rest);
         if image > HARD_IMAGE_LIMIT_BYTES as u64 {
-            self.rollback(snapshot, journal);
+            self.rollback(snapshot, journal)?;
             return Err(self.refuse_merge(source, image, false));
         }
         self.image
@@ -3109,8 +3172,9 @@ impl KvStore {
     /// local put, remove or writer mark, or a load, drops it; the next delta
     /// measures it once. When an upper growth bound fits, the delta just
     /// applies. Otherwise a lower bound over the limit refuses it unapplied;
-    /// else it applies in place under an undo journal and a copy of the
-    /// OR-Set, and is kept or rolled back.
+    /// else it applies in place under an entry journal and an OR-Set undo
+    /// log of its touched keys, and is kept or rolled back. No step copies
+    /// the whole OR-Set (#2146).
     ///
     /// # Errors
     ///
@@ -3181,11 +3245,13 @@ impl KvStore {
             return Err(self.refuse_merge(writer.copied(), image, true));
         }
         let before = self.retained_with_content(content)?;
-        let snapshot = self.snapshot_without_entries();
+        // `content_exact` compacted the changelog, so the undo log copies
+        // no changelog and costs O(touched keys) (#2146).
+        let snapshot = self.snapshot_for_delta(&touched);
         let outcome = match self.apply_delta_content(delta, writer, &mut journal) {
             Ok(outcome) => outcome,
             Err(e) => {
-                self.rollback(snapshot, journal);
+                self.rollback(snapshot, journal)?;
                 return Err(e);
             }
         };
@@ -3881,7 +3947,7 @@ impl KvStore {
         let snapshot = self.snapshot_without_entries();
         let mut journal = EntryJournal::default();
         if let Err(e) = self.keys.merge_state(&other.keys) {
-            self.rollback(snapshot, journal);
+            self.rollback(snapshot, journal)?;
             return Err(KvError::Merge(format!("OR-Set image merge failed: {e}")));
         }
         for (key, entry) in &other.entries {
@@ -3951,7 +4017,7 @@ impl KvStore {
         let snapshot = self.snapshot_without_entries();
         let mut journal = EntryJournal::default();
         if let Err(e) = self.keys.merge_state(&source.keys) {
-            self.rollback(snapshot, journal);
+            self.rollback(snapshot, journal)?;
             return Err(KvError::Merge(format!(
                 "legacy OR-Set image merge failed: {e}"
             )));
@@ -10518,3 +10584,7 @@ mod tests {
 #[cfg(test)]
 #[path = "incremental_measure_tests.rs"]
 mod incremental_measure_tests;
+
+#[cfg(test)]
+#[path = "orset_undo_tests.rs"]
+mod orset_undo_tests;
