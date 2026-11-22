@@ -516,15 +516,20 @@ A HostCommitted or Restored journal is settled for the producer, but its
 launcher still owns a trial there and reads its binding on every start. So
 `stage` never writes or removes the binding the current journal names until
 the new journal is durable, and it refuses a transaction id equal to the
-current journal's. A crash, or a failed journal write, after the new
-binding leaves the current journal and its binding as they were, plus an
-orphan binding that no journal names.
+current journal's. It also refuses a plan for another install pair (other
+daemon or CLI target) over a settled journal in the same data root, since
+the launcher reads that data root under the lock of the journal's own
+daemon target. A crash, or a failed journal write, after the new binding
+leaves one of two startable states: before the journal's rename, the
+current journal and its binding as they were, plus an orphan binding that
+no journal names; after the rename (a failure at the directory sync), the
+new Staged journal with its own binding.
 
 Orphans (bindings of neither the current nor the new transaction) are
 removed under the host lock before the new binding is written, and every
-binding but the new one after the new journal is written, so at most two
-binding files exist at any time. Removal is best effort; a leftover is
-harmless and the next stage retries. At the new transaction's own path, a
+binding but the new one after the new journal is written. Each removal is
+best effort: when all succeed at most two binding files exist; a removal
+that fails leaves a harmless leftover that the next stage retries. At the new transaction's own path, a
 leftover the strict writer would refuse to replace is removed first: any
 regular file it cannot read as a binding (corrupt, a later schema, or a
 read that fails, EACCES or EIO included) or a symlink (removed as a link;
@@ -543,8 +548,11 @@ typed refusal (78):
 - the binding named by the journal's transaction id, opened through the
   checked host root without following a symlink, is missing, cannot be
   opened by the launcher's account, or is not a 0600 regular file of that
-  account. It is read under the same daemon install lock as the journal,
-  so no stage can change it between the two reads;
+  account. The journal and the binding are both read under the install
+  lock of the journal plan's daemon target, taken beside that target even
+  when the binary is missing (a lock that cannot be taken is a failed
+  read, 75). Every stage in this data root holds that lock, so none can
+  change the binding between the two reads;
 - the binding names another transaction, generation, plan or anchor, or
   the plan names another install pair or other participants than the
   anchor.

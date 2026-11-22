@@ -254,6 +254,22 @@ fn remove_bindings_except(data_root: &Path, keep: &[Option<&str>]) {
     }
 }
 
+/// The new transaction's binding write. A test can make it fail at one
+/// barrier step (`tests::fail_binding_write`).
+#[cfg(unix)]
+fn write_binding(path: &Path, binding: &plan_binding::PlanBinding) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(step) = tests::BINDING_FAILURE.with(std::cell::Cell::take) {
+        return journal::write_auxiliary_record_with_failure(
+            path,
+            binding,
+            plan_binding::validate_binding,
+            step,
+        );
+    }
+    journal::write_auxiliary_record(path, binding, plan_binding::validate_binding)
+}
+
 /// The Staged journal write. A test can make it fail at one barrier step
 /// (`tests::fail_journal_write`), as a crash or a full disk would.
 #[cfg(unix)]
@@ -475,13 +491,21 @@ impl Prepared {
     /// durable: stage never writes or removes the binding the current
     /// journal names before that. A transaction id equal to the current
     /// journal's is refused, since its binding would be the current one.
-    /// A crash or a failed journal write after the new binding leaves the
-    /// current journal and its binding as they were, plus an orphan
-    /// binding. Orphans (bindings of neither the current nor the new
-    /// transaction) are removed before the new binding is written, and
-    /// every binding but the new one after the new journal is written, so
-    /// at most two binding files exist at any time. Removal of an orphan is
-    /// best effort; a leftover is harmless and the next stage retries.
+    /// A settled journal for another install pair is refused too: the
+    /// launcher reads this data root under the lock of the journal's own
+    /// daemon target, which a stage for another pair would not hold.
+    ///
+    /// A crash or a failed journal write after the new binding leaves one
+    /// of two states, both startable. If it happens before the journal's
+    /// rename, the current journal and its binding are as they were, plus
+    /// an orphan binding. If it happens after the rename (at the directory
+    /// sync), the new Staged journal is in place with its own binding.
+    /// Orphans (bindings of neither the current nor the new transaction)
+    /// are removed before the new binding is written, and every binding
+    /// but the new one after the new journal is written. Each removal is
+    /// best effort: when all succeed at most two binding files exist; a
+    /// removal that fails leaves a harmless leftover that the next stage
+    /// retries.
     #[cfg(unix)]
     pub(crate) fn stage(
         lock: &HostLock,
@@ -515,6 +539,26 @@ impl Prepared {
                                 "transaction {transaction_id} is the current journal's"
                             )));
                         }
+                        // The launcher reads this data root's journal and
+                        // binding under the lock of the journal's daemon
+                        // target; a stage for another pair would hold other
+                        // locks and could remove that binding between its
+                        // two reads (#2171 review). Refused rather than also
+                        // taking the earlier pair's locks: a third and
+                        // fourth lock beside the plan's two has no order
+                        // every holder agrees on, so it could deadlock.
+                        if earlier.plan.daemon.target_path != plan.daemon.target_path
+                            || earlier.plan.cli.target_path != plan.cli.target_path
+                        {
+                            return Err(refused(format!(
+                                "the host journal in {} is for another install pair \
+                                 ({}, {}); this data root cannot be staged for a different \
+                                 install until that journal is removed by hand",
+                                data_root.display(),
+                                earlier.plan.daemon.target_path.display(),
+                                earlier.plan.cli.target_path.display()
+                            )));
+                        }
                         current = Some(plan_binding::binding_file_name(&earlier.transaction_id));
                     }
                     journal::RecordRead::Journal(earlier) => {
@@ -536,7 +580,7 @@ impl Prepared {
         remove_bindings_except(data_root, &[Some(name.as_str()), current.as_deref()]);
         let binding_path = data_root.join(&name);
         clear_unusable_binding(&binding_path)?;
-        journal::write_auxiliary_record(&binding_path, &binding, plan_binding::validate_binding)?;
+        write_binding(&binding_path, &binding)?;
         write_staged_journal(&path, &record)?;
         // The new journal is durable: the current one's binding is history.
         remove_bindings_except(data_root, &[Some(name.as_str())]);
@@ -639,6 +683,17 @@ pub(crate) mod tests {
         /// write fails.
         pub(crate) static JOURNAL_FAILURE: std::cell::Cell<Option<journal::BarrierStep>> =
             const { std::cell::Cell::new(None) };
+    }
+
+    thread_local! {
+        /// The barrier step at which this thread's next binding write fails.
+        pub(crate) static BINDING_FAILURE: std::cell::Cell<Option<journal::BarrierStep>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Make this thread's next binding write fail at `step`.
+    pub(crate) fn fail_binding_write(step: journal::BarrierStep) {
+        BINDING_FAILURE.with(|failure| failure.set(Some(step)));
     }
 
     /// Make this thread's next Staged journal write fail at `step`.
@@ -873,6 +928,61 @@ pub(crate) mod tests {
         expected.sort();
         assert_eq!(bindings(), expected);
         assert!(directory.is_dir());
+    }
+
+    /// #2171 review: the binding is written before the journal; a binding
+    /// write that fails at any step before its rename writes no journal.
+    #[test]
+    fn a_failed_binding_write_writes_no_journal() {
+        for step in [
+            journal::BarrierStep::Write,
+            journal::BarrierStep::FileSync,
+            journal::BarrierStep::Rename,
+        ] {
+            let (_dir, root) = root();
+            let plan = freeze_plan(input_in(&root)).unwrap();
+            let lock = HostLock::acquire(&plan).unwrap();
+            let anchor = plan_binding::test_anchored(&plan);
+            fail_binding_write(step);
+            assert!(Prepared::stage(&lock, &root, "tx", plan, &anchor).is_err());
+            assert!(!root.join(journal::JOURNAL_FILE_NAME).exists(), "{step:?}");
+        }
+    }
+
+    /// #2171 review: over a settled journal for another install pair, a
+    /// stage is refused and changes nothing.
+    #[test]
+    fn staging_refuses_another_install_pair_over_a_journal() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let anchor = plan_binding::test_anchored(&plan);
+        Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).unwrap();
+        settle(&root, Phase::HostCommitted);
+        drop(lock);
+        let (_other_dir, other_root) = super::tests::root();
+        let mut other = freeze_plan(input_in(&other_root)).unwrap();
+        // The other pair, staged into this data root.
+        other.participants = plan.participants.clone();
+        for participant in &mut other.participants {
+            participant.executable = other.daemon.target_path.clone();
+            participant.argv[0] = other.daemon.target_path.to_string_lossy().into_owned();
+        }
+        let other_lock = HostLock::acquire(&other).unwrap();
+        let other_anchor = plan_binding::test_anchored(&other);
+        let before = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+        let error =
+            Prepared::stage(&other_lock, &root, "tx-2", other, &other_anchor).expect_err("refused");
+        assert!(
+            error.to_string().contains("another install pair"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap(),
+            before
+        );
+        assert!(root.join(plan_binding::binding_file_name("tx-1")).exists());
+        assert!(!root.join(plan_binding::binding_file_name("tx-2")).exists());
     }
 
     /// #2171 review: a transaction id equal to the current journal's is

@@ -204,13 +204,39 @@ fn issue_held(
         *held = daemon.map(|(_, lock)| lock);
         return Ok(None);
     }
-    // The binding is read under the same daemon install lock as the
-    // journal (#2171 review): a producer stages, and removes an old
-    // transaction's binding, only under that lock, so this start reads the
-    // binding of the journal it read, never one changed in between.
+    // The journal and its binding are read under the install lock of the
+    // journal plan's daemon target (#2171 review). A producer stages, and
+    // removes an old transaction's binding, only while it holds that lock:
+    // `stage` refuses a plan for another install pair over a journal in
+    // this data root, so every stage here takes this same lock. When the
+    // lock taken above is not that one (the daemon is missing, or the
+    // argv names another file), take it now and read the journal again
+    // under it. A lock that cannot be taken is a failed read (75), never a
+    // refusal from a torn read.
+    let plan_lock = match &daemon {
+        Some((canonical, _)) if *canonical == record.plan.daemon.target_path => None,
+        _ => Some(plan_daemon_lock(
+            &record.plan.daemon.target_path,
+            DAEMON_LOCK_WAIT,
+        )?),
+    };
+    let record = if plan_lock.is_some() {
+        match read_journal(&root, record_uid)? {
+            Some(again) if serde_json::to_vec(&again)? == serde_json::to_vec(&record)? => again,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "the host journal changed while its install lock was taken",
+                ))
+            }
+        }
+    } else {
+        record
+    };
     #[cfg(test)]
     tests::before_binding_read();
     check_binding(args, &root, &record, owners)?;
+    drop(plan_lock);
     drop(daemon);
     let participant = record
         .plan
@@ -343,6 +369,37 @@ fn daemon_lock_with(
                 ));
             }
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+/// The install lock of the journal plan's daemon target, taken within
+/// `wait`. The lock file is created beside the target even when the
+/// binary itself is missing. Every failure (no directory, no access, a
+/// lock held past the wait) is a failed read, so the start is retried; a
+/// read under no lock could see a torn journal and binding.
+fn plan_daemon_lock(target: &Path, wait: std::time::Duration) -> io::Result<File> {
+    let retry = |error: io::Error| {
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!(
+                "cannot take the install lock {}: {error}",
+                recovery::lock_path(target).display()
+            ),
+        )
+    };
+    let lock = recovery::lock(target).map_err(retry)?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(retry(io::Error::new(io::ErrorKind::TimedOut, "still held")))
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(retry(error)),
         }
     }
 }
@@ -737,6 +794,12 @@ mod tests {
                 match issue_as(&args, &command, effective_uid()) {
                     // The journal stayed: the current transaction issues.
                     Ok(Some(issued)) => {
+                        // At the directory sync the new journal is already
+                        // in place, so only an ordinary start is right.
+                        assert!(
+                            !matches!(step, journal::BarrierStep::DirectorySync),
+                            "{phase:?} {step:?}"
+                        );
                         assert_eq!(issued.host.root(), root, "{phase:?} {step:?}")
                     }
                     // The rename landed before the failure: the new Staged
@@ -749,6 +812,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Arm the hook to try `stage` just before the binding read; returns
+    /// whether that stage went through.
+    fn race_before_binding_read(
+        stage: impl FnOnce() -> io::Result<()> + 'static,
+    ) -> std::rc::Rc<std::cell::Cell<Option<bool>>> {
+        let staged = std::rc::Rc::new(std::cell::Cell::new(None));
+        let hook_staged = staged.clone();
+        BEFORE_BINDING_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                hook_staged.set(Some(stage().is_ok()));
+            }))
+        });
+        staged
+    }
+
+    /// #2171 review 3 (a): a racing stage for another install pair (another
+    /// daemon target, so another daemon lock) over this data root is
+    /// refused by the producer, so it cannot remove the binding between the
+    /// start's two reads.
+    #[test]
+    fn a_racing_stage_for_another_install_pair_is_refused() {
+        let (_dir, root, record) = rooted(journal::Phase::HostCommitted);
+        let (args, command) = matching(&record);
+        let mut other = record.clone();
+        let other_daemon = root.join("other-daemon.d");
+        std::fs::write(&other_daemon, b"other").unwrap();
+        other.plan.daemon.target_path = other_daemon.clone();
+        for participant in &mut other.plan.participants {
+            participant.executable = other_daemon.clone();
+            participant.argv[0] = other_daemon.to_string_lossy().into_owned();
+        }
+        let staged = race_before_binding_read(move || {
+            use super::super::prepare::{HostLock, Prepared};
+            let lock =
+                HostLock::acquire_within(&other.plan, std::time::Duration::from_millis(200))?;
+            let anchor = plan_binding::test_anchored(&other.plan);
+            Prepared::stage(&lock, &root, "tx-racer", other.plan.clone(), &anchor).map(drop)
+        });
+        let issued = issue_as(&args, &command, effective_uid());
+        assert_eq!(staged.get(), Some(false), "the other pair's stage ran");
+        assert!(matches!(issued, Ok(Some(_))));
+    }
+
+    /// #2171 review 3 (b): with the daemon binary missing, the start still
+    /// reads the journal and binding under the journal plan's daemon lock,
+    /// so a same-pair stage cannot run in between; the missing binary is
+    /// then a failed read (75), not a refusal.
+    #[test]
+    fn a_missing_daemon_still_reads_under_the_plans_lock() {
+        let (_dir, root, record) = rooted(journal::Phase::HostCommitted);
+        let (args, command) = matching(&record);
+        std::fs::remove_file(&record.plan.daemon.target_path).unwrap();
+        let (hook_root, hook_record) = (root.clone(), record.clone());
+        let staged = race_before_binding_read(move || {
+            stage_over(&hook_root, &hook_record, "tx-racer", None)
+        });
+        let error = issue_as(&args, &command, effective_uid())
+            .err()
+            .expect("the missing daemon is an error");
+        assert_eq!(staged.get(), Some(false), "the racing stage got the lock");
+        assert!(!start::is_refusal(&error), "{error}");
+        assert!(root
+            .join(plan_binding::binding_file_name(&record.transaction_id))
+            .exists());
+    }
+
+    /// #2171 review 3 (b): a plan lock that cannot be taken (its directory
+    /// is gone) is a failed read, never a refusal.
+    #[test]
+    fn a_plan_lock_that_cannot_be_taken_is_a_failed_read() {
+        let error = plan_daemon_lock(
+            Path::new("/nonexistent-x0x-dir/x0xd"),
+            std::time::Duration::from_millis(10),
+        )
+        .expect_err("no directory");
+        assert!(!start::is_refusal(&error), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     /// #2171 review (c): a stage that tries to run between the start's
