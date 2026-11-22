@@ -142,6 +142,23 @@ class WindowsFlushAcceptanceControls(unittest.TestCase):
                 self.assertEqual(len(job_if), 1, name)
                 self.assertIn(gate, job_if[0], name)
 
+    def test_cli_runs_on_the_explicit_stack_and_ci_checks_it(self):
+        cli = read('src/bin/x0x.rs')
+        self.assertNotIn('#[tokio::main]', cli)
+        self.assertIn('x0x::server::run_cli_runtime(run_cli)', cli)
+        workflow = WORKFLOW.read_text(encoding='utf-8')
+        job = workflow[workflow.index('  test-windows:'):workflow.index('  coverage:')]
+        debug = job.index('run: ./scripts/ci/windows-cli-stack-check.ps1 -X0x target/debug/x0x.exe')
+        release = job.index('run: ./scripts/ci/windows-cli-stack-check.ps1 -X0x target/release/x0x.exe')
+        self.assertLess(debug, job.index('./scripts/ci/windows-flush-acceptance.ps1'))
+        self.assertLess(job.index('run: cargo build --release --bin x0x'), release)
+        self.assertIn("'scripts/ci/windows-cli-stack-check.ps1'", job)
+        check = read('scripts/ci/windows-cli-stack-check.ps1')
+        self.assertIn('$StackOverflow = -1073741571', check)
+        self.assertEqual(-1073741571, 0xC00000FD - (1 << 32))
+        for arguments in ("@('--version')", "@('--help')", "@('autostart', '--help')"):
+            self.assertIn(arguments, check)
+
 
 if __name__ == '__main__':
     unittest.main()

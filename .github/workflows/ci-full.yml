@@ -1250,7 +1250,7 @@ jobs:
       - name: Parse-check the PowerShell scripts
         shell: pwsh
         run: |
-          $scripts = @('scripts/install.ps1', 'scripts/ci/windows-flush-acceptance-peer.ps1')
+          $scripts = @('scripts/install.ps1', 'scripts/ci/windows-flush-acceptance-peer.ps1', 'scripts/ci/windows-cli-stack-check.ps1')
           foreach ($script in $scripts) {
             $check = "`$e = `$null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path '$script').Path, [ref]`$null, [ref]`$e); if (`$e) { `$e | Out-String | Write-Host; exit 1 }"
             foreach ($exe in @('powershell', 'pwsh')) {
@@ -1335,6 +1335,26 @@ jobs:
         id: acceptance_build
         if: always()
         run: cargo build --bin x0xd --bin x0x
+
+      # #1764: the debug `x0x` overflowed the 1 MiB Windows main-thread
+      # stack (exit 0xC00000FD) in `x0x autostart`, because clap built its
+      # command tree there. The CLI now runs on `x0x-main` with an explicit
+      # stack, like x0xd (#2083). These commands only parse arguments.
+      - name: CLI starts without a stack overflow (debug)
+        id: cli_stack_debug
+        if: always() && steps.acceptance_build.outcome == 'success'
+        shell: pwsh
+        run: ./scripts/ci/windows-cli-stack-check.ps1 -X0x target/debug/x0x.exe
+
+      - name: Build the release x0x
+        id: release_cli_build
+        if: always() && steps.acceptance_build.outcome == 'success'
+        run: cargo build --release --bin x0x
+
+      - name: CLI starts without a stack overflow (release)
+        if: always() && steps.release_cli_build.outcome == 'success'
+        shell: pwsh
+        run: ./scripts/ci/windows-cli-stack-check.ps1 -X0x target/release/x0x.exe
 
       - name: Windows flush-owner acceptance (#1764)
         if: always() && steps.acceptance_build.outcome == 'success'

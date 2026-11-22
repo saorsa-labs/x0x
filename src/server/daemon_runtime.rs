@@ -9,6 +9,11 @@
 //! [`run_daemon_runtime`] runs the future on a new thread with an explicit
 //! stack size instead, so the stack the daemon gets no longer depends on the
 //! platform.
+//!
+//! The `x0x` CLI had the same fault (#1764): `#[tokio::main]` polled its
+//! top-level future on the main thread, and a debug `x0x autostart` on a
+//! hosted Windows runner exited with `STATUS_STACK_OVERFLOW`. The CLI uses
+//! [`run_cli_runtime`], which shares the thread and runtime setup.
 
 use std::future::Future;
 
@@ -29,6 +34,36 @@ pub const DAEMON_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 /// Name of the thread that drives the daemon's top-level future.
 pub const DAEMON_MAIN_THREAD_NAME: &str = "x0xd-main";
 
+/// Name of the thread that drives the `x0x` CLI's top-level future.
+pub const CLI_MAIN_THREAD_NAME: &str = "x0x-main";
+
+/// Spawn `thread_name` with a [`DAEMON_THREAD_STACK_BYTES`] stack. On it,
+/// build a multi-thread Tokio runtime whose workers have the same stack, and
+/// block on the future that `make` returns.
+fn spawn_runtime_thread<F, Fut>(
+    thread_name: &str,
+    role: &'static str,
+    make: F,
+) -> anyhow::Result<std::thread::JoinHandle<anyhow::Result<Fut::Output>>>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future,
+    Fut::Output: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .stack_size(DAEMON_THREAD_STACK_BYTES)
+        .spawn(move || {
+            Ok(tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(DAEMON_THREAD_STACK_BYTES)
+                .build()
+                .with_context(|| format!("failed to build the {role} Tokio runtime"))?
+                .block_on(make()))
+        })
+        .with_context(|| format!("failed to spawn the {role} main thread"))
+}
+
 /// Run the future that `make` returns to completion on a new multi-thread
 /// Tokio runtime, and return its result.
 ///
@@ -48,21 +83,33 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
     T: Send + 'static,
 {
-    let daemon_thread = std::thread::Builder::new()
-        .name(DAEMON_MAIN_THREAD_NAME.to_string())
-        .stack_size(DAEMON_THREAD_STACK_BYTES)
-        .spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_stack_size(DAEMON_THREAD_STACK_BYTES)
-                .build()
-                .context("failed to build the daemon Tokio runtime")?
-                .block_on(make())
-        })
-        .context("failed to spawn the daemon main thread")?;
-    daemon_thread
+    spawn_runtime_thread(DAEMON_MAIN_THREAD_NAME, "daemon", make)?
         .join()
-        .map_err(|_| anyhow::anyhow!("the daemon main thread panicked"))?
+        .map_err(|_| anyhow::anyhow!("the daemon main thread panicked"))??
+}
+
+/// Run the `x0x` CLI's top-level future like [`run_daemon_runtime`], on a
+/// thread named [`CLI_MAIN_THREAD_NAME`], and return its output.
+///
+/// A panic on the CLI thread is re-raised on the caller with
+/// [`std::panic::resume_unwind`]. The panic hook has already printed the
+/// message once on the CLI thread, so the process exits with the same status
+/// (101) and prints the same message as a panic on the main thread did.
+///
+/// # Errors
+///
+/// Returns an error if the thread cannot be spawned or the runtime cannot be
+/// built.
+pub fn run_cli_runtime<F, Fut>(make: F) -> anyhow::Result<Fut::Output>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future,
+    Fut::Output: Send + 'static,
+{
+    match spawn_runtime_thread(CLI_MAIN_THREAD_NAME, "CLI", make)?.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +237,60 @@ mod tests {
         .expect("daemon runtime");
         assert_eq!(main_name.as_deref(), Some(DAEMON_MAIN_THREAD_NAME));
         assert_eq!((main_probe, worker_probe), (1, 1));
+    }
+
+    /// #1764: the CLI future runs on [`CLI_MAIN_THREAD_NAME`], and it and
+    /// the runtime's workers have [`DAEMON_THREAD_STACK_BYTES`]. Same child
+    /// re-run as [`daemon_and_worker_threads_have_the_explicit_stack`].
+    #[test]
+    fn cli_and_worker_threads_have_the_explicit_stack() {
+        if std::env::var_os(PROBE_CHILD_ENV).is_some() {
+            let (name, main, worker) = run_cli_runtime(|| async {
+                let name = std::thread::current().name().map(str::to_string);
+                let main = touch_probe_stack();
+                let worker = tokio::spawn(async { touch_probe_stack() }).await;
+                (name, main, worker.ok())
+            })
+            .expect("CLI runtime");
+            assert_eq!(name.as_deref(), Some(CLI_MAIN_THREAD_NAME));
+            assert_eq!((main, worker), (1, Some(1)));
+            return;
+        }
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("path of this test binary"))
+                .args([
+                    "--exact",
+                    "server::daemon_runtime::tests::cli_and_worker_threads_have_the_explicit_stack",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env_remove("RUST_MIN_STACK")
+                .env(PROBE_CHILD_ENV, "1")
+                .output()
+                .expect("run the stack-probe child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "stack-probe child failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// #1764: a CLI-thread panic is re-raised on the caller with its own
+    /// payload, so the process keeps the main-thread panic exit status.
+    #[test]
+    fn cli_thread_panic_is_re_raised_with_its_payload() {
+        let caught = std::panic::catch_unwind(|| {
+            run_cli_runtime(|| async {
+                panic!("deliberate CLI-thread panic");
+            })
+        });
+        let payload = caught.expect_err("a CLI-thread panic must be re-raised");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("deliberate CLI-thread panic")
+        );
     }
 
     /// A panic on the daemon thread is returned as an error, not re-raised

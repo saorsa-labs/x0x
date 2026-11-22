@@ -68,7 +68,10 @@ compiler or test error.
   neither merges nor releases. That includes `Test Suite (Windows)` and the `Coverage Gate`, which no
   longer run on PRs at all.
 - `Test Suite (Windows)` ends with the Windows flush-owner acceptance (#1764),
-  `scripts/ci/windows-flush-acceptance.ps1`. It builds `x0xd` and `x0x`, makes the wrapper with the real
+  `scripts/ci/windows-flush-acceptance.ps1`. Before it, `scripts/ci/windows-cli-stack-check.ps1` runs
+  `x0x --version`, `x0x --help` and `x0x autostart --help` on the debug and the release `x0x.exe` and
+  fails on exit 0xC00000FD (`STATUS_STACK_OVERFLOW`); the first acceptance run found that overflow in
+  the debug CLI (A11, 22 Nov 2026). The job builds `x0xd` and `x0x`; the acceptance script makes the wrapper with the real
   `x0x autostart --name accept1764` (then deletes the logon task it registers), and runs the real `x0xd`
   under that wrapper with an isolated loopback config: no seeds, no mDNS, no port mapping, no update
   check. It checks that the flush owner starts and serves its named pipe at the derived name, that the
