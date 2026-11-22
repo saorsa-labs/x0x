@@ -12,14 +12,13 @@ Breaking and operator-visible changes in this release. Each item names the
 number its entry below cites; the entries hold the detail.
 
 - **Dependency pins:** `ant-quic =0.29.0` and all eleven `saorsa-gossip-*`
-  crates `=0.5.95` (v0.48.1 shipped `=0.27.61` and `=0.5.90`). The entry
-  under Changed names the step from 0.28.0 and 0.5.92 to 0.29.0 and 0.5.94
-  (PR #2126); 0.5.95 came with #2110 item 1 (PR #2147). ant-quic 0.29.0 changes packets on the wire (path-MTU probes
+  crates `=0.5.95` (#2126, #2147; v0.48.1 shipped `=0.27.61` and
+  `=0.5.90`). ant-quic 0.29.0 changes packets on the wire (path-MTU probes
   to 1452 B, ECN, bounded relay queues of 256 packets); soak before a fleet
   rollout. The optional `voice` feature still pulls ant-quic 0.28.0 into
   `Cargo.lock`.
 - **Rust API:** `IdentityError::KeyNotFound` is a new variant and
-  `KvRemoveOutcome` has a new public field `held` (#2110 item 3); neither
+  `KvRemoveOutcome` has a new public field `held` (#2110 item 3, PR #2142); neither
   type is `#[non_exhaustive]`, so an exhaustive `match` or a struct literal
   must change. `NetworkConfig.relay_service_enabled` is a new field
   (#1642). `DmError::RecipientMachineRevoked` is a new variant (#1597
@@ -37,8 +36,10 @@ number its entry below cites; the entries hold the detail.
   `no_admission_result` (#2135 item 1). `POST /groups/:id/send` returns
   `fallback_topic: null` when no global copy was sent (#1964).
   `GET /groups/:id/messages` can answer `429` `public_listener_cap` (#2124).
-  A group store refuses a local put past 12 MiB and a remote merge past
-  16 MiB, with HTTP 507 (#1970). `POST /grants` refuses a window above
+  A group store refuses a local put that would take its image past the
+  12 MiB soft limit `SOFT_IMAGE_LIMIT_BYTES` (HTTP 507), and refuses a
+  remote merge past the 16 MiB hard limit `HARD_IMAGE_LIMIT_BYTES` (shown
+  as `image.state: full_diverged`) (#1970). `POST /grants` refuses a window above
   90 days (#1350) or a start more than 600 s in the future (#1350
   follow-up).
 - **Sessions:** a GUI session ends after `gui_idle_timeout_minutes`
@@ -154,7 +155,10 @@ number its entry below cites; the entries hold the detail.
   key, so no wire change. On a group store a holder that was offline loses
   the key at its next image merge; on a plain store it keeps the key until
   it is removed again. Without the flag, deleting a key this replica
-  does not hold now returns 404 `key not found` instead of 500.
+  does not hold now returns 404 `key not found` instead of 500. Rust API
+  (breaking, PR #2142): `IdentityError` has a new variant `KeyNotFound`
+  and `KvRemoveOutcome` a new public field `held`; neither type is
+  `#[non_exhaustive]`.
 - **A Homebrew install keeps the direct autostart job (#2111; A14
   amendment of 20 Nov 2026).** `x0x autostart --launcher` and
   `--repair --launcher` keep refusing a daemon inside a versioned Homebrew
@@ -314,6 +318,166 @@ number its entry below cites; the entries hold the detail.
   opt-in `x0x autostart --launcher` installs the job through the dormant
   stable launcher.
 
+- **The arm handler's restore takes the host lock (#2012, #2065 and #2074
+  reviews; A14 amendment of 18 Nov 2026).** `restore_arm` now writes the
+  journal and restores the swapped pair under the host lock, with a
+  bounded 5 s wait (Unix). An arm request while the host lock is held is
+  refused at admission (`WouldBlock`). New `acquire_install_lock` returns
+  the install lock as an `InstallLock` guard, which the prepare producer
+  can adopt; a refused adoption hands the guards back. `InstallLock` is
+  defined in `upgrade` so the Windows build keeps compiling. A refused
+  arm can reply after about 37 s, past the launcher's 30 s read timeout;
+  the launcher's recovery then restores the pair. The test profile builds
+  `sha2` at opt-level 3.
+- **A late ACK after a restart must come from the recipient machine (#2007;
+  A07 amendment of 17 Nov 2026).** Each queued-send attempt record in
+  `direct_send_outcomes.json` now also keeps the recipient machine IDs the
+  attempts were sent to (`machines`, hex). An orphan v2 ACK settles a held
+  send, or records `delivered_late`, only when the machine it came from is
+  in that list. An ACK from the right agent on another machine changes
+  nothing. A record without `machines` (written before this change, or whose
+  machine was never known) still loads, but no orphan ACK settles it; the
+  send is sent again.
+- **Groups (H-S3-r, studio1 train 60):** a joiner whose join seal was not
+  served now keeps its group record and its `readmission_required
+  {base_beyond_retention}` after the join attempt times out. Before, a stub
+  still at the invite base was removed on the timeout and the joiner answered
+  404. W3-H row H-S3-r also no longer passes or fails by gossip timing: J gets
+  no gossip replay of the metadata messages published before it redeemed, so
+  its head stays beyond A's retention.
+- **Launcher refusals that can clear by themselves no longer stop the job,
+  and `x0x doctor` shows why the launcher refuses (#2015 and #2016 reviews;
+  A14 amendment of 17 Nov 2026).** A prior child that still exists gets up
+  to 45 s to end before the start refuses (on macOS a refusal holds until a
+  stop). A missing plan path, for example a data root on a volume not yet
+  mounted, is retried (75) instead of refused (78); only typed refusals are
+  final. Each final refusal is recorded in the host root and reported by
+  `x0x doctor` while the daemon is down. The launchd classifiers detect the
+  launcher from `Program` when it is set, and check launcher arguments with
+  the launcher's own parser. The launcher stays dormant.
+- **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
+  review of #2014).** A plan path that is missing or not canonical, and a
+  symlinked or non-regular trial record, now exit 78 instead of 75. The tests
+  now reach the journal owner check and cover the `.` and `..` instance ids.
+- **The dormant launcher's main loop keeps a last-attempt Failed on a clock
+  error, honours a late stop, and does not restart on a fixed refusal (#1378,
+  review of #2006).** A clock error after the last failed attempt rolls back
+  as Failed at once. A stop caught after a retired trial's own stop check
+  exits 0 instead of starting the daemon. A missing or stopped participant
+  and a prior child that still runs exit 78, not 75.
+- **The dormant launcher records Failed when a peer's fence ends its last
+  attempt (#1378, review of #1991).** A failed attempt on a host a peer has
+  fenced now takes the Failed verdict when its attempts or total budget are
+  used up, and Interrupted only otherwise; a clock error no longer turns that
+  Failed into Interrupted, and a last attempt ended by a peer's stop counts as
+  Failed (A14 amendment of 17 Nov 2026). The coordinator lets Failed win, so
+  the failed release is held instead of retried.
+- **Groups (#2003):** a joiner past its authority's retention that another
+  admin attests now catches up to the head and ends Active with keys; before,
+  it stayed `catching_up` at its head. An admin keeps the renames, role
+  changes and unbans it applies, whoever signed them, and serves them on a
+  catch-up page only to a joiner it attested. A pre-Welcome joiner applies
+  such a relayed link as its signer's only inside its armed attested sequence.
+  A joiner whose seal was not served stops counting rounds once every admin
+  has answered (`awaiting_attestation {admins_answered}`), and a finished
+  catch-up no longer stays `catching_up`. ADR A08 amendment of 17 Nov 2026.
+- **Groups (#2003, review of #2021):** an admin that attested a joiner keeps
+  relaying other admins' renames, role changes and unbans to it after a later
+  `rate_limited` answer; before, that answer ended the relay until the admin
+  attested again. Any other later answer still ends it. The relay goes only
+  to a requester that is an Active member when the page is served. A relayed
+  link's `actor` now matches its signer without regard to hex case. ADR A08
+  correction of 17 Nov 2026.
+- **Group store images have a 12 MiB put limit and a 16 MiB merge limit
+  (#1970; A10 amendment of 18 Nov 2026).** A group store now retains only
+  entries of live keys and no OR-Set changelog, so a removed key keeps no
+  value bytes and an image cannot plant dead entries. A local put that would
+  take the retained image past 12 MiB is refused (HTTP 507). Every remote
+  merge (delta, retained image, checkpoint adoption, legacy import) is
+  measured and kept only when the merged image (replicated part plus a 16 KiB
+  allowance for per-replica fields) is at most 16 MiB. Honest concurrent
+  writes within the 4 MiB headroom converge on every replica in any order. A
+  refused merge applies nothing. It is shown as `image.state: full_diverged`
+  in `GET /stores` and warned by `x0x doctor`; this replica's pulls from the
+  refused source back off until its image shrinks, and the refused content
+  returns through the next full-image repair. Merges of deltas, retained images and adoption apply in place with no copy of the
+  store; legacy import still measures on a copy. An image saved above 16 MiB loads whole as
+  `over_limit` and serves again once entries are removed. Refusals are also
+  counted in `GET /diagnostics/state-sync`.
+- **Groups (#2022):** a joiner that reaches its catch-up terminal without its
+  keys keeps its `catching_up` recovery object until it has them; if they do
+  not come within the Welcome's 10-minute lifetime it ends
+  `readmission_required {base_beyond_retention}`, which stays until it has
+  keys or joins again. On TreeKEM an Active seat alone no longer counts as
+  keys, here or in the #1661 lost-Welcome rule. Before, the recovery object
+  cleared at the terminal with no keys. With no capable peer at all, the
+  recovery loop no longer counts a round on each tick. Tests cover a relayed
+  link under an admin ATA (a member-signed one is refused), the authority's
+  decision for a head one below its oldest kept commit, and a decrypt at the
+  head epoch in W3-H H-S3-r. ADR A08 amendment of 18 Nov 2026.
+
+- **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
+  (and `grant revoke|renew`) percent-encode each path segment, so a key with
+  `#`, `?` or `/` reaches the exact key. A slow granted read or write now
+  runs on a detached task (at most 16 at once), so it does not hold the
+  replies to other waiting requests.
+- **The dormant launcher reads a process that exits during its `/proc` read
+  as gone.** `child::absent` treated only NotFound as gone; a process reaped
+  between the open and the read of `/proc/<pid>/stat` fails with ESRCH, which
+  flaked `a_peer_recovery_failure_during_the_stop_is_final` on studio1 and
+  could make `stop_foreign` report a stopped process as an error.
+- **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
+  of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
+  TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2
+  higher-head evidence, so a reconnect pass held every revocation eviction
+  of the group while it ran. W3-H row
+  `w3h_1357_red_s4_idle_revocation_one_admin_home` failed 8 runs in 20
+  without the shim (the pass's random wait is not controlled there); with
+  the fix it passed 20 of 20. Epoch-ahead traffic stays evidence.
+- **An evidence Hello on a followed older connection gets a reply again
+  (#1346, A05 amendment of 15 Nov 2026).** The Hello reply gate charged a
+  high-water mark of connection generations, so after ant-quic made an older
+  connection the winner again (ADR-017 follow) a Hello on it got only an ACK.
+  The gate now charges the accepted stream's own connection generation
+  (ant-quic 0.27.62), and each generation gets one attempt in a bounded
+  record; the 60-second machine gate is unchanged. A local race no longer
+  charges the peer a reset. No wire-format change.
+- **A listener-admission marker that can never complete no longer blocks join
+  requests (#1840, A08 amendment of 15 Nov 2026).** An early-gate refusal
+  (revoked or unverified sender, revocation-resync hold, withdrawn group), an
+  expired marker, and a marker whose group was deleted or withdrawn now
+  release the journal, live and at startup, with the sidecar bytes kept as
+  evidence. A requester signs one request again over the authority's head at
+  most 8 times per offer, and a re-seal no longer restarts the offer backoff.
+- **A daemon that restarts with pending S4 work no longer seals a stale
+  head (#1581).** If the `.evs` file held an unsealed revocation-eviction
+  row, the group needs a holder to confirm its head before S4 seals there.
+  Until then the row shows `waiting_for_head_sync`, also past the 13 s
+  restart sync wait. Before, the wait alone counted as a synced head, and a
+  restarted admin could seal its stale head with a divergent key.
+- **A demoted S4 worker shows `local_committer_ineligible` (#1581).** An
+  admin that is demoted to member while it holds an open revocation-eviction
+  row now marks the row `local_committer_ineligible` naming the next
+  admin, as ADR 0110 §4 wants. Before, the row showed
+  `waiting_for_designated_admin`.
+- **Owner recovery no longer deadlocks while another revoked member is
+  seated (#1973; A09 amendment of 16 Nov 2026).** In an `OwnerCertified`
+  group whose admins are all revoked, the promoted member's recovery seal
+  now tolerates seated below-Admin members whose verified revocation the
+  node holds. The recovery commits; each tolerated seat keeps its leaf in
+  the recovery epoch, D60 egress withholding keeps it out, and its own S4
+  row removes it and rekeys one epoch later under the new admin. Before,
+  the seal refused with the ADR-0038 eviction check and that member's
+  eviction waited for the admin the recovery would seat, so the group
+  stayed without an admin. A refused recovery seal that names failing
+  members now shows the typed wait `waiting_for_member_eviction` with
+  those members in `named`. An expired (not revoked) below-Admin seat
+  still refuses the seal (#2004). No wire format changes. W3-H: the
+  1581m arm `w3h_1581m_recovery_refuses_a_revoked_member` flips from RED
+  to GREEN, and the new receiver-side arm
+  `w3h_1357_s4_owner_recovery_revoked_member_1973` (own shard `s4-1973`)
+  checks that E cannot decrypt after its own S4 row commits at e0+2.
+
 ### Added
 
 - **Launcher-bound systemd unit (#1378; A14 amendment of 20 Nov 2026).**
@@ -414,7 +578,9 @@ number its entry below cites; the entries hold the detail.
   `GET /status` adds `gui_idle_timeout_secs`; `x0xd --doctor` prints the
   timeout. Known limit: open WebSocket and SSE streams of a revoked or
   idle-expired session are not closed; such a stream can outlive sign-out
-  until the client disconnects, with no time bound.
+  until the client disconnects, with no time bound. *(Superseded in this
+  release by #2079 under Fixed: those streams now close when the session
+  ends.)*
 - **Relay serving follows participation mode (#1642; A06 amendment of
   18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
   is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;
@@ -566,7 +732,10 @@ number its entry below cites; the entries hold the detail.
   `verified` says anything, the rest mean writer unknown. A delta
   that holds an entry under another key is refused. A mark adds about
   4.7 KB; a put that would take a group store's image past the 16 MiB
-  retained-image limit is refused (`store full`, HTTP 507).
+  retained-image limit is refused (`store full`, HTTP 507). *(Superseded in
+  this release by #1970 under Fixed: a local put is refused past the 12 MiB
+  soft limit `SOFT_IMAGE_LIMIT_BYTES`; 16 MiB, `HARD_IMAGE_LIMIT_BYTES`, is
+  the bound for remote merges.)*
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
   amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
   `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe
@@ -717,10 +886,12 @@ number its entry below cites; the entries hold the detail.
 
 ### Changed
 
-- **ant-quic 0.29.0 and saorsa-gossip 0.5.94 (A06 amendment of 20 Nov
-  2026).** `ant-quic` moves from `=0.28.0` to `=0.29.0` and all eleven
-  `saorsa-gossip-*` crates from `=0.5.92` to `=0.5.94`. No x0x code
-  changes. Defaults x0x now gets: (1) Only a wildcard bind (x0x binds
+- **ant-quic 0.29.0 and saorsa-gossip 0.5.95 (#2126, #2147; A06 amendment
+  of 20 Nov 2026).** This release ships `ant-quic =0.29.0` and all eleven
+  `saorsa-gossip-*` crates at `=0.5.95`. #2126 moved `ant-quic` from
+  `=0.28.0` to `=0.29.0` and the gossip crates from `=0.5.92` to `=0.5.94`
+  with no x0x code changes; #2147 (#2110 item 1) moved the gossip crates to
+  `=0.5.95` for the crdt-sync `OrSet::retained_tags` accessor. Defaults x0x now gets: (1) Only a wildcard bind (x0x binds
   `[::]`) gets the new dual-stack socket; an explicit bind such as the
   `127.0.0.1` CI tests does not exercise it. That socket uses
   `quinn_udp::UdpSocketState`: it reports the real `may_fragment()`
@@ -746,9 +917,10 @@ number its entry below cites; the entries hold the detail.
   `ingress_by_topic`, `ingress_topics_uncounted` and `eager_send_causes`
   to the stage snapshot; they appear in `GET /diagnostics/gossip` under
   `pubsub_stages`, and `ingress_by_topic` shows the top signer peer IDs
-  per topic. 0.5.94 only moves its ant-quic pin. The #501
-  controlled-load reviewed producer moves to crates.io
-  `saorsa-gossip-pubsub` 0.5.94 (checksum `beb6146f...`); no outbound
+  per topic. 0.5.94 only moves its ant-quic pin, and 0.5.95's pubsub
+  sources are byte-identical to 0.5.94's. The #501 controlled-load
+  reviewed producer is crates.io `saorsa-gossip-pubsub` 0.5.95 (checksum
+  `e4a433ec...`); no outbound
   meter definition changes. The optional `voice` feature keeps
   `saorsa-webrtc-core` 0.6.1, which needs ant-quic 0.28, so `Cargo.lock`
   now holds ant-quic 0.28.0 (voice only) beside 0.29.0; x0x passes no
@@ -1072,168 +1244,6 @@ number its entry below cites; the entries hold the detail.
   registered=0`. Fixtures log at `warn`, where dial and join activity is
   not recorded. A daemon that does not answer keeps unknown counts; it is
   never reported as zero connections.
-
-### Fixed
-
-- **The arm handler's restore takes the host lock (#2012, #2065 and #2074
-  reviews; A14 amendment of 18 Nov 2026).** `restore_arm` now writes the
-  journal and restores the swapped pair under the host lock, with a
-  bounded 5 s wait (Unix). An arm request while the host lock is held is
-  refused at admission (`WouldBlock`). New `acquire_install_lock` returns
-  the install lock as an `InstallLock` guard, which the prepare producer
-  can adopt; a refused adoption hands the guards back. `InstallLock` is
-  defined in `upgrade` so the Windows build keeps compiling. A refused
-  arm can reply after about 37 s, past the launcher's 30 s read timeout;
-  the launcher's recovery then restores the pair. The test profile builds
-  `sha2` at opt-level 3.
-- **A late ACK after a restart must come from the recipient machine (#2007;
-  A07 amendment of 17 Nov 2026).** Each queued-send attempt record in
-  `direct_send_outcomes.json` now also keeps the recipient machine IDs the
-  attempts were sent to (`machines`, hex). An orphan v2 ACK settles a held
-  send, or records `delivered_late`, only when the machine it came from is
-  in that list. An ACK from the right agent on another machine changes
-  nothing. A record without `machines` (written before this change, or whose
-  machine was never known) still loads, but no orphan ACK settles it; the
-  send is sent again.
-- **Groups (H-S3-r, studio1 train 60):** a joiner whose join seal was not
-  served now keeps its group record and its `readmission_required
-  {base_beyond_retention}` after the join attempt times out. Before, a stub
-  still at the invite base was removed on the timeout and the joiner answered
-  404. W3-H row H-S3-r also no longer passes or fails by gossip timing: J gets
-  no gossip replay of the metadata messages published before it redeemed, so
-  its head stays beyond A's retention.
-- **Launcher refusals that can clear by themselves no longer stop the job,
-  and `x0x doctor` shows why the launcher refuses (#2015 and #2016 reviews;
-  A14 amendment of 17 Nov 2026).** A prior child that still exists gets up
-  to 45 s to end before the start refuses (on macOS a refusal holds until a
-  stop). A missing plan path, for example a data root on a volume not yet
-  mounted, is retried (75) instead of refused (78); only typed refusals are
-  final. Each final refusal is recorded in the host root and reported by
-  `x0x doctor` while the daemon is down. The launchd classifiers detect the
-  launcher from `Program` when it is set, and check launcher arguments with
-  the launcher's own parser. The launcher stays dormant.
-- **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
-  review of #2014).** A plan path that is missing or not canonical, and a
-  symlinked or non-regular trial record, now exit 78 instead of 75. The tests
-  now reach the journal owner check and cover the `.` and `..` instance ids.
-- **The dormant launcher's main loop keeps a last-attempt Failed on a clock
-  error, honours a late stop, and does not restart on a fixed refusal (#1378,
-  review of #2006).** A clock error after the last failed attempt rolls back
-  as Failed at once. A stop caught after a retired trial's own stop check
-  exits 0 instead of starting the daemon. A missing or stopped participant
-  and a prior child that still runs exit 78, not 75.
-- **The dormant launcher records Failed when a peer's fence ends its last
-  attempt (#1378, review of #1991).** A failed attempt on a host a peer has
-  fenced now takes the Failed verdict when its attempts or total budget are
-  used up, and Interrupted only otherwise; a clock error no longer turns that
-  Failed into Interrupted, and a last attempt ended by a peer's stop counts as
-  Failed (A14 amendment of 17 Nov 2026). The coordinator lets Failed win, so
-  the failed release is held instead of retried.
-- **Groups (#2003):** a joiner past its authority's retention that another
-  admin attests now catches up to the head and ends Active with keys; before,
-  it stayed `catching_up` at its head. An admin keeps the renames, role
-  changes and unbans it applies, whoever signed them, and serves them on a
-  catch-up page only to a joiner it attested. A pre-Welcome joiner applies
-  such a relayed link as its signer's only inside its armed attested sequence.
-  A joiner whose seal was not served stops counting rounds once every admin
-  has answered (`awaiting_attestation {admins_answered}`), and a finished
-  catch-up no longer stays `catching_up`. ADR A08 amendment of 17 Nov 2026.
-- **Groups (#2003, review of #2021):** an admin that attested a joiner keeps
-  relaying other admins' renames, role changes and unbans to it after a later
-  `rate_limited` answer; before, that answer ended the relay until the admin
-  attested again. Any other later answer still ends it. The relay goes only
-  to a requester that is an Active member when the page is served. A relayed
-  link's `actor` now matches its signer without regard to hex case. ADR A08
-  correction of 17 Nov 2026.
-- **Group store images have a 12 MiB put limit and a 16 MiB merge limit
-  (#1970; A10 amendment of 18 Nov 2026).** A group store now retains only
-  entries of live keys and no OR-Set changelog, so a removed key keeps no
-  value bytes and an image cannot plant dead entries. A local put that would
-  take the retained image past 12 MiB is refused (HTTP 507). Every remote
-  merge (delta, retained image, checkpoint adoption, legacy import) is
-  measured and kept only when the merged image (replicated part plus a 16 KiB
-  allowance for per-replica fields) is at most 16 MiB. Honest concurrent
-  writes within the 4 MiB headroom converge on every replica in any order. A
-  refused merge applies nothing. It is shown as `image.state: full_diverged`
-  in `GET /stores` and warned by `x0x doctor`; this replica's pulls from the
-  refused source back off until its image shrinks, and the refused content
-  returns through the next full-image repair. Merges of deltas, retained images and adoption apply in place with no copy of the
-  store; legacy import still measures on a copy. An image saved above 16 MiB loads whole as
-  `over_limit` and serves again once entries are removed. Refusals are also
-  counted in `GET /diagnostics/state-sync`.
-- **Groups (#2022):** a joiner that reaches its catch-up terminal without its
-  keys keeps its `catching_up` recovery object until it has them; if they do
-  not come within the Welcome's 10-minute lifetime it ends
-  `readmission_required {base_beyond_retention}`, which stays until it has
-  keys or joins again. On TreeKEM an Active seat alone no longer counts as
-  keys, here or in the #1661 lost-Welcome rule. Before, the recovery object
-  cleared at the terminal with no keys. With no capable peer at all, the
-  recovery loop no longer counts a round on each tick. Tests cover a relayed
-  link under an admin ATA (a member-signed one is refused), the authority's
-  decision for a head one below its oldest kept commit, and a decrypt at the
-  head epoch in W3-H H-S3-r. ADR A08 amendment of 18 Nov 2026.
-
-- **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
-  (and `grant revoke|renew`) percent-encode each path segment, so a key with
-  `#`, `?` or `/` reaches the exact key. A slow granted read or write now
-  runs on a detached task (at most 16 at once), so it does not hold the
-  replies to other waiting requests.
-- **The dormant launcher reads a process that exits during its `/proc` read
-  as gone.** `child::absent` treated only NotFound as gone; a process reaped
-  between the open and the read of `/proc/<pid>/stat` fails with ESRCH, which
-  flaked `a_peer_recovery_failure_during_the_stop_is_final` on studio1 and
-  could make `stop_foreign` report a stopped process as an error.
-- **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
-  of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
-  TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2
-  higher-head evidence, so a reconnect pass held every revocation eviction
-  of the group while it ran. W3-H row
-  `w3h_1357_red_s4_idle_revocation_one_admin_home` failed 8 runs in 20
-  without the shim (the pass's random wait is not controlled there); with
-  the fix it passed 20 of 20. Epoch-ahead traffic stays evidence.
-- **An evidence Hello on a followed older connection gets a reply again
-  (#1346, A05 amendment of 15 Nov 2026).** The Hello reply gate charged a
-  high-water mark of connection generations, so after ant-quic made an older
-  connection the winner again (ADR-017 follow) a Hello on it got only an ACK.
-  The gate now charges the accepted stream's own connection generation
-  (ant-quic 0.27.62), and each generation gets one attempt in a bounded
-  record; the 60-second machine gate is unchanged. A local race no longer
-  charges the peer a reset. No wire-format change.
-- **A listener-admission marker that can never complete no longer blocks join
-  requests (#1840, A08 amendment of 15 Nov 2026).** An early-gate refusal
-  (revoked or unverified sender, revocation-resync hold, withdrawn group), an
-  expired marker, and a marker whose group was deleted or withdrawn now
-  release the journal, live and at startup, with the sidecar bytes kept as
-  evidence. A requester signs one request again over the authority's head at
-  most 8 times per offer, and a re-seal no longer restarts the offer backoff.
-- **A daemon that restarts with pending S4 work no longer seals a stale
-  head (#1581).** If the `.evs` file held an unsealed revocation-eviction
-  row, the group needs a holder to confirm its head before S4 seals there.
-  Until then the row shows `waiting_for_head_sync`, also past the 13 s
-  restart sync wait. Before, the wait alone counted as a synced head, and a
-  restarted admin could seal its stale head with a divergent key.
-- **A demoted S4 worker shows `local_committer_ineligible` (#1581).** An
-  admin that is demoted to member while it holds an open revocation-eviction
-  row now marks the row `local_committer_ineligible` naming the next
-  admin, as ADR 0110 §4 wants. Before, the row showed
-  `waiting_for_designated_admin`.
-- **Owner recovery no longer deadlocks while another revoked member is
-  seated (#1973; A09 amendment of 16 Nov 2026).** In an `OwnerCertified`
-  group whose admins are all revoked, the promoted member's recovery seal
-  now tolerates seated below-Admin members whose verified revocation the
-  node holds. The recovery commits; each tolerated seat keeps its leaf in
-  the recovery epoch, D60 egress withholding keeps it out, and its own S4
-  row removes it and rekeys one epoch later under the new admin. Before,
-  the seal refused with the ADR-0038 eviction check and that member's
-  eviction waited for the admin the recovery would seat, so the group
-  stayed without an admin. A refused recovery seal that names failing
-  members now shows the typed wait `waiting_for_member_eviction` with
-  those members in `named`. An expired (not revoked) below-Admin seat
-  still refuses the seal (#2004). No wire format changes. W3-H: the
-  1581m arm `w3h_1581m_recovery_refuses_a_revoked_member` flips from RED
-  to GREEN, and the new receiver-side arm
-  `w3h_1357_s4_owner_recovery_revoked_member_1973` (own shard `s4-1973`)
-  checks that E cannot decrypt after its own S4 row commits at e0+2.
 
 ## [v0.48.1] - 2026-10-17
 
