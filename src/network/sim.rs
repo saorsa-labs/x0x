@@ -600,6 +600,19 @@ impl SimFabric {
         dst: &PeerId,
         after: usize,
     ) -> Vec<(Write, usize)> {
+        self.deliveries_after(src, dst, after)
+            .into_iter()
+            .map(|(write, position, _)| (write, position))
+            .collect()
+    }
+
+    /// [`Self::delivered_writes_after`] with each write's delivery time.
+    pub(crate) fn deliveries_after(
+        &self,
+        src: &PeerId,
+        dst: &PeerId,
+        after: usize,
+    ) -> Vec<(Write, usize, Duration)> {
         let state = self.lock();
         let writes: BTreeMap<(LaneKey, u64), &Write> = state
             .writes
@@ -616,10 +629,10 @@ impl SimFabric {
                 TraceEvent::Fate {
                     lane,
                     seq,
-                    fate: Fate::Delivered { .. },
+                    fate: Fate::Delivered { at },
                 } => writes
                     .get(&(*lane, *seq))
-                    .map(|write| ((*write).clone(), position)),
+                    .map(|write| ((*write).clone(), position, *at)),
                 _ => None,
             })
             .collect()
