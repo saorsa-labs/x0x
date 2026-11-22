@@ -1,8 +1,12 @@
 # CI/CD
 
-Eight workflows in `.github/workflows/`:
+The main workflows in `.github/workflows/`:
 
-- **ci.yml**: fmt, clippy, nextest, line coverage, doc, API/GUI parity, skill token budget
+- **ci.yml**: the slim hosted set on pushes to `main` and on PRs: fmt, clippy, the library unit tests
+  (`Test Suite`), inert CI script controls, doc, API/GUI parity, deployment authority, skill token budget
+- **ci-full.yml** (`CI (full)`): the heavy suites, nightly on `main` and on `workflow_dispatch`: the full
+  workspace Test Suite, the W3-H shards and determinism gate, the released-binary rows, the Linux systemd and
+  100k signing acceptances, Windows, and the Coverage Gate
 - **security.yml**: `cargo audit` (daily schedule + PRs)
 - **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io. Also generates `release-manifest.json` and signature for the self-update system (see [`upgrade-system.md`](upgrade-system.md)).
 - **build.yml**: PR validation
@@ -13,7 +17,7 @@ Eight workflows in `.github/workflows/`:
 
 ## PR CI and main protection (ADR 0087, charter D15)
 
-Recorded in [ADR 0087](adr/0087-repository-and-release-governance.md) (Proposed);
+Recorded in [ADR 0087](adr/0087-repository-and-release-governance.md) (Accepted);
 the rulings D04, D05, D15 and D36 are summarised in
 [`design/x0x-direction.md`](design/x0x-direction.md).
 
@@ -30,6 +34,44 @@ the rulings D04, D05, D15 and D36 are summarised in
 - `v*` tags can be created, moved or deleted only by repository admins (tag ruleset). Every agent currently acts
   as the `dirvine` admin account, so this and the `release` environment reviewer are procedural gates, not
   technical separation between agents and David (a separate bot identity was declined, D15).
+
+## Hosted CI is the slim set
+
+GitHub-hosted runners have 4 vCPUs and 16 GB of RAM. From 13 Nov 2026 the full set in `ci.yml` did not go
+green there. The `Test Suite` job stopped with exit 143 ("The runner has received a shutdown signal") while
+rustc built the workspace test graph, before any test ran (#1789, run 44976569803). The W3-H shards, the
+H-S3-rm rows and the Coverage Gate lost their runners ("lost communication with the server"). The same tree
+was green on studio1. The likely cause is memory exhaustion on the runner; the logs end without a
+compiler or test error.
+
+- `ci.yml` runs only what fits a hosted runner. Its `Test Suite` job runs the x0x library unit tests
+  (`--all-features --lib`) in the isolated namespace, with `--no-fail-fast`. It builds them with the
+  `ci-hosted` Cargo profile (no debuginfo, x0x at `opt-level = 0` with 256 codegen units) and adds 12 GB of
+  swap. It skips two sets of lib tests:
+  - the W3-H cases (`(^|::)w3h_`, the `w3h-gate` default filter). Other unit tests under `src/server/w3h/`
+    still run;
+  - the tests that took 60 s or more on a hosted runner, named in `X0X_HOSTED_SKIP` in `ci.yml`:
+    `evidence_wire::lookup::tests::s4_machine_resolution_work_is_independent_of_registry_size` (459 s),
+    `evidence_wire::admission_tests::issue1207_late_readiness_preserves_denials` (76 s) and
+    `gossip::pubsub::tests::slice1_pinned_sg_concurrent_publishers_after_maintenance_timers` (62 s).
+  Keep this list and `X0X_HOSTED_SKIP` in step.
+- Measured on a hosted runner (job 137137607557): the cold `ci-hosted` build took 11m31s with swap near
+  zero, and 4,876 of 7,807 tests ran in 786 s. That projects to about 21 min for all of them, or about
+  18 min without the skipped slow tests. The test deadline is 2400 s and the job limit is 75 min, at least
+  2x the projection.
+- The `Inert CI script controls` job runs the script self-tests behind the `ci-full.yml` jobs (W3-H shard
+  plan and trace gate, systemd acceptance, M2 signing gate, the #703 proof validator, the Coverage Gate
+  step controls) on every PR. They take seconds.
+- The studio1 trains run the full suite and are the merge gate.
+- `ci-full.yml` runs the heavy jobs nightly on `main` and on `workflow_dispatch` for any branch. They gate
+  neither merges nor releases. That includes `Test Suite (Windows)` and the `Coverage Gate`, which no
+  longer run on PRs at all.
+- The 20 W3-H reruns that D196 (A08) requires for a harness case are not automatic on a PR. Someone must
+  dispatch `CI (full)` on the PR branch by hand.
+- `integration.yml`, `build.yml` and `security.yml` still run on every PR (ADR 0087 rule 1).
+- Every PR workflow cancels an older run for the same PR. Push runs on `main` are never cancelled, so each
+  merge commit keeps a terminal `ci.yml` result for the release gate. `ci-full.yml` cancels only an older
+  run of the same event on the same ref, so a dispatch never cancels a nightly run.
 
 ## Release CI Gate (#128)
 
@@ -49,6 +91,8 @@ commit.
   than the old ceiling, which forced a manual rerun on the v0.41.0 tag.)
 - `ci.yml` is not triggered by the tag push itself (it gates on branch
   `main`), so the observed run is the one from when the commit was merged.
+- The gate reads `ci.yml` runs only. A `ci-full.yml` (`CI (full)`) run does
+  not gate a release.
 
 To exercise it locally, push a scratch `vX.Y.Z` tag on a commit with
 intentionally-red CI and confirm `require-green-ci` fails before any artifact
@@ -98,7 +142,8 @@ X0XD_LEGACY_BINARY=/path/to/authentic/x0xd-0.30.1 just convergence-release
 
 ## Coverage Gate
 
-The CI coverage job runs on Linux with `cargo-llvm-cov` and `cargo-nextest`.
+The coverage job (`ci-full.yml`, nightly and on dispatch) runs on Linux with
+`cargo-llvm-cov` and `cargo-nextest`.
 It emits `lcov.info`, uploads it as a workflow artifact, and enforces the
 active global floor from `coverage-thresholds.toml`.
 

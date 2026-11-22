@@ -4,7 +4,7 @@
 # Gate step (issue #607).
 #
 # Extracts the ACTUAL `run:` block of "Run line coverage gate" from
-# .github/workflows/ci.yml and executes it in a temp directory with PATH-stub
+# .github/workflows/ci-full.yml and executes it in a temp directory with PATH-stub
 # `cargo` / `python3` and a stub scripts/ci/nextest-isolated.sh, exactly as
 # GitHub runs it (`bash -e`). Four cases:
 #
@@ -16,14 +16,14 @@
 # Every case also asserts the arguments were preserved verbatim from the
 # workflow: --no-fail-fast and the exclusion filter on the test pass,
 # --fail-under-lines on the report, --thresholds/--enforce-global on the
-# ratchet. If ci.yml ever drifts (flag dropped, filter edited), the recorded
+# ratchet. If ci-full.yml ever drifts (flag dropped, filter edited), the recorded
 # stub arguments no longer match and these controls fail.
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
+CI_YML="$REPO_ROOT/.github/workflows/ci-full.yml"
 REAL_PYTHON3="$(command -v python3)"
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); printf 'ok %d - %s\n' "$((PASS+FAIL))" "$*"; }
