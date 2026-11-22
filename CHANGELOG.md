@@ -31,6 +31,16 @@ All notable changes to this project will be documented in this file.
   unpublished and the row completes from the local chain, also after a
   restart. No new route.
 
+## [v0.49.1] - 2026-11-22
+
+### Fixed
+
+- **Package size:** the v0.49.0 crate was 12.4 MiB compressed and crates.io
+  rejected it (413, 10 MiB limit). The `exclude` list now drops `tests/` (except
+  the two `[[test]]` targets), `docs/`, `issues/`, `scripts/`, `.github/`,
+  `.claude/`, `agent/` and backup files. The crate is 7.5 MiB. No code changes;
+  binaries are rebuilt from the same sources as v0.49.0 plus #2170's CI profile.
+
 ## [v0.49.0] - 2026-11-22
 
 ### Upgrade notes
