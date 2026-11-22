@@ -218,6 +218,11 @@ impl CeState {
         self.deliveries.keys().cloned().collect()
     }
 
+    /// Stop the delivery of one row's saved frame, if it has one.
+    pub(super) fn drop_delivery(&mut self, key: &EvictionKey) {
+        self.deliveries.remove(key);
+    }
+
     /// Per-member `waiting_for_receiver_upgrade` of one row: the
     /// recipients stranded by a lacking or unknown advert, with the gap
     /// revision (§6 "Stranded").

@@ -1030,7 +1030,12 @@ fine **when given both `--delegation-payload-b64` and
 `--delegation-signature`** (clap-required, mutually `requires`-bound).
 Certify the sub-agent first (`POST /owner/agents/issue` with
 `"mode": "rider"` — the CLI equivalent is `x0x owner agents issue
-<PUB_HEX> --mode rider`), then mint with a harness-side capability:
+<PUB_HEX> --mode rider`), then mint with a harness-side capability.
+Minting uses the agent's rider-mode journal line with the greatest
+`issued_at`. A later ACP re-issue of the same agent does not remove that
+line, so `POST /owner/riders` can still mint for it while
+`GET /owner/agents` shows it as `acp` (`POST /report` refuses it as a
+target for this reason):
 
 the harness signs `rider_delegation_bytes(sub_agent_id,
 daemon_agent_id, groups, not_after)` with the sub-agent's OWN key
@@ -1195,7 +1200,14 @@ publishing explicit no-name X0A4 beats so peers erase it.
 restarts), `mode` (`"acp"` \| `"rider"`), `journal_label`, `revoked` (bool),
 `placement` (nullable enrichment: `"pinned"`/`"roaming"` + epoch — null when
 no owner-verified placement record is held; P enforcement fails open for such
-agents).
+agents). `mode` and `journal_label` come from the owner's last
+`POST /owner/agents/issue` line for the agent in journal file order, not
+from the certificate the row shows: a renewed or live-announced certificate
+keeps a rider `"rider"` with its label; a later issuance in the other mode
+changes it (#2158). Owner sync does not carry the mode (#2182): a rider
+re-issued as ACP on another owner device stays `"rider"` on this one, so
+placement minting pins it to this machine and `POST /report` refuses it
+as a target (fail closed).
 
 ## Home (ADR-0038)
 
@@ -2078,7 +2090,7 @@ token. A session token is refused before the body is read.
 | GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group delete <group_id>` | **Phase D.3**: any admin permanently deletes the group with a signed terminal withdrawal |
-| POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker (`:id` accepts either the roster map key or the group's stable id). Requires the durable API token. On a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set |
+| POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker (`:id` accepts either the roster map key or the group's stable id). Requires the durable API token. On a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set. After the clear, an S4 row that waited as `waiting_for_fork_resolution` drops its saved removal or crypto-only exclusion unpublished when it met a competing exclusion, and completes from the local chain; a row held only by an unrelated conflict resumes its delivery (#2135) |
 | POST | `/groups/:id/send` | `x0x group send <group_id> <body> [--kind chat\|announcement] [--thread-root <id>] [--reply-to <id>] [--mentions <hex>...] [--delegation-digest <hex>]` | **Phase E**: publish a signed message to a SignedPublic group. `--mentions` (repeatable) routes structured ADR-0040 mentions daemon-side; `--delegation-digest` authorizes send-as attribution |
 | POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit). **ADR-0066 §3b**: 409 `fork_quarantined` while the group is fork-quarantined — refused before anything is signed, committed or published |
 | GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history. **ADR-0066 §3b**: keeps serving while fork-quarantined, with `fork_quarantined: true` and a `fork_quarantine` object added to the response |
@@ -2390,6 +2402,7 @@ every wait. A wait always names its cause; it does not stop silently.
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
 | `POST /groups/:id/ban/:agent_id` (TreeKEM group, target with no seat and no leaf) | `200 OK` / `409 Conflict` | #1540: the ban is roster-only — no TreeKEM commit, no epoch change — and answers `{"ok": true, "revision", "roster_only": true}`. While another Active member's current verified advert lacks application bit 17 (`roster_only_ban_v1`) it answers 409 `{"ok": false, "error": "waiting_for_receiver_upgrade", "capability": "roster_only_ban_v1", "members": [<agent hex>...]}` and changes nothing. |
+| `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` (TreeKEM group) | `500 Internal Server Error` | #2135: `{"ok": false, "error": "treekem_rollback_failed", "detail"}`. The TreeKEM commit was made, the seal was refused, and the tree could not be restored. The daemon unloads the group's tree before it answers, so later TreeKEM operations on the group answer 424 "TreeKEM group not loaded" until the durable tree, which never held the commit, is reloaded (a daemon restart or the next rebind). This reply and an error log are the only places that name the failure. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
 | `POST /groups/:id/secure/encrypt` (GSS plane) | `424 Failed Dependency` | `{"ok": false, "error": "no shared secret available — await welcome or ask admin to re-share"}`. The caller is an active member that holds no group secret and no verified-removal hold: an encrypted-group joiner still waiting for its welcome share. The keyless survivor of the 409 row below is not this state — its hold is what separates the two answers.
