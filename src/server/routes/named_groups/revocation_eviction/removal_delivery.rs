@@ -418,120 +418,217 @@ pub(super) fn resume_after_load(
         else {
             continue;
         };
-        let Some(row) = store.get_mut(&key) else {
-            continue;
-        };
-        match classify(info, row.parent_head.as_deref(), &saved.result_head) {
-            ResumeAction::Deliver => {
-                row.phase = Phase::CommittedDeliveryPending;
-                row.result_head = Some(saved.result_head.clone());
-                let delivery = new_delivery(
-                    saved.event,
-                    saved.result_head,
-                    survivors(info, local, &key.target),
-                    true,
-                    Instant::now(),
-                );
-                removals.insert(key.clone(), delivery);
-            }
-            ResumeAction::Discard => {
-                row.phase = Phase::CommittedDeliveryPending;
-                row.result_head = Some(saved.result_head);
-                row.outgoing_event = None;
-            }
-            ResumeAction::Abandon => {
-                row.phase = Phase::Pending;
-                row.parent_head = None;
-                row.result_head = None;
-                row.result_epoch = None;
-                row.outgoing_event = None;
-            }
-            ResumeAction::Fork => {
-                ce_state.fork.insert(key.clone());
-                tracing::warn!(
-                    group_id = %super::super::LogHexId::group(&key.stable_group_id),
-                    target = %super::super::LogHexId::agent(&hex::encode(key.target)),
-                    "ADR 0110 S4: a saved removal meets a competing branch; waiting for fork resolution"
-                );
-            }
-            ResumeAction::WaitForHeadSync => {
-                row.waiting = Some(WaitingState::cause(WaitingCause::WaitingForHeadSync));
-            }
+        resume_saved_removal(info, local, &key, saved, store, removals, ce_state);
+    }
+}
+
+/// Classify one open row's saved removal against `info` and act on it
+/// (§3): resume its delivery, discard it, abandon the preparation, keep it
+/// as fork evidence, or wait for the head sync.
+fn resume_saved_removal(
+    info: &GroupInfo,
+    local: &[u8; 32],
+    key: &EvictionKey,
+    saved: SavedRemoval,
+    store: &mut ObligationStore,
+    removals: &mut HashMap<EvictionKey, RemovalDelivery>,
+    ce_state: &mut crypto_exclusion::CeState,
+) {
+    let Some(row) = store.get_mut(key) else {
+        return;
+    };
+    match classify(info, row.parent_head.as_deref(), &saved.result_head) {
+        ResumeAction::Deliver => {
+            row.phase = Phase::CommittedDeliveryPending;
+            row.result_head = Some(saved.result_head.clone());
+            let delivery = new_delivery(
+                saved.event,
+                saved.result_head,
+                survivors(info, local, &key.target),
+                true,
+                Instant::now(),
+            );
+            removals.insert(key.clone(), delivery);
+        }
+        ResumeAction::Discard => {
+            row.phase = Phase::CommittedDeliveryPending;
+            row.result_head = Some(saved.result_head);
+            row.outgoing_event = None;
+        }
+        ResumeAction::Abandon => {
+            row.phase = Phase::Pending;
+            row.parent_head = None;
+            row.result_head = None;
+            row.result_epoch = None;
+            row.outgoing_event = None;
+        }
+        ResumeAction::Fork => {
+            ce_state.fork.insert(key.clone());
+            tracing::warn!(
+                group_id = %super::super::LogHexId::group(&key.stable_group_id),
+                target = %super::super::LogHexId::agent(&hex::encode(key.target)),
+                "ADR 0110 S4: a saved removal meets a competing branch; waiting for fork resolution"
+            );
+        }
+        ResumeAction::WaitForHeadSync => {
+            row.waiting = Some(WaitingState::cause(WaitingCause::WaitingForHeadSync));
         }
     }
+}
+
+/// #2135: the parent and result heads of a saved removal event or
+/// crypto-only frame, and whether it is a removal event.
+fn saved_heads(row: &x0x::groups::eviction::ObligationRow) -> Option<(String, String, bool)> {
+    let bytes = row.outgoing_event.as_deref()?;
+    if let Some(saved) = decode_saved_removal(bytes) {
+        return Some((row.parent_head.clone()?, saved.result_head, true));
+    }
+    let (parent, result, _) = crypto_exclusion::saved_frame_heads(bytes)?;
+    Some((parent, result, false))
+}
+
+/// #2135: whether `marker` names a competing child of `parent`, so that a
+/// saved transition `parent` → `result` is on a branch the marker forks.
+fn marker_competes(marker: &x0x::groups::ForkQuarantine, parent: &str, result: &str) -> bool {
+    let conflicting = &marker.snapshot.conflicting_commit;
+    conflicting.prev_state_hash.as_deref() == Some(parent) && conflicting.state_hash != result
+}
+
+/// The stored fork wait of a row and the competing committer it names, if
+/// the marker competed with the row's saved transition.
+fn stored_fork_wait(row: &x0x::groups::eviction::ObligationRow) -> Option<bool> {
+    row.waiting
+        .as_ref()
+        .filter(|waiting| waiting.cause == WaitingCause::WaitingForForkResolution)
+        .map(|waiting| !waiting.named.is_empty())
 }
 
 /// #2135 (ADR 0110 §3): every open row that holds a saved removal event or
 /// crypto-only frame, measured against its group's fork-quarantine marker.
 ///
 /// - **Marker set.** The row's delivery stops and it waits in the fork set
-///   as `waiting_for_fork_resolution`. The saved event stays in the row as
-///   fork evidence and is never sent. The waiting cause is stored in the
-///   row, and the store changes only on the first pass that sets it.
+///   as `waiting_for_fork_resolution`. The saved event stays in the row and
+///   is never sent. When the marker's competing commit is a child of the
+///   saved event's parent, the stored wait names that commit's signer: the
+///   saved event is fork evidence. The store changes only on the pass that
+///   first sets the wait.
 /// - **Marker gone** (the manual clear of ADR 0066, or an owner-anchored
-///   clear), for a row in the fork set or whose stored cause is
-///   `waiting_for_fork_resolution`: the saved event is dropped, never
-///   published, and the row leaves the fork set. A competing exclusion of
-///   the same target landed on another branch, so the completion pass then
-///   completes the row from this node's verified chain; a survivor that
-///   still lacks a transition gets it by chain catch-up. The stored cause
-///   makes this hold across a restart that follows the clear.
+///   clear). The row leaves the fork set and is classified against this
+///   node's chain. When the stored wait names a competing signer, or the
+///   chain holds a competing child of the parent, the saved event is
+///   dropped unpublished: the competing exclusion is the one the group
+///   kept elsewhere, and the completion pass completes the row from this
+///   node's chain. Otherwise the marker was for another conflict: a removal
+///   resumes as at a restart, and a crypto-only frame on the current head
+///   resumes its delivery (any other frame stays as catch-up evidence).
+///   The stored wait makes this hold across a restart after the clear.
 ///
-/// Fork-set entries of rows with no saved event in an unmarked group are
-/// dropped. Returns whether the store changed.
+/// Returns whether the store changed.
 pub(super) fn settle_forked_saves(
     groups: &[(String, GroupInfo)],
+    local: &[u8; 32],
     store: &mut ObligationStore,
     removals: &mut HashMap<EvictionKey, RemovalDelivery>,
     ce_state: &mut crypto_exclusion::CeState,
 ) -> bool {
-    let marked: HashMap<&str, bool> = groups
+    let infos: HashMap<&str, &GroupInfo> = groups
         .iter()
         .filter(|(_, info)| !info.withdrawn)
-        .map(|(_, info)| (info.stable_group_id(), info.fork_quarantine.is_some()))
+        .map(|(_, info)| (info.stable_group_id(), info))
         .collect();
-    let saved: Vec<(EvictionKey, bool)> = store
+    let saved: Vec<EvictionKey> = store
         .rows()
         .filter(|row| row.phase.is_open() && row.outgoing_event.is_some())
-        .map(|row| {
-            let fork_waiting = row
-                .waiting
-                .as_ref()
-                .is_some_and(|waiting| waiting.cause == WaitingCause::WaitingForForkResolution);
-            (row.key(), fork_waiting)
-        })
+        .map(|row| row.key())
         .collect();
     let mut changed = false;
-    for (key, fork_waiting) in saved {
-        let Some(&quarantined) = marked.get(key.stable_group_id.as_str()) else {
+    for key in saved {
+        let Some(info) = infos.get(key.stable_group_id.as_str()).copied() else {
             continue;
         };
-        if quarantined {
+        let Some(row) = store.get(&key) else {
+            continue;
+        };
+        let heads = saved_heads(row);
+        let stored = stored_fork_wait(row);
+        if let Some(marker) = info.fork_quarantine.as_ref() {
             removals.remove(&key);
             ce_state.drop_delivery(&key);
             ce_state.fork.insert(key.clone());
-            changed |= store.set_waiting(
-                &key,
-                Some(WaitingState::cause(WaitingCause::WaitingForForkResolution)),
-            );
-        } else if ce_state.fork.remove(&key) || fork_waiting {
+            let mut waiting = WaitingState::cause(WaitingCause::WaitingForForkResolution);
+            if heads
+                .as_ref()
+                .is_some_and(|(parent, result, _)| marker_competes(marker, parent, result))
+            {
+                if let Ok(signer) = super::super::parse_agent_id_hex(&marker.committed_by) {
+                    waiting.named = vec![*signer.as_bytes()];
+                }
+            }
+            changed |= store.set_waiting(&key, Some(waiting));
+            continue;
+        }
+        let in_fork = ce_state.fork.remove(&key);
+        if !in_fork && stored.is_none() {
+            continue;
+        }
+        changed = true;
+        let Some((parent, result, is_removal)) = heads else {
+            continue;
+        };
+        let chain_competes = if is_removal {
+            classify(info, Some(&parent), &result) == ResumeAction::Fork
+        } else {
+            crypto_exclusion::classify_saved_frame(info, &parent, &result) == SavedFrameState::Fork
+        };
+        let Some(row) = store.get_mut(&key) else {
+            continue;
+        };
+        row.waiting = None;
+        if stored == Some(true) || chain_competes {
             removals.remove(&key);
             ce_state.drop_delivery(&key);
-            if let Some(row) = store.get_mut(&key) {
-                row.outgoing_event = None;
-                row.waiting = None;
-                changed = true;
-            }
+            row.outgoing_event = None;
             tracing::info!(
                 group_id = %super::super::LogHexId::group(&key.stable_group_id),
                 target = %super::super::LogHexId::agent(&hex::encode(key.target)),
-                "ADR 0110 S4: the fork marker is cleared; the saved exclusion is dropped unpublished"
+                "ADR 0110 S4: the fork marker is cleared; the competing branch's exclusion stands and the saved one is dropped unpublished"
             );
+            continue;
+        }
+        if is_removal {
+            let Some(saved) = row.outgoing_event.as_deref().and_then(decode_saved_removal) else {
+                continue;
+            };
+            resume_saved_removal(info, local, &key, saved, store, removals, ce_state);
+        } else if crypto_exclusion::classify_saved_frame(info, &parent, &result)
+            == SavedFrameState::CurrentHead
+        {
+            let frame = row.outgoing_event.clone().unwrap_or_default();
+            let next_revision =
+                crypto_exclusion::saved_frame_heads(&frame).map_or(0, |(_, _, revision)| revision);
+            let recipients: Vec<[u8; 32]> = info
+                .active_members()
+                .filter_map(|member| super::super::parse_agent_id_hex(&member.agent_id).ok())
+                .map(|agent| *agent.as_bytes())
+                .filter(|id| id != local && *id != key.target)
+                .collect();
+            crypto_exclusion::new_delivery(
+                ce_state,
+                &key,
+                &result,
+                next_revision,
+                Arc::new(frame),
+                recipients.clone(),
+                true,
+            );
+            crypto_exclusion::arm_resumed_share_debts(ce_state, &key, info, &recipients);
         }
     }
-    ce_state
-        .fork
-        .retain(|key| marked.get(key.stable_group_id.as_str()) == Some(&true));
+    ce_state.fork.retain(|key| {
+        infos
+            .get(key.stable_group_id.as_str())
+            .is_some_and(|info| info.fork_quarantine.is_some())
+    });
     changed
 }
 
@@ -1222,6 +1319,7 @@ mod tests {
         let groups = vec![("g".to_string(), marked(info))];
         assert!(settle_forked_saves(
             &groups,
+            &[1; 32],
             &mut store,
             &mut removals,
             &mut ce_state
@@ -1233,7 +1331,7 @@ mod tests {
         assert!(row.phase.is_open());
         assert!(row.outgoing_event.is_some(), "kept as fork evidence");
         assert!(
-            !settle_forked_saves(&groups, &mut store, &mut removals, &mut ce_state),
+            !settle_forked_saves(&groups, &[1; 32], &mut store, &mut removals, &mut ce_state),
             "a second pass changes nothing, so nothing is written again"
         );
     }
@@ -1247,10 +1345,11 @@ mod tests {
         let info = info_with_log("r", &[("p", "r")]);
         let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
         let held = vec![("g".to_string(), marked(info.clone()))];
-        settle_forked_saves(&held, &mut store, &mut removals, &mut ce_state);
+        settle_forked_saves(&held, &[1; 32], &mut store, &mut removals, &mut ce_state);
         let cleared = vec![("g".to_string(), info)];
         assert!(settle_forked_saves(
             &cleared,
+            &[1; 32],
             &mut store,
             &mut removals,
             &mut ce_state
@@ -1262,6 +1361,7 @@ mod tests {
         assert!(removals.is_empty(), "no delivery restarts");
         assert!(!settle_forked_saves(
             &cleared,
+            &[1; 32],
             &mut store,
             &mut removals,
             &mut ce_state
@@ -1276,7 +1376,7 @@ mod tests {
         let info = info_with_log("r", &[("p", "r")]);
         let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
         let held = vec![("g".to_string(), marked(info.clone()))];
-        settle_forked_saves(&held, &mut store, &mut removals, &mut ce_state);
+        settle_forked_saves(&held, &[1; 32], &mut store, &mut removals, &mut ce_state);
         // The restart: the rows through the frozen `.evs` v1 encoding, no
         // runtime state, no marker.
         let bytes = x0x::groups::eviction::encode_evs(&x0x::groups::eviction::EvsBodyV1 {
@@ -1291,6 +1391,7 @@ mod tests {
         let cleared = vec![("g".to_string(), info)];
         assert!(settle_forked_saves(
             &cleared,
+            &[1; 32],
             &mut store,
             &mut removals,
             &mut ce_state
@@ -1298,6 +1399,115 @@ mod tests {
         resume_after_load(&cleared, &[1; 32], &mut store, &mut removals, &mut ce_state);
         assert!(removals.is_empty(), "no delivery of the saved event");
         assert!(store.get(&key).expect("row").outgoing_event.is_none());
+    }
+
+    /// #2173 review: a marker for another conflict (its competing commit is
+    /// not a child of the saved event's parent). After the clear the saved
+    /// removal is this node's committed head, so it resumes its delivery
+    /// (after the head sync) instead of being dropped.
+    #[test]
+    fn an_unrelated_marker_clear_resumes_the_saved_removal() {
+        let info = info_with_log("r", &[("p", "r")]);
+        let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
+        let mut unrelated = marked(info.clone());
+        if let Some(marker) = unrelated.fork_quarantine.as_mut() {
+            marker.snapshot.conflicting_commit = commit("x", "y");
+        }
+        let held = vec![("g".to_string(), unrelated)];
+        settle_forked_saves(&held, &[1; 32], &mut store, &mut removals, &mut ce_state);
+        assert!(removals.is_empty(), "held while the marker stands");
+        assert!(fork_waiting(&store, &key));
+        let cleared = vec![("g".to_string(), with_members(info))];
+        assert!(settle_forked_saves(
+            &cleared,
+            &[1; 32],
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+        assert!(store.get(&key).expect("row").outgoing_event.is_some());
+        let delivery = removals.get(&key).expect("the delivery resumes");
+        assert!(delivery.resumed, "no resend before the head sync");
+    }
+
+    /// `info` with the members [`resume_one`] seats.
+    fn with_members(mut info: GroupInfo) -> GroupInfo {
+        for id in [[1; 32], [0xbb; 32], [0xcc; 32]] {
+            info.add_member(hex::encode(id), GroupRole::Member, None, None);
+        }
+        info.remove_member(&hex::encode([0xbb; 32]), Some(hex::encode([1; 32])));
+        info
+    }
+
+    fn ce_frame(stable_group_id: &str, prior_head: &str, result_head: &str) -> Vec<u8> {
+        use x0x::groups::crypto_exclusion as ce;
+        let kp = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let mut header = commit(prior_head, result_head);
+        header.revision = 5;
+        let body = ce::CryptoExclusionBodyV1 {
+            stable_group_id: stable_group_id.to_string(),
+            actor: *kp.agent_id().as_bytes(),
+            target: [0xbb; 32],
+            prior_head: prior_head.to_string(),
+            prior_revision: 4,
+            next_revision: 5,
+            roster_revision: 5,
+            removal_proof_hash: [3; 32],
+            crypto: ce::CryptoExclusionCryptoV1::TreeKem {
+                leaf_key_package_hash: "leaf".to_string(),
+                commit: vec![1, 2, 3],
+                next_epoch: 2,
+            },
+            commit: ce::CommitHeaderV1::from(&header),
+        };
+        ce::encode_frame(&ce::sign(body, &kp).expect("sign")).expect("encode")
+    }
+
+    /// A row holding a crypto-only frame `p` → `r` on this node's head.
+    fn ce_row(info: &GroupInfo) -> (ObligationStore, EvictionKey) {
+        let key = EvictionKey::new(info.stable_group_id().to_string(), [0xbb; 32]);
+        let mut store = ObligationStore::new();
+        store.intake(
+            &key,
+            x0x::groups::eviction::EvictionTrigger::AgentRevocation {
+                record_hash: [7; 32],
+                record_bytes: vec![7],
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        let row = store.get_mut(&key).expect("row");
+        row.phase = Phase::CommittedDeliveryPending;
+        row.outgoing_event = Some(ce_frame(info.stable_group_id(), "p", "r"));
+        (store, key)
+    }
+
+    /// #2173 review: a crypto-only frame that met a competing child of its
+    /// parent is dropped after the clear; one held only by an unrelated
+    /// marker is kept as catch-up evidence and its delivery resumes.
+    #[test]
+    fn a_crypto_only_frame_is_dropped_only_when_the_marker_competed() {
+        let info = with_members(info_with_log("r", &[("p", "r")]));
+        for competing in [true, false] {
+            let (mut store, key) = ce_row(&info);
+            let mut removals = HashMap::new();
+            let mut ce_state = crypto_exclusion::CeState::default();
+            let mut held = marked(info.clone());
+            if !competing {
+                if let Some(marker) = held.fork_quarantine.as_mut() {
+                    marker.snapshot.conflicting_commit = commit("x", "y");
+                }
+            }
+            let held = vec![("g".to_string(), held)];
+            settle_forked_saves(&held, &[1; 32], &mut store, &mut removals, &mut ce_state);
+            assert!(ce_state.delivering().is_empty());
+            let cleared = vec![("g".to_string(), info.clone())];
+            settle_forked_saves(&cleared, &[1; 32], &mut store, &mut removals, &mut ce_state);
+            let kept = store.get(&key).expect("row").outgoing_event.is_some();
+            assert_eq!(kept, !competing, "competing: {competing}");
+            assert_eq!(ce_state.delivering().contains(&key), !competing);
+        }
     }
 
     /// #2163 review blocker: the competing child is on this node's chain
@@ -1312,6 +1522,7 @@ mod tests {
         let groups = vec![("g".to_string(), info)];
         assert!(settle_forked_saves(
             &groups,
+            &[1; 32],
             &mut store,
             &mut removals,
             &mut ce_state
@@ -1320,6 +1531,7 @@ mod tests {
         assert!(store.get(&key).expect("row").outgoing_event.is_none());
         assert!(!settle_forked_saves(
             &groups,
+            &[1; 32],
             &mut store,
             &mut removals,
             &mut ce_state

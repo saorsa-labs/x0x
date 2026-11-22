@@ -4,16 +4,38 @@
 //! parent. Their TreeKEM commits differ, so their epoch keys differ. Before
 //! this change both sealed `treekem:epoch=<n>`, both roster commits had one
 //! state hash, and A took D's commit for a duplicate of its own: a silent
-//! fork (W3-H 1581e). With every member's advert carrying
-//! `removal_commit_binding_v1`, the signed binding names the TreeKEM commit
-//! (`treekem:epoch=<n>:commit=<blake3>`), so D's commit is fork evidence on
-//! A and a replay of one commit is still a duplicate.
+//! fork (W3-H 1581e). Once every member, the target included, is ready for
+//! `removal_commit_binding_v1` (a current verified advert with the bit, or
+//! with no current advert a sticky record that one showed it), the signed
+//! binding names the TreeKEM commit (`treekem:epoch=<n>:commit=<blake3>`),
+//! so D's commit is fork evidence on A and a replay of one commit is still a
+//! duplicate.
 
 use super::*;
 use x0x::identity::AgentKeypair;
 use x0x::mls::TreeKemMlsGroup;
 
 const GROUP: &str = "e2135e2135e2135e2135e2135e2135e2";
+
+/// What A's capability store knows about one member.
+#[derive(Clone, Copy)]
+enum Advert {
+    /// No verified advert was ever seen.
+    Never,
+    /// A current verified advert with these registry bits.
+    Current(u64),
+    /// No current advert (expired, offline, withheld), but a verified
+    /// advert once showed the bit: only the sticky record remains.
+    StickyOnly,
+}
+
+fn all_bits() -> u64 {
+    x0x::dm::CapabilityRegistry::current().bits
+}
+
+fn without_binding_bit() -> u64 {
+    all_bits() & !x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1
+}
 
 fn seed_advert(state: &AppState, agent: &AgentId, bits: u64) {
     let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
@@ -26,12 +48,22 @@ fn seed_advert(state: &AppState, agent: &AgentId, bits: u64) {
     ));
 }
 
-fn all_bits() -> u64 {
-    x0x::dm::CapabilityRegistry::current().bits
+fn seed_sticky(state: &AppState, agent: &AgentId) {
+    state.agent.capability_store().seed_sticky([(
+        *agent,
+        x0x::dm_capability::StickySeen {
+            bits: x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1,
+            last_seen_unix_ms: 1,
+        },
+    )]);
 }
 
-fn without_binding_bit() -> u64 {
-    all_bits() & !x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1
+fn apply_advert(state: &AppState, agent: &AgentId, advert: Advert) {
+    match advert {
+        Advert::Never => {}
+        Advert::Current(bits) => seed_advert(state, agent, bits),
+        Advert::StickyOnly => seed_sticky(state, agent),
+    }
 }
 
 async fn body_of(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
@@ -74,18 +106,20 @@ async fn ban_via_route(state: &Arc<AppState>, target_hex: &str) -> (StatusCode, 
     body_of(response).await
 }
 
-/// Admin A (this daemon), a second admin D, a member L (its own daemon)
-/// and the target T, all seated in one TreeKEM tree at `epoch`. A, D and L
-/// each hold that tree; `parent` is the committed roster they share.
+/// Admin A (this daemon), a second admin D, a member L and the target T
+/// (each of L and T its own daemon), all seated in one TreeKEM tree at
+/// `epoch`. A, D, L and T each hold that tree; `parent` is the committed
+/// roster they share.
 struct Fixture {
     a: Arc<AppState>,
     _a_dir: tempfile::TempDir,
     l: Arc<AppState>,
     _l_dir: tempfile::TempDir,
+    t: Arc<AppState>,
+    _t_dir: tempfile::TempDir,
     d_kp: AgentKeypair,
     d_tree: TreeKemMlsGroup,
     parent: x0x::groups::GroupInfo,
-    target: AgentId,
     target_kp: Vec<u8>,
     epoch: u64,
 }
@@ -99,12 +133,22 @@ impl Fixture {
         Self::hex(&self.d_kp.agent_id())
     }
 
+    fn target(&self) -> AgentId {
+        self.t.agent.agent_id()
+    }
+
     fn target_hex(&self) -> String {
-        Self::hex(&self.target)
+        Self::hex(&self.target())
     }
 
     async fn head(&self, state: &AppState) -> x0x::groups::GroupInfo {
         state.named_groups.read().await[GROUP].clone()
+    }
+
+    async fn epoch_of(&self, state: &AppState) -> u64 {
+        let tree = state.treekem_groups.read().await[GROUP].clone();
+        let epoch = tree.lock().await.epoch();
+        epoch
     }
 
     /// D's removal or ban of T from `parent`, with its own TreeKEM commit
@@ -114,9 +158,10 @@ impl Fixture {
         ban: bool,
         binding: impl Fn(&x0x::groups::GroupInfo, &[u8]) -> String,
     ) -> Result<NamedGroupMetadataEvent> {
+        let target = self.target();
         let commit_bytes = self
             .d_tree
-            .remove_member_verified(self.target, &self.target_kp)?;
+            .remove_member_verified(target, &self.target_kp)?;
         let d_hex = self.d_hex();
         let target_hex = self.target_hex();
         let mut next = self.parent.clone();
@@ -156,41 +201,69 @@ impl Fixture {
             }
         })
     }
+
+    /// D's removal or ban, its binding chosen by the production rule from
+    /// A's capability store.
+    fn d_event_by_rule(&mut self, ban: bool) -> Result<NamedGroupMetadataEvent> {
+        let a_state = Arc::clone(&self.a);
+        let d_hex = self.d_hex();
+        let target_hex = self.target_hex();
+        let epoch = self.epoch + 1;
+        self.d_event(ban, |next, bytes| {
+            treekem_removal_security_binding(&a_state, next, &d_hex, &target_hex, epoch, bytes)
+        })
+    }
 }
 
-/// `l_bits` is the registry of L's advert as A holds it. A also holds D's
-/// and its own advert with every bit.
-async fn fixture(l_bits: u64) -> Result<Fixture> {
+fn signed_commit(event: &NamedGroupMetadataEvent) -> x0x::groups::GroupStateCommit {
+    match event {
+        NamedGroupMetadataEvent::MemberRemoved {
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberBanned {
+            commit: Some(commit),
+            ..
+        } => commit.clone(),
+        _ => unreachable!("a removal or ban"),
+    }
+}
+
+/// `l` and `target` are what A's store knows about L and T. A also holds
+/// its own and D's advert with every bit.
+async fn fixture(l: Advert, target: Advert) -> Result<Fixture> {
     let (a, a_dir) = secure_endpoint_test_state().await?;
-    let (l, l_dir) = secure_endpoint_test_state().await?;
+    let (l_state, l_dir) = secure_endpoint_test_state().await?;
+    let (t, t_dir) = secure_endpoint_test_state().await?;
     let a_id = a.agent.agent_id();
-    let l_id = l.agent.agent_id();
+    let l_id = l_state.agent.agent_id();
+    let t_id = t.agent.agent_id();
     let d_kp = AgentKeypair::generate()?;
     let d_id = d_kp.agent_id();
-    let target = AgentKeypair::generate()?.agent_id();
     let group_id_bytes = hex::decode(GROUP)?;
 
-    let a_seed = super::super::agent_treekem_seed(a.agent.as_ref(), &group_id_bytes);
-    let l_seed = super::super::agent_treekem_seed(l.agent.as_ref(), &group_id_bytes);
-    let mut a_tree = TreeKemMlsGroup::create(group_id_bytes, a_id, &a_seed)?;
+    let seed_of =
+        |state: &AppState| super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    let mut a_tree = TreeKemMlsGroup::create(group_id_bytes.clone(), a_id, &seed_of(&a))?;
     let d_prepared = TreeKemMlsGroup::prepare_member(d_id, &[5u8; 32])?;
     let d_kp_bytes = d_prepared.key_package_bytes().to_vec();
-    let l_prepared = TreeKemMlsGroup::prepare_member(l_id, &l_seed)?;
+    let l_prepared = TreeKemMlsGroup::prepare_member(l_id, &seed_of(&l_state))?;
     let l_kp_bytes = l_prepared.key_package_bytes().to_vec();
-    let target_kp = TreeKemMlsGroup::prepare_member(target, &[8u8; 32])?
-        .key_package_bytes()
-        .to_vec();
+    let t_prepared = TreeKemMlsGroup::prepare_member(t_id, &seed_of(&t))?;
+    let target_kp = t_prepared.key_package_bytes().to_vec();
     let added_d = a_tree.add_member(d_id, &d_kp_bytes)?;
     let mut d_tree = TreeKemMlsGroup::join_from_welcome(d_prepared, &added_d.welcome)?;
     let added_l = a_tree.add_member(l_id, &l_kp_bytes)?;
     d_tree.process_commit(&added_l.commit)?;
     let mut l_tree = TreeKemMlsGroup::join_from_welcome(l_prepared, &added_l.welcome)?;
-    let added_t = a_tree.add_member(target, &target_kp)?;
+    let added_t = a_tree.add_member(t_id, &target_kp)?;
     d_tree.process_commit(&added_t.commit)?;
     l_tree.process_commit(&added_t.commit)?;
+    let t_tree = TreeKemMlsGroup::join_from_welcome(t_prepared, &added_t.welcome)?;
     let epoch = a_tree.epoch();
     assert_eq!(d_tree.epoch(), epoch);
     assert_eq!(l_tree.epoch(), epoch);
+    assert_eq!(t_tree.epoch(), epoch);
 
     let a_hex = Fixture::hex(&a_id);
     let mut parent =
@@ -199,7 +272,7 @@ async fn fixture(l_bits: u64) -> Result<Fixture> {
     for (id, role, kp) in [
         (d_id, x0x::groups::GroupRole::Admin, &d_kp_bytes),
         (l_id, x0x::groups::GroupRole::Member, &l_kp_bytes),
-        (target, x0x::groups::GroupRole::Member, &target_kp),
+        (t_id, x0x::groups::GroupRole::Member, &target_kp),
     ] {
         let id_hex = Fixture::hex(&id);
         parent.add_member(id_hex.clone(), role, Some(a_hex.clone()), None);
@@ -210,7 +283,7 @@ async fn fixture(l_bits: u64) -> Result<Fixture> {
     parent.roster_revision = parent.roster_revision.saturating_add(1);
     parent.seal_commit(a.agent.identity().agent_keypair(), now_millis_u64())?;
 
-    for (state, tree) in [(&a, a_tree), (&l, l_tree)] {
+    for (state, tree) in [(&a, a_tree), (&l_state, l_tree), (&t, t_tree)] {
         state
             .named_groups
             .write()
@@ -224,56 +297,56 @@ async fn fixture(l_bits: u64) -> Result<Fixture> {
     }
     seed_advert(&a, &a_id, all_bits());
     seed_advert(&a, &d_id, all_bits());
-    seed_advert(&a, &l_id, l_bits);
+    apply_advert(&a, &l_id, l);
+    apply_advert(&a, &t_id, target);
     Ok(Fixture {
         a,
         _a_dir: a_dir,
-        l,
+        l: l_state,
         _l_dir: l_dir,
+        t,
+        _t_dir: t_dir,
         d_kp,
         d_tree,
         parent,
-        target,
         target_kp,
         epoch,
     })
+}
+
+fn ready() -> Advert {
+    Advert::Current(all_bits())
 }
 
 fn commit_bound(binding: Option<&str>, epoch: u64) -> bool {
     binding.is_some_and(|binding| binding.starts_with(&format!("treekem:epoch={epoch}:commit=")))
 }
 
-/// The 1581e shape, red on main. A removes T through the route; D removes
-/// T from the same parent with its own TreeKEM commit, its binding given by
-/// the same production rule. The two state hashes differ, D's commit is
-/// fork evidence on A (a persisted marker naming D), L applies D's commit,
-/// and a replay of D's commit on L is a duplicate, not evidence.
-#[tokio::test]
-async fn a_second_admins_removal_of_the_same_member_is_fork_evidence() -> Result<()> {
-    let mut f = fixture(all_bits()).await?;
+/// Drives the 1581e shape on `f`: A removes T through the route; D removes
+/// T from the same parent with its own TreeKEM commit, its binding by the
+/// same rule. Returns A's head and D's event.
+async fn race(f: &mut Fixture) -> Result<(x0x::groups::GroupInfo, NamedGroupMetadataEvent)> {
     let (status, body) = remove_via_route(&f.a, &f.target_hex()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let a_head = f.head(&f.a).await;
+    let d_event = f.d_event_by_rule(false)?;
+    Ok((a_head, d_event))
+}
+
+/// The 1581e shape, red on main. The two state hashes differ, D's commit
+/// is fork evidence on A (a marker naming D, in the stored roster file),
+/// L applies D's commit, a replay of D's commit on L is a duplicate, and
+/// the manual clear removes the marker in memory and on disk.
+#[tokio::test]
+async fn a_second_admins_removal_of_the_same_member_is_fork_evidence() -> Result<()> {
+    let mut f = fixture(ready(), ready()).await?;
+    let (a_head, d_event) = race(&mut f).await?;
     assert!(
         commit_bound(a_head.security_binding.as_deref(), f.epoch + 1),
         "A's removal names its TreeKEM commit: {:?}",
         a_head.security_binding
     );
-
-    let a_state = Arc::clone(&f.a);
-    let d_hex = f.d_hex();
-    let target_hex = f.target_hex();
-    let epoch = f.epoch + 1;
-    let d_event = f.d_event(false, |next, bytes| {
-        treekem_removal_security_binding(&a_state, next, &d_hex, &target_hex, epoch, bytes)
-    })?;
-    let d_hash = match &d_event {
-        NamedGroupMetadataEvent::MemberRemoved {
-            commit: Some(commit),
-            ..
-        } => commit.state_hash.clone(),
-        _ => unreachable!("a removal"),
-    };
+    let d_hash = signed_commit(&d_event).state_hash;
     assert_ne!(
         d_hash, a_head.state_hash,
         "two admins' removals of one member are distinct states"
@@ -282,9 +355,7 @@ async fn a_second_admins_removal_of_the_same_member_is_fork_evidence() -> Result
     let d_id = f.d_kp.agent_id();
     let on_l = apply_named_group_metadata_event(&f.l, d_event.clone(), d_id, true, None).await;
     assert!(on_l.accepted, "L applies D's removal: {on_l:?}");
-    let l_head = f.head(&f.l).await;
-    assert_eq!(l_head.state_hash, d_hash);
-    assert_eq!(l_head.secret_epoch, f.epoch + 1);
+    assert_eq!(f.head(&f.l).await.state_hash, d_hash);
     let replay = apply_named_group_metadata_event(&f.l, d_event.clone(), d_id, true, None).await;
     assert!(!replay.accepted, "a replay applies nothing new");
     let l_after = f.head(&f.l).await;
@@ -308,45 +379,165 @@ async fn a_second_admins_removal_of_the_same_member_is_fork_evidence() -> Result
         marker.snapshot.terminal_commit.state_hash,
         a_head.state_hash
     );
-    // The marker is part of the stored group record, so it survives a
-    // restart.
-    let stored: x0x::groups::GroupInfo = serde_json::from_str(&serde_json::to_string(&a_after)?)?;
-    assert_eq!(stored.fork_quarantine, Some(marker));
+    // The evidence is in the stored roster file, so it survives a restart.
+    let stored = load_named_groups(&f.a.named_groups_path).await?;
+    assert_eq!(stored[GROUP].fork_quarantine.as_ref(), Some(&marker));
+
+    // The manual exit (ADR 0066) clears it in memory and on disk.
+    let response = clear_group_quarantine(
+        State(Arc::clone(&f.a)),
+        owner(),
+        Path(GROUP.to_string()),
+        Json(ClearQuarantineRequest {
+            force: true,
+            reason: "#2135 fork resolved by hand".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = body_of(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(f.head(&f.a).await.fork_quarantine.is_none());
+    let stored = load_named_groups(&f.a.named_groups_path).await?;
+    assert!(stored[GROUP].fork_quarantine.is_none());
     Ok(())
 }
 
-/// The mixed-version rule: while one member's advert lacks
-/// `removal_commit_binding_v1`, the route seals the legacy binding, which
-/// every released receiver applies. The state hash form is unchanged.
+/// Blocker of the #2173 review: two admins partitioned for longer than the
+/// 900 s advert TTL hold no current advert of the others. Each member once
+/// showed the bit, so the sticky record keeps the commit-bound form and the
+/// fork is found. Red on the previous head: it needed a current advert, so
+/// both admins sealed the legacy form, the hashes matched and A took D's
+/// commit for a duplicate.
 #[tokio::test]
-async fn a_member_without_the_bit_keeps_the_legacy_binding() -> Result<()> {
-    let f = fixture(without_binding_bit()).await?;
+async fn admins_partitioned_past_the_advert_ttl_still_find_the_fork() -> Result<()> {
+    let mut f = fixture(Advert::StickyOnly, Advert::StickyOnly).await?;
+    let (a_head, d_event) = race(&mut f).await?;
+    assert!(
+        commit_bound(a_head.security_binding.as_deref(), f.epoch + 1),
+        "{:?}",
+        a_head.security_binding
+    );
+    let d_id = f.d_kp.agent_id();
+    let on_a = apply_named_group_metadata_event(&f.a, d_event, d_id, true, None).await;
+    assert!(!on_a.accepted);
+    assert!(
+        f.head(&f.a).await.fork_quarantine.is_some(),
+        "D's competing removal is fork evidence on A"
+    );
+    Ok(())
+}
+
+/// A verified advert with the bit that then expires leaves the member
+/// ready through the sticky record.
+#[tokio::test]
+async fn an_expired_advert_keeps_the_commit_bound_form() -> Result<()> {
+    let f = fixture(Advert::Never, ready()).await?;
+    let l_id = f.l.agent.agent_id();
+    let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+    caps.application_registry = x0x::dm::CapabilityRegistry {
+        version: 1,
+        bits: all_bits(),
+    };
+    let ttl_ms = x0x::dm_capability::ADVERT_CACHE_TTL_SECS * 1000;
+    let store = f.a.agent.capability_store();
+    assert!(store.insert(
+        l_id,
+        x0x::identity::MachineId([4; 32]),
+        caps,
+        x0x::dm::now_unix_ms() - ttl_ms + 300,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let bit = x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
+    assert_eq!(
+        store.verified_registry_supports(&l_id, bit),
+        None,
+        "expired"
+    );
     let (status, body) = remove_via_route(&f.a, &f.target_hex()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let head = f.head(&f.a).await;
+    assert!(
+        commit_bound(head.security_binding.as_deref(), f.epoch + 1),
+        "{:?}",
+        head.security_binding
+    );
+    Ok(())
+}
+
+/// A member never seen with the bit, and a member whose current advert
+/// dropped it (a downgrade), keep the legacy binding, which every released
+/// receiver applies. The state hash form is unchanged.
+#[tokio::test]
+async fn a_member_never_seen_with_the_bit_keeps_the_legacy_binding() -> Result<()> {
+    for downgraded in [false, true] {
+        let f = fixture(Advert::Never, ready()).await?;
+        if downgraded {
+            // It once showed the bit; the later advert without it wins.
+            seed_sticky(&f.a, &f.l.agent.agent_id());
+            seed_advert(&f.a, &f.l.agent.agent_id(), without_binding_bit());
+        }
+        let (status, body) = remove_via_route(&f.a, &f.target_hex()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let head = f.head(&f.a).await;
+        let legacy = format!("treekem:epoch={}", f.epoch + 1);
+        assert_eq!(head.security_binding.as_deref(), Some(legacy.as_str()));
+        let mut expected = head.clone();
+        expected.recompute_state_hash();
+        assert_eq!(expected.state_hash, head.state_hash);
+    }
+    Ok(())
+}
+
+/// Blocker of the #2173 review: the target receives its own removal or ban
+/// and must apply it, so it counts in the gate. A target never seen with
+/// the bit gets the legacy form, and it applies its own legacy ban and tears
+/// its group down. Red on the previous head: the target was left out of the
+/// gate, so a released target got a commit-bound ban it refuses.
+#[tokio::test]
+async fn a_target_never_seen_with_the_bit_gets_the_legacy_form_and_tears_down() -> Result<()> {
+    let f = fixture(ready(), Advert::Never).await?;
+    let (status, body) = ban_via_route(&f.a, &f.target_hex()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let legacy = format!("treekem:epoch={}", f.epoch + 1);
-    assert_eq!(head.security_binding.as_deref(), Some(legacy.as_str()));
-    let mut expected = head.clone();
-    expected.recompute_state_hash();
-    assert_eq!(expected.state_hash, head.state_hash);
+    assert_eq!(
+        f.head(&f.a).await.security_binding.as_deref(),
+        Some(legacy.as_str())
+    );
+
+    let mut g = fixture(ready(), Advert::Never).await?;
+    let ban = g.d_event_by_rule(true)?;
+    assert_eq!(
+        signed_commit(&ban).security_binding.as_deref(),
+        Some(format!("treekem:epoch={}", g.epoch + 1).as_str())
+    );
+    let applied = apply_named_group_metadata_event(&g.t, ban, g.d_kp.agent_id(), true, None).await;
+    assert!(
+        applied.accepted,
+        "the target applies its own ban: {applied:?}"
+    );
+    assert!(
+        !g.t.treekem_groups.read().await.contains_key(GROUP),
+        "the banned target drops its tree"
+    );
     Ok(())
 }
 
 /// The ban route follows the same rule as the removal route.
 #[tokio::test]
 async fn the_ban_route_binds_the_treekem_commit_once_every_member_is_ready() -> Result<()> {
-    let ready = fixture(all_bits()).await?;
-    let (status, body) = ban_via_route(&ready.a, &ready.target_hex()).await;
+    let ready_fixture = fixture(ready(), ready()).await?;
+    let (status, body) = ban_via_route(&ready_fixture.a, &ready_fixture.target_hex()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let head = ready.head(&ready.a).await;
-    assert!(head.is_banned(&ready.target_hex()));
+    let head = ready_fixture.head(&ready_fixture.a).await;
+    assert!(head.is_banned(&ready_fixture.target_hex()));
     assert!(
-        commit_bound(head.security_binding.as_deref(), ready.epoch + 1),
+        commit_bound(head.security_binding.as_deref(), ready_fixture.epoch + 1),
         "{:?}",
         head.security_binding
     );
 
-    let mixed = fixture(without_binding_bit()).await?;
+    let mixed = fixture(Advert::Current(without_binding_bit()), ready()).await?;
     let (status, body) = ban_via_route(&mixed.a, &mixed.target_hex()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let head = mixed.head(&mixed.a).await;
@@ -361,24 +552,18 @@ async fn the_ban_route_binds_the_treekem_commit_once_every_member_is_ready() -> 
 /// so the commit-bound ban failed its state-hash check.
 #[tokio::test]
 async fn a_member_applies_a_commit_bound_ban_and_refuses_other_bytes() -> Result<()> {
-    let mut f = fixture(all_bits()).await?;
+    let mut f = fixture(ready(), ready()).await?;
     let epoch = f.epoch + 1;
     let forged = f.d_event(true, |_, _| treekem_commit_binding(epoch, b"other bytes"))?;
-    // `d_event` advanced D's tree; rebuild it for the genuine event.
-    let mut g = fixture(all_bits()).await?;
-    let d_id = f.d_kp.agent_id();
-    let refused = apply_named_group_metadata_event(&f.l, forged, d_id, true, None).await;
+    let refused =
+        apply_named_group_metadata_event(&f.l, forged, f.d_kp.agent_id(), true, None).await;
     assert!(!refused.accepted, "a binding over other bytes: {refused:?}");
     assert_eq!(f.head(&f.l).await.state_hash, f.parent.state_hash);
 
+    // `d_event` advanced D's tree; a fresh fixture gives the genuine ban.
+    let mut g = fixture(ready(), ready()).await?;
     let genuine = g.d_event(true, |_, bytes| treekem_commit_binding(epoch, bytes))?;
-    let signed = match &genuine {
-        NamedGroupMetadataEvent::MemberBanned {
-            commit: Some(commit),
-            ..
-        } => commit.clone(),
-        _ => unreachable!("a ban"),
-    };
+    let signed = signed_commit(&genuine);
     let applied =
         apply_named_group_metadata_event(&g.l, genuine, g.d_kp.agent_id(), true, None).await;
     assert!(
@@ -392,11 +577,64 @@ async fn a_member_applies_a_commit_bound_ban_and_refuses_other_bytes() -> Result
     Ok(())
 }
 
-/// The readiness rule: every other Active or Pending member must hold a
-/// verified advert with the bit; the actor, the target and removed seats do
-/// not count, and an unknown advert is not support.
+/// The removal and ban routes make the TreeKEM commit before the seal. A
+/// seal that fails rolls the tree back, so the roster and the tree stay at
+/// the parent and the next attempt succeeds.
+#[tokio::test]
+async fn a_failed_seal_rolls_the_tree_back() -> Result<()> {
+    for ban in [false, true] {
+        let f = fixture(ready(), ready()).await?;
+        arm_removal_seal_fault_for_test(GROUP);
+        let (status, body) = if ban {
+            ban_via_route(&f.a, &f.target_hex()).await
+        } else {
+            remove_via_route(&f.a, &f.target_hex()).await
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(f.epoch_of(&f.a).await, f.epoch, "the tree is rolled back");
+        let head = f.head(&f.a).await;
+        assert_eq!(
+            head.state_hash, f.parent.state_hash,
+            "the roster is unchanged"
+        );
+        let (status, body) = if ban {
+            ban_via_route(&f.a, &f.target_hex()).await
+        } else {
+            remove_via_route(&f.a, &f.target_hex()).await
+        };
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(f.epoch_of(&f.a).await, f.epoch + 1);
+    }
+    Ok(())
+}
+
+/// The sticky record survives a restart through its file.
+#[tokio::test]
+async fn the_sticky_record_survives_a_restart() -> Result<()> {
+    let (before, dir) = secure_endpoint_test_state().await?;
+    let peer = AgentKeypair::generate()?.agent_id();
+    seed_advert(&before, &peer, all_bits());
+    let (_, entries) = before.agent.capability_store().sticky_snapshot();
+    crate::server::sticky_capabilities::write(dir.path(), &entries).await?;
+    let (after, _after_dir) = secure_endpoint_test_state().await?;
+    let bit = x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
+    assert!(!after.agent.capability_store().registry_bit_seen(&peer, bit));
+    let bytes = tokio::fs::read(crate::server::sticky_capabilities::path_in(dir.path())).await?;
+    let restored: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(
+        restored["entries"][0]["agent_id"],
+        hex::encode(peer.as_bytes())
+    );
+    crate::server::sticky_capabilities::load_into(dir.path(), &after.agent.capability_store())
+        .await;
+    assert!(after.agent.capability_store().registry_bit_seen(&peer, bit));
+    Ok(())
+}
+
+/// The readiness rule: every Active or Pending member other than the actor,
+/// and the target, must be ready; removed seats do not count.
 #[test]
-fn readiness_needs_every_other_live_members_advert() {
+fn readiness_needs_every_other_live_member_and_the_target() {
     let ids: Vec<AgentId> = (1u8..=5).map(|n| AgentId([n; 32])).collect();
     let hex_of = |id: &AgentId| hex::encode(id.as_bytes());
     let mut info =
@@ -404,34 +642,28 @@ fn readiness_needs_every_other_live_members_advert() {
     for id in &ids[1..] {
         info.add_member(hex_of(id), x0x::groups::GroupRole::Member, None, None);
     }
+    info.remove_member(&hex_of(&ids[1]), None);
     info.remove_member(&hex_of(&ids[4]), None);
-    let (actor, target) = (hex_of(&ids[0]), hex_of(&ids[1]));
-    let supported = |set: Vec<AgentId>| {
-        move |agent: &AgentId| {
-            if set.contains(agent) {
-                Some(true)
-            } else {
-                None
-            }
-        }
-    };
+    let actor = hex_of(&ids[0]);
+    let target = Some(&ids[1]);
+    let ready_set = |set: Vec<AgentId>| move |agent: &AgentId| set.contains(agent);
     assert!(removal_commit_binding_peers_ready(
         &info,
         &actor,
-        &target,
-        supported(vec![ids[2], ids[3]])
+        target,
+        ready_set(vec![ids[1], ids[2], ids[3]])
     ));
     assert!(!removal_commit_binding_peers_ready(
         &info,
         &actor,
-        &target,
-        supported(vec![ids[2]])
+        target,
+        ready_set(vec![ids[2], ids[3]])
     ));
     assert!(!removal_commit_binding_peers_ready(
         &info,
         &actor,
-        &target,
-        |agent: &AgentId| (*agent == ids[2]).then_some(true).or(Some(false))
+        target,
+        ready_set(vec![ids[1], ids[2]])
     ));
 }
 

@@ -7,29 +7,38 @@ All notable changes to this project will be documented in this file.
 ### Upgrade notes
 
 - **Commit-bound removal binding (#2135).** New capability bit 22,
-  `removal_commit_binding_v1`. An admin's TreeKEM removal or ban now names
-  its TreeKEM commit in the signed binding (`treekem:epoch=<n>:commit=<blake3>`),
-  but only while every other Active or Pending member advertises bit 22.
-  Until every member of a group runs this release, the group keeps the
-  legacy binding and today's limit (two admins' removals of one member still
-  look the same). A downgrade to 0.49.0 or older while its advert is still
-  current refuses a commit-bound ban (fail closed).
+  `removal_commit_binding_v1`. An admin's TreeKEM removal or ban names its
+  TreeKEM commit in the signed binding (`treekem:epoch=<n>:commit=<blake3>`)
+  only while the target and every other Active or Pending member is ready: a
+  current verified advert with bit 22, or, with no current advert, a record
+  that a verified advert once showed it. This record is kept per agent in the
+  new `<data_dir>/sticky-capabilities.json`, so an advert that expired while a
+  member was offline or partitioned does not bring back the legacy binding.
+  A group with a member never seen with bit 22 keeps the legacy binding and
+  today's limit (two admins' removals of one member still look the same). A
+  member that advertised bit 22 and then downgraded to 0.49.0 or older without
+  a new advert refuses a commit-bound ban (0.47 and older: also a removal) and
+  falls behind; it shows only a debug trace.
 
 ### Fixed
 
-- **Two admins removing the same member no longer fork silently (#2135,
-  David's ruling of 22 Nov 2026).** Their removals now have different state
-  hashes, so the second one is fork evidence: the node keeps its head and sets
-  the `fork_quarantine` marker. A replay of one commit is still a duplicate.
-  Receivers verify a commit-bound `MemberBanned` against its TreeKEM bytes and
-  keep its signed binding.
+- **Two admins removing the same TreeKEM member no longer fork silently
+  (#2135, David's ruling of 22 Nov 2026).** Their removals now have different
+  state hashes, so the second one is fork evidence: the node keeps its head and
+  sets the `fork_quarantine` marker. A replay of one commit is still a
+  duplicate. Receivers verify a commit-bound `MemberBanned` against its
+  TreeKEM bytes and keep its signed binding. GSS removals are not changed yet.
 - **S4 rows across a fork (#2135, ADR 0110 §3).** While a group holds the fork
   marker, a saved S4 removal or crypto-only exclusion is not sent, its row
   waits as `waiting_for_fork_resolution`, and no row of the group completes.
   The `.evs` is written when the state changes, not on each worker pass. After
-  the manual `POST /groups/:id/quarantine/clear`, the saved event is dropped
-  unpublished and the row completes from the local chain, also after a
-  restart. No new route.
+  the manual `POST /groups/:id/quarantine/clear`, a saved event that met a
+  competing exclusion is dropped unpublished and the row completes from the
+  local chain, also after a restart; one held only by an unrelated conflict
+  resumes its delivery. No new route.
+- **Removal routes roll back a failed seal (#2135).** A TreeKEM removal or ban
+  whose seal fails restores the tree; if that fails it answers 500
+  `treekem_rollback_failed` and unloads the tree until a restart.
 
 ## [v0.49.1] - 2026-11-22
 

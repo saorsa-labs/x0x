@@ -1408,6 +1408,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         let inner = &mut *inner;
         if removal_delivery::settle_forked_saves(
             &groups,
+            &local,
             &mut inner.store,
             &mut inner.removals,
             &mut inner.ce,
@@ -1665,7 +1666,17 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         // upgraded member. §3: a saved frame that met a competing branch
         // waits for fork resolution and is never published.
         if inner.ce.fork.contains(&key) {
-            evaluation.waiting = Some(WaitingState::cause(WaitingCause::WaitingForForkResolution));
+            // #2135: keep the competing signer that `settle_forked_saves`
+            // stored, so the row is not rewritten on every pass.
+            let mut waiting = WaitingState::cause(WaitingCause::WaitingForForkResolution);
+            if let Some(stored) = row
+                .waiting
+                .as_ref()
+                .filter(|stored| stored.cause == WaitingCause::WaitingForForkResolution)
+            {
+                waiting.named = stored.named.clone();
+            }
+            evaluation.waiting = Some(waiting);
             evaluation.action = RowAction::None;
         } else if !target_seated
             && row.phase == Phase::Pending
@@ -5290,6 +5301,7 @@ async fn load_persisted_obligations(state: &AppState) {
     // restart is dropped before any resume can deliver it.
     let fork_settled = removal_delivery::settle_forked_saves(
         &loaded_groups,
+        state.agent.agent_id().as_bytes(),
         &mut store,
         &mut removals,
         &mut ce_state,

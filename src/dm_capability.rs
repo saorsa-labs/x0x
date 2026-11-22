@@ -345,6 +345,90 @@ pub struct CapabilityStore {
     /// #1109 S2: a fresh verified advert that supports durable delivery
     /// arrived. The direct-send outbox makes that recipient's held sends due.
     durable_adverts: tokio::sync::broadcast::Sender<AgentId>,
+    /// #2135: the [`STICKY_REGISTRY_BITS`] each agent's verified adverts
+    /// have shown, kept past the advert TTL.
+    sticky: Mutex<StickyRegistry>,
+}
+
+/// #2135: the application-registry bits the store keeps for an agent after
+/// its verified advert expires. A gate that must not fall back while a peer
+/// is only offline or withholding its advert reads them through
+/// [`CapabilityStore::registry_bit_seen`].
+pub const STICKY_REGISTRY_BITS: u64 = crate::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
+
+/// #2135: the most agents [`CapabilityStore`] keeps sticky bits for; the
+/// agent seen longest ago is dropped first.
+pub const STICKY_REGISTRY_CAP: usize = 16_384;
+
+/// #2135: one agent's sticky registry bits and when a verified advert last
+/// showed them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickySeen {
+    /// The [`STICKY_REGISTRY_BITS`] the agent's verified advert showed.
+    pub bits: u64,
+    /// Local time of that advert (Unix ms).
+    pub last_seen_unix_ms: u64,
+}
+
+#[derive(Default)]
+struct StickyRegistry {
+    seen: HashMap<[u8; 32], StickySeen>,
+    /// Bumped when an agent or its bits are added or dropped, not when only
+    /// `last_seen_unix_ms` moves, so a writer persists on change only.
+    generation: u64,
+}
+
+impl StickyRegistry {
+    fn note(&mut self, agent: [u8; 32], registry: crate::dm::CapabilityRegistry, now_ms: u64) {
+        let shown = if registry.version == 1 {
+            registry.bits & STICKY_REGISTRY_BITS
+        } else {
+            0
+        };
+        if shown == 0 {
+            // A current verified advert without the bits: the agent runs a
+            // binary that does not have them (a downgrade).
+            if self.seen.remove(&agent).is_some() {
+                self.generation += 1;
+            }
+            return;
+        }
+        match self.seen.get_mut(&agent) {
+            Some(entry) if entry.bits == shown => {
+                entry.last_seen_unix_ms = now_ms;
+                return;
+            }
+            Some(entry) => {
+                entry.bits = shown;
+                entry.last_seen_unix_ms = now_ms;
+            }
+            None => {
+                self.seen.insert(
+                    agent,
+                    StickySeen {
+                        bits: shown,
+                        last_seen_unix_ms: now_ms,
+                    },
+                );
+                self.evict_over_cap();
+            }
+        }
+        self.generation += 1;
+    }
+
+    fn evict_over_cap(&mut self) {
+        while self.seen.len() > STICKY_REGISTRY_CAP {
+            let Some(oldest) = self
+                .seen
+                .iter()
+                .min_by_key(|(id, entry)| (entry.last_seen_unix_ms, **id))
+                .map(|(id, _)| *id)
+            else {
+                return;
+            };
+            self.seen.remove(&oldest);
+        }
+    }
 }
 
 /// One recipient's obligation wait (#1158). Memory only.
@@ -432,6 +516,7 @@ impl CapabilityStore {
             durable_adverts: tokio::sync::broadcast::channel(OBLIGATION_ADVERT_SIGNAL_CAPACITY).0,
             evidence_wire: Default::default(),
             evidence: Default::default(),
+            sticky: Mutex::new(StickyRegistry::default()),
         }
     }
 
@@ -447,6 +532,7 @@ impl CapabilityStore {
             durable_adverts: tokio::sync::broadcast::channel(OBLIGATION_ADVERT_SIGNAL_CAPACITY).0,
             evidence_wire: Default::default(),
             evidence: Default::default(),
+            sticky: Mutex::new(StickyRegistry::default()),
         }
     }
 
@@ -562,6 +648,55 @@ impl CapabilityStore {
             return None;
         }
         Some(entry.capabilities.application_registry.supports(bit))
+    }
+
+    /// #2135: whether a verified advert of this agent has shown `bit` (one
+    /// of [`STICKY_REGISTRY_BITS`]) and no later verified advert dropped it.
+    /// It stays true after the advert expires and after a restart that
+    /// seeded the record ([`Self::seed_sticky`]).
+    #[must_use]
+    pub fn registry_bit_seen(&self, agent_id: &AgentId, bit: u64) -> bool {
+        self.sticky.lock().is_ok_and(|sticky| {
+            sticky
+                .seen
+                .get(agent_id.as_bytes())
+                .is_some_and(|entry| entry.bits & bit == bit)
+        })
+    }
+
+    /// #2135: the sticky record and its generation, for a writer that
+    /// persists it when the generation changes.
+    #[must_use]
+    pub fn sticky_snapshot(&self) -> (u64, Vec<(AgentId, StickySeen)>) {
+        let Ok(sticky) = self.sticky.lock() else {
+            return (0, Vec::new());
+        };
+        let mut entries: Vec<(AgentId, StickySeen)> = sticky
+            .seen
+            .iter()
+            .map(|(id, entry)| (AgentId(*id), *entry))
+            .collect();
+        entries.sort_by_key(|(id, _)| id.0);
+        (sticky.generation, entries)
+    }
+
+    /// #2135: load a persisted sticky record at startup. An agent this
+    /// store already knows keeps its in-memory entry; only the bits in
+    /// [`STICKY_REGISTRY_BITS`] are kept.
+    pub fn seed_sticky(&self, entries: impl IntoIterator<Item = (AgentId, StickySeen)>) {
+        let Ok(mut sticky) = self.sticky.lock() else {
+            return;
+        };
+        for (agent, entry) in entries {
+            let bits = entry.bits & STICKY_REGISTRY_BITS;
+            if bits != 0 {
+                sticky.seen.entry(agent.0).or_insert(StickySeen {
+                    bits,
+                    last_seen_unix_ms: entry.last_seen_unix_ms,
+                });
+            }
+        }
+        sticky.evict_over_cap();
     }
 
     /// Whether the newest CURRENT VERIFIED advert signed by `machine`
@@ -742,6 +877,15 @@ impl CapabilityStore {
         }
         let mut capabilities = capabilities;
         let durable = capabilities.supports_durable_app_ack();
+        if machine_id.as_bytes() != &[0; 32] {
+            if let Ok(mut sticky) = self.sticky.lock() {
+                sticky.note(
+                    *agent_id.as_bytes(),
+                    capabilities.application_registry,
+                    now_unix_ms(),
+                );
+            }
+        }
         // #448: the base advert rides the frozen v1 wire shape, so a
         // true `digest_support` bit arrives here only from a pre-fix
         // peer's v2-shaped advert (kept verbatim — the signer signed
