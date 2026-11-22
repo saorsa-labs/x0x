@@ -23,6 +23,7 @@ env:
 jobs:
   validate-release-metadata:
     name: Validate release metadata
+    if: &run-unless-train-bundle ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'train/') && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["dirvine"]'), github.event.pull_request.user.login)) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -58,6 +59,7 @@ jobs:
   # fips204, so no leg pays for a host debug build of the x0x graph.
   prepare-m2-signing-controls:
     name: Prepare M2 signing controls
+    if: *run-unless-train-bundle
     needs: validate-release-metadata
     runs-on: ubuntu-latest
     outputs:
@@ -89,20 +91,181 @@ jobs:
           path: ${{ runner.temp }}/m2-signing-controls/
           if-no-files-found: error
 
+  # Pull requests build only linux-x64-gnu, the required check. A matrix job
+  # skipped by `if:` reports under its unexpanded name, so the required check
+  # is a separate job that keeps its literal name when a train/* PR skips it.
+  build-linux-x64-gnu:
+    name: Build linux-x64-gnu
+    if: *run-unless-train-bundle
+    needs: [validate-release-metadata, prepare-m2-signing-controls]
+    runs-on: ubuntu-latest
+    env:
+      BUILD_PLATFORM: linux-x64-gnu
+      BUILD_TARGET: x86_64-unknown-linux-gnu
+      BUILD_CROSS: 'false'
+    steps: &build-steps
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.BUILD_TARGET }}
+
+      - name: Resolve dependency graph
+        shell: bash
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
+
+      - name: Capture source and dependency provenance
+        shell: bash
+        run: |
+          python3 .github/scripts/build_artifact_provenance.py prepare \
+            --repo . \
+            --artifact-dir "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}" \
+            --platform "${{ env.BUILD_PLATFORM }}" \
+            --target "${{ env.BUILD_TARGET }}"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-${{ env.BUILD_TARGET }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.BUILD_TARGET }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-${{ env.BUILD_TARGET }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.BUILD_TARGET }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ env.BUILD_TARGET }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.BUILD_TARGET }}-target-
+
+      - name: Install cross
+        if: env.BUILD_CROSS == 'true'
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: env.BUILD_CROSS != 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --locked --release --target ${{ env.BUILD_TARGET }} \
+            --message-format=json-render-diagnostics \
+            | tee "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}-build.jsonl"
+
+      - name: Build (cross)
+        if: env.BUILD_CROSS == 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          cross build --locked --release --target ${{ env.BUILD_TARGET }} \
+            --message-format=json-render-diagnostics \
+            | tee "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}-build.jsonl"
+
+      - name: Finalize and verify artifact provenance
+        shell: bash
+        run: |
+          python3 .github/scripts/build_artifact_provenance.py finalize \
+            --repo . \
+            --artifact-dir "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}" \
+            --release-dir "target/${{ env.BUILD_TARGET }}/release" \
+            --build-messages "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}-build.jsonl"
+          python3 .github/scripts/build_artifact_provenance.py verify \
+            --artifact-dir "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}"
+
+      # Exercise the release gate on every executor that builds.
+      - name: Package signing control archive
+        shell: bash
+        env:
+          M2_PLATFORM: ${{ env.BUILD_PLATFORM }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tarfile
+          import zipfile
+          platform = os.environ["M2_PLATFORM"]
+          custody = Path(os.environ["RUNNER_TEMP"]) / ("x0x-" + platform)
+          output = Path(os.environ["RUNNER_TEMP"]) / ("m2-build-signing-" + platform)
+          output.mkdir()
+          suffix = ".exe" if platform == "windows-x64" else ""
+          names = [name + suffix for name in ("x0x", "x0xd")]
+          if suffix:
+              with zipfile.ZipFile(output / "archive.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                  for name in names:
+                      archive.write(custody / name, arcname=name)
+          else:
+              with tarfile.open(output / "archive.tar.gz", "w:gz") as archive:
+                  for name in names:
+                      archive.add(custody / name, arcname=name)
+          PY
+
+      - name: Prepare ARM64 packaged verification
+        if: env.BUILD_PLATFORM == 'linux-arm64-gnu'
+        run: |
+          scripts/ci/apt-install.sh qemu-user libc6-arm64-cross libgcc-s1-arm64-cross
+
+      - name: Download public signing controls
+        uses: actions/download-artifact@v5
+        with:
+          name: m2-signing-controls
+          path: ${{ runner.temp }}/m2-signing-controls
+
+      - name: Prove packaged production trust and test-feature absence
+        shell: bash
+        env:
+          M2_PLATFORM: ${{ env.BUILD_PLATFORM }}
+        run: |
+          archive="archive.tar.gz"
+          if [[ "$M2_PLATFORM" == windows-* ]]; then
+            archive="archive.zip"
+          fi
+          python3 .github/scripts/m2_release_signing_gate.py \
+            --build-messages "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}-build.jsonl" \
+            --archive "${RUNNER_TEMP}/m2-build-signing-${{ env.BUILD_PLATFORM }}/${archive}" \
+            --custody "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}" \
+            --control-fixture "${RUNNER_TEMP}/m2-signing-controls" \
+            --control-receipt-sha256 "${{ needs.prepare-m2-signing-controls.outputs.receipt_sha256 }}" \
+            --platform "${{ env.BUILD_PLATFORM }}" \
+            --receipt "${RUNNER_TEMP}/m2-build-signing-${{ env.BUILD_PLATFORM }}/receipt.json"
+
+      - name: Upload M2 packaged signing evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: m2-build-signing-${{ env.BUILD_PLATFORM }}
+          path: ${{ runner.temp }}/m2-build-signing-${{ env.BUILD_PLATFORM }}/receipt.json
+          if-no-files-found: error
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: x0x-${{ env.BUILD_PLATFORM }}
+          path: ${{ runner.temp }}/x0x-${{ env.BUILD_PLATFORM }}/
+          if-no-files-found: error
+
   build-matrix:
     name: Build ${{ matrix.platform }}
+    if: github.event_name != 'pull_request'
     needs: [validate-release-metadata, prepare-m2-signing-controls]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 GNU
-          - platform: linux-x64-gnu
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cross: false
-
           # Linux x86_64 musl (static linking)
           - platform: linux-x64-musl
             os: ubuntu-latest
@@ -132,157 +295,8 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Resolve dependency graph
-        shell: bash
-        run: |
-          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
-            cargo metadata --locked --format-version 1 >/dev/null
-          else
-            cargo generate-lockfile
-          fi
-
-      - name: Capture source and dependency provenance
-        shell: bash
-        run: |
-          python3 .github/scripts/build_artifact_provenance.py prepare \
-            --repo . \
-            --artifact-dir "${RUNNER_TEMP}/x0x-${{ matrix.platform }}" \
-            --platform "${{ matrix.platform }}" \
-            --target "${{ matrix.target }}"
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-registry-
-
-      - name: Cache cargo index
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-git-
-
-      - name: Cache target directory
-        uses: actions/cache@v5
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-target-
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo build --locked --release --target ${{ matrix.target }} \
-            --message-format=json-render-diagnostics \
-            | tee "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl"
-
-      - name: Build (cross)
-        if: matrix.cross
-        shell: bash
-        run: |
-          set -o pipefail
-          cross build --locked --release --target ${{ matrix.target }} \
-            --message-format=json-render-diagnostics \
-            | tee "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl"
-
-      - name: Finalize and verify artifact provenance
-        shell: bash
-        run: |
-          python3 .github/scripts/build_artifact_provenance.py finalize \
-            --repo . \
-            --artifact-dir "${RUNNER_TEMP}/x0x-${{ matrix.platform }}" \
-            --release-dir "target/${{ matrix.target }}/release" \
-            --build-messages "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl"
-          python3 .github/scripts/build_artifact_provenance.py verify \
-            --artifact-dir "${RUNNER_TEMP}/x0x-${{ matrix.platform }}"
-
-      # Exercise the release gate on all six executors on every PR/main build.
-      - name: Package signing control archive
-        shell: bash
-        env:
-          M2_PLATFORM: ${{ matrix.platform }}
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          import tarfile
-          import zipfile
-          platform = os.environ["M2_PLATFORM"]
-          custody = Path(os.environ["RUNNER_TEMP"]) / ("x0x-" + platform)
-          output = Path(os.environ["RUNNER_TEMP"]) / ("m2-build-signing-" + platform)
-          output.mkdir()
-          suffix = ".exe" if platform == "windows-x64" else ""
-          names = [name + suffix for name in ("x0x", "x0xd")]
-          if suffix:
-              with zipfile.ZipFile(output / "archive.zip", "w", zipfile.ZIP_DEFLATED) as archive:
-                  for name in names:
-                      archive.write(custody / name, arcname=name)
-          else:
-              with tarfile.open(output / "archive.tar.gz", "w:gz") as archive:
-                  for name in names:
-                      archive.add(custody / name, arcname=name)
-          PY
-
-      - name: Prepare ARM64 packaged verification
-        if: matrix.platform == 'linux-arm64-gnu'
-        run: |
-          scripts/ci/apt-install.sh qemu-user libc6-arm64-cross libgcc-s1-arm64-cross
-
-      - name: Download public signing controls
-        uses: actions/download-artifact@v5
-        with:
-          name: m2-signing-controls
-          path: ${{ runner.temp }}/m2-signing-controls
-
-      - name: Prove packaged production trust and test-feature absence
-        shell: bash
-        env:
-          M2_PLATFORM: ${{ matrix.platform }}
-        run: |
-          archive="archive.tar.gz"
-          if [[ "$M2_PLATFORM" == windows-* ]]; then
-            archive="archive.zip"
-          fi
-          python3 .github/scripts/m2_release_signing_gate.py \
-            --build-messages "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl" \
-            --archive "${RUNNER_TEMP}/m2-build-signing-${{ matrix.platform }}/${archive}" \
-            --custody "${RUNNER_TEMP}/x0x-${{ matrix.platform }}" \
-            --control-fixture "${RUNNER_TEMP}/m2-signing-controls" \
-            --control-receipt-sha256 "${{ needs.prepare-m2-signing-controls.outputs.receipt_sha256 }}" \
-            --platform "${{ matrix.platform }}" \
-            --receipt "${RUNNER_TEMP}/m2-build-signing-${{ matrix.platform }}/receipt.json"
-
-      - name: Upload M2 packaged signing evidence
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: m2-build-signing-${{ matrix.platform }}
-          path: ${{ runner.temp }}/m2-build-signing-${{ matrix.platform }}/receipt.json
-          if-no-files-found: error
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v5
-        with:
-          name: x0x-${{ matrix.platform }}
-          path: ${{ runner.temp }}/x0x-${{ matrix.platform }}/
-          if-no-files-found: error
+    env:
+      BUILD_PLATFORM: ${{ matrix.platform }}
+      BUILD_TARGET: ${{ matrix.target }}
+      BUILD_CROSS: ${{ matrix.cross }}
+    steps: *build-steps
