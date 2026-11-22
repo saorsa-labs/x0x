@@ -279,9 +279,9 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/report",
         cli_name: "report",
-        description: "Authenticated (durable owner): build a redacted problem-report bundle and store it under the data directory's reports/ (#1354); one per minute; nothing is sent",
+        description: "Authenticated (durable owner): build a redacted problem-report bundle and store it under the data directory's reports/ (#1354); one per minute; with deliver_to (an owner device), also queue a sent copy without log lines or file names on the durable direct-send outbox",
         category: "status",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::body("deliver_to", false)]),
     },
     EndpointDef {
         method: Method::Post,

@@ -260,7 +260,7 @@ daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 | GET | `/health` | `x0x health` | Health probe with the M1 structured verdict (#1380); the node-specific detail is gated to loopback/authenticated callers (see the privacy boundary below) |
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings, `gui_idle_timeout_secs` (effective GUI session idle timeout) |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
-| POST | `/report` | `x0x report` | Authenticated (durable owner only). Builds a redacted problem-report bundle and stores it as `<data_dir>/reports/x0x-report-<unix-secs>.json` (mode 0600, directory 0700). Nothing is sent. One report per minute per daemon (`429` with `retry_after_secs`); the newest 10 bundles are kept and older ones deleted. `201` body: `path`, `file_name`, `schema`, `created_unix`, `size_bytes`, `log_lines`, `log_lines_dropped_for_size`, `older_reports_deleted`, `sent: false` (#1354 slice 2; see below) |
+| POST | `/report` | `x0x report [--deliver-to <agent_id>]` | Authenticated (durable owner only). Builds a redacted problem-report bundle and stores it as `<data_dir>/reports/x0x-report-<unix-secs>.json` (mode 0600, directory 0700). Without `deliver_to` nothing is sent. One report per minute per daemon (`429` with `retry_after_secs`); the newest 10 bundles are kept and older ones deleted. `201` body: `path`, `file_name`, `schema`, `created_unix`, `size_bytes`, `log_lines`, `log_lines_dropped_for_size`, `older_reports_deleted`, `sent: false`, `delivery` (#1354 slices 2 and 3; see below). Optional JSON body `{"deliver_to": "<agent_id hex>"}` (CLI `--deliver-to`) also queues a sent copy to that owner device; `delivery` is then `{outcome: "queued", agent_id, logical_id, request_id, deliver_until_ms, size_bytes}`, else `null` |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6). Response: `session_token`, `expires_in`, `idle_timeout_secs`; a mint counts as user activity |
 | POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a **session** token for a fresh 10-minute one. Optional body `{"idle_ms": n}`: milliseconds since the client's last user input; the daemon moves the session's last activity to `now - idle_ms` when later, never past now. No body (or no `idle_ms`) is a background refresh and does not extend the session: a client that only refreshes this way now ends after the idle timeout (60 min by default), where it had 12 h before. Idle time is wall-clock time, so time asleep counts. A wall-clock step back of up to 60 s freezes the store's time at the high-water mark until the wall clock passes it; a larger step back ends every session, and users sign in again. The token can be live or lapsed; a lapsed token is accepted on this route only. Refused (`401`) once the session has had no recorded activity for the idle timeout (default 60 min; `gui_idle_timeout_minutes`, `--gui-idle-timeout-minutes`, `X0X_GUI_IDLE_TIMEOUT_MINUTES`, 1–1440). The durable token gets `403`, a malformed or oversized body (over 1 024 bytes) `400`, and the replaced token stops working at once. Response: `session_token`, `expires_in`, `idle_timeout_secs` (#893) |
 | POST | `/auth/session/revoke` | `x0x auth revoke` | End the caller's own **session**: the bearer session token stops working at once and a pending GUI show bound to it is dropped. Ends every token of the session's lineage, so a refresh that raced the sign-out is ended too. Accepts any session token refresh accepts (live, or lapsed inside the idle timeout), or a token a refresh replaced while the session is live; the durable token gets `403`. Open SSE streams and WebSockets of the session close too (a WebSocket with close code `1008`, reason `session ended`); streams of an idle-expired session close within 30 s of the idle limit. Response: `{"revoked": bool}` |
@@ -455,7 +455,8 @@ owner's machine: this slice adds no sending (`POST /report` and opt-in
 maintainer delivery are later slices of #1354).
 
 `POST /report` / `x0x report` (#1354 slice 2) builds a problem-report
-bundle inside the daemon and stores it locally; it sends nothing. The
+bundle inside the daemon and stores it locally; without `deliver_to`
+it sends nothing. The
 bundle (`schema: "x0x-report-bundle"`, `version: 1`) holds only these
 sections: `generator`, `host` (OS, architecture, uptime), `identity`
 (agent and machine ids as 8-character prefixes only), `health` (the
@@ -477,9 +478,49 @@ special file is skipped (the bundle notes it), and a symlinked
 What the redactor KEEPS: peer IP addresses and ports, four-word
 addresses, unquoted names and other free text in log messages,
 `:`-separated hex, byte arrays printed as `[..]`, and base64 runs under
-32 characters. So the bundle stays owner-local. Every one of these must
-be closed before any slice sends a report off the machine (to the
-owner's other devices or to maintainers).
+32 characters. So the stored bundle stays owner-local, and the copy that
+leaves the machine does not carry those sections (below).
+
+Delivery to an owner device (#1354 slice 3). With
+`{"deliver_to": "<agent_id hex>"}` (`x0x report --deliver-to <agent_id>`)
+the route stores the bundle as above and also queues a sent copy to that
+device. The device must be on the owner's issued-certificate roster
+(`GET /owner/agents`, which keeps offline agents), and must not be a
+rider (in the roster or in any journal line of this owner), this
+daemon's own agent, an agent with an expired certificate, an agent the
+owner revoked (`DELETE /owner/agents/:id`, a lost device), or a blocked
+or revoked contact. These checks run when the request is made. The
+outbox worker checks only the contact store before each attempt, so a
+certificate that expires, or an owner revocation that arrives, after the
+copy is queued does not stop it: it can still be sent up to 24 hours
+later. Cancel it with
+`DELETE /direct/receipts/{logical_id}?agent_id=<device>`. The sent copy is the bundle without `log_tail` and
+`data_dir` (neither is read), with `profile: "sent"` and
+`withheld: ["data_dir", "log_tail"]`; the other sections pass the same
+redactor. It is compact JSON of at most 32 KiB, below the 48 KiB DM
+payload limit. It travels as the payload of an ordinary durable direct
+message on the [queued send](#queued-durable-send-1109) outbox, under
+`logical_id` `x0x-report-<created_unix>` with the outbox's longest
+deadline (24 hours): attempts while the device is offline keep it, a
+restart keeps it, and the first attempt after the device is back
+delivers it. Follow it with `GET /direct/receipts/{logical_id}?agent_id=<device>`.
+The receiving device gets it as a plain direct message from this agent
+whose payload is the JSON copy (`schema: "x0x-report-bundle"`). Nothing on
+the receiving side recognises or shows a report yet. The call itself sends nothing,
+so `sent` stays `false`. Errors: `400 invalid_agent_id`,
+`400 deliver_to_self`, `400 invalid_request` (a malformed body or an
+unknown field; a request needs `Content-Type: application/json` to carry
+a body), `403 not_an_owner_device`, `403 certificate_expired`,
+`403 recipient_revoked`, `403 recipient_blocked` and
+`409 no_owner_identity` are answered before the one-per-minute slot is
+taken, and nothing is stored or queued. `413 report_too_large_to_send`
+stores and queues nothing and gives the slot back. A queue refusal keeps
+the stored bundle (its `path` is in the body). `429 outbox_full`,
+`409 idempotency_conflict` and `500 outbox_write_failed` give the slot
+back. `503 outbox_not_durable` keeps the slot: the copy is held and may
+still be sent (`delivery.outcome` is `held_not_durable`), so check its
+receipt before a later report, which could otherwise reach the device
+as a second copy. Nothing is sent to the maintainers.
 
 ### Example: status
 
