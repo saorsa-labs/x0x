@@ -34,7 +34,7 @@ exclude = [
 anyhow = "1.0"
 # 0.28.0 and later honour `relay_service_enabled` (ant-quic ADR-019, relay
 # serving opt-out). 0.29.0 keeps the SendStream/RecvStream::connection_generation()
-# that the evidence Hello reply gate keys on (#1346). saorsa-gossip 0.5.95
+# that the evidence Hello reply gate keys on (#1346). saorsa-gossip 0.5.96
 # pins the same ant-quic; saorsa-webrtc-core 0.6.1 (voice only) still uses
 # 0.28. x0x keeps the 0.29.0 relay forward mode at `Stream` (no Hybrid:
 # src/voice/link_transport.rs reads datagrams directly) and `auto_migrate`
@@ -65,17 +65,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = "=0.5.95"
-saorsa-gossip-crdt-sync = "=0.5.95"
-saorsa-gossip-groups = "=0.5.95"
-saorsa-gossip-identity = "=0.5.95"
-saorsa-gossip-membership = "=0.5.95"
-saorsa-gossip-presence = "=0.5.95"
-saorsa-gossip-pubsub = "=0.5.95"
-saorsa-gossip-rendezvous = "=0.5.95"
-saorsa-gossip-runtime = "=0.5.95"
-saorsa-gossip-transport = "=0.5.95"
-saorsa-gossip-types = "=0.5.95"
+saorsa-gossip-coordinator = "=0.5.96"
+saorsa-gossip-crdt-sync = "=0.5.96"
+saorsa-gossip-groups = "=0.5.96"
+saorsa-gossip-identity = "=0.5.96"
+saorsa-gossip-membership = "=0.5.96"
+saorsa-gossip-presence = "=0.5.96"
+saorsa-gossip-pubsub = "=0.5.96"
+saorsa-gossip-rendezvous = "=0.5.96"
+saorsa-gossip-runtime = "=0.5.96"
+saorsa-gossip-transport = "=0.5.96"
+saorsa-gossip-types = "=0.5.96"
 saorsa-pqc = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
