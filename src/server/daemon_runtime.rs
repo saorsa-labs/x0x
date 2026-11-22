@@ -2,11 +2,13 @@
 //!
 //! `x0xd` used to poll its top-level future with `block_on` on the process
 //! main thread. The main-thread stack is set by the platform: 8 MiB on Linux
-//! and macOS, but 1 MiB on Windows. The startup future (`serve_with_options`)
-//! needed more than 1 MiB of stack in an unoptimised build, so a debug
-//! `x0xd` on Windows overflowed at start. [`run_daemon_runtime`] runs the
-//! future on a new thread with an explicit stack size instead, so the stack
-//! the daemon gets no longer depends on the platform.
+//! and macOS, but 1 MiB on Windows. On a macOS arm64 debug build the
+//! `poll` frame of the startup future (`serve_with_options`) alone was
+//! 1,380,656 bytes, so a debug `x0xd` on Windows would overflow at start.
+//! That is inferred from the frame size; no Windows launch was done.
+//! [`run_daemon_runtime`] runs the future on a new thread with an explicit
+//! stack size instead, so the stack the daemon gets no longer depends on the
+//! platform.
 
 use std::future::Future;
 
@@ -134,12 +136,49 @@ mod tests {
         assert!(result.is_ok(), "hermetic serve and shutdown: {result:?}");
     }
 
+    /// Set in the child run of
+    /// [`daemon_and_worker_threads_have_the_explicit_stack`].
+    const PROBE_CHILD_ENV: &str = "X0X_2083_STACK_PROBE_CHILD";
+
     /// #2083: the daemon thread and the runtime's worker threads both have
-    /// [`DAEMON_THREAD_STACK_BYTES`]. Each probe uses more stack than the
-    /// 2 MiB defaults, so dropping either explicit size fails this test on
-    /// every platform.
+    /// [`DAEMON_THREAD_STACK_BYTES`].
+    ///
+    /// The CI lanes set `RUST_MIN_STACK` to 16 MiB, and std uses it for every
+    /// thread spawned without an explicit size, so a probe in this process
+    /// would pass without the explicit sizes. This test therefore re-runs
+    /// itself in a child process of this test binary with `RUST_MIN_STACK`
+    /// removed. In the child, a thread without an explicit size has the
+    /// 2 MiB std default, and each 3 MiB probe overflows it and aborts the
+    /// child. The parent fails unless the child exits with success.
     #[test]
     fn daemon_and_worker_threads_have_the_explicit_stack() {
+        if std::env::var_os(PROBE_CHILD_ENV).is_some() {
+            probe_daemon_and_worker_stacks();
+            return;
+        }
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("path of this test binary"),
+        )
+        .args([
+            "--exact",
+            "server::daemon_runtime::tests::daemon_and_worker_threads_have_the_explicit_stack",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env_remove("RUST_MIN_STACK")
+        .env(PROBE_CHILD_ENV, "1")
+        .output()
+        .expect("run the stack-probe child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "stack-probe child failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn probe_daemon_and_worker_stacks() {
         let (main_name, main_probe, worker_probe) = run_daemon_runtime(|| async {
             let main_name = std::thread::current().name().map(str::to_string);
             let main_probe = touch_probe_stack();

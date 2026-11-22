@@ -1349,9 +1349,13 @@ jobs:
         run: cargo test --lib instance_lock
 
       # #2083: x0xd runs its daemon future on an explicit 8 MiB thread, not on
-      # the 1 MiB Windows main thread. These tests serve a hermetic loopback
-      # daemon (no bootstrap peers, no mDNS, no port mapping) through that
-      # runtime from a 256 KiB caller thread, and probe the thread stacks.
+      # the 1 MiB Windows main thread. One test serves a hermetic loopback
+      # daemon (no bootstrap peers, no mDNS, no port mapping) through
+      # `run_daemon_runtime` from a 256 KiB caller thread. One re-runs itself
+      # in a child with RUST_MIN_STACK removed and touches 3 MiB of stack on
+      # the daemon thread and on a worker, so it fails if either explicit
+      # size is lost, whatever this job's RUST_MIN_STACK is. One checks that a
+      # daemon-thread panic is returned as an error.
       - name: Run the daemon-runtime suite
         run: cargo test --lib daemon_runtime
 

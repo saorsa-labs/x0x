@@ -21,9 +21,13 @@ All notable changes to this project will be documented in this file.
 
 - **`x0xd` no longer runs its daemon on the process main thread (#2083; A11
   paragraph of 21 Nov 2026).** The main-thread stack is 1 MiB on Windows,
-  and in a debug build the startup future's `poll` frame alone was 1.3 MB.
-  `x0xd` now runs the daemon on a thread named `x0xd-main` with an explicit
-  8 MiB stack, through the new `x0x::server::run_daemon_runtime`. The
+  and on a macOS arm64 debug build the startup future's `poll` frame alone
+  was 1.3 MB, so a debug `x0xd` on Windows would overflow at start (inferred
+  from that frame size; not launched on Windows). `x0xd` now runs the daemon
+  on a thread named `x0xd-main` with an explicit 8 MiB stack, through the
+  new `x0x::server::run_daemon_runtime`. A panic on that thread now makes
+  `x0xd` exit with code 1 (was 101); the panic message names
+  `thread 'x0xd-main'`. The
   `serve_with_options` future is now small (its state is on the heap), and
   its debug `poll` frame is about a third of its old size. Release frame
   sizes were not measured.
