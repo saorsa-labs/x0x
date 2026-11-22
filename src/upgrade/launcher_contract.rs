@@ -9,8 +9,11 @@
 //!
 //! ```text
 //! x0x-launcher /abs/x0xd [daemon args...]
-//! x0x-launcher --host-root <abs data_root> --instance <id> -- /abs/x0xd [daemon args...]
+//! x0x-launcher --host-root <abs data_root> --instance <id> [--plan-anchor <abs path>] -- /abs/x0xd [daemon args...]
 //! ```
+//!
+//! `--plan-anchor` names the root-owned plan anchor (#2012, B4); a trial
+//! needs it, and a trial-form start without it can only pass through.
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -23,6 +26,9 @@ pub const LAUNCHER_BASENAME: &str = "x0x-launcher";
 pub struct TrialArgs {
     pub host_root: PathBuf,
     pub instance: String,
+    /// The root-owned plan anchor (#2012, B4). Without it the launcher
+    /// never gives a trial.
+    pub plan_anchor: Option<PathBuf>,
 }
 
 /// A launcher argv (after the launcher's own name) that the launcher
@@ -35,8 +41,8 @@ pub struct LauncherArgv<'a, S> {
 }
 
 const PLAIN_USAGE: &str = "usage: x0x-launcher /absolute/daemon-executable [daemon args]";
-const TRIAL_USAGE: &str = "usage: x0x-launcher --host-root /absolute/data-root --instance ID -- \
-                           /absolute/daemon [daemon args]";
+const TRIAL_USAGE: &str = "usage: x0x-launcher --host-root /absolute/data-root --instance ID \
+                           [--plan-anchor /absolute/anchor] -- /absolute/daemon [daemon args]";
 
 /// Parse a launcher argv (after the launcher's own name). The error is the
 /// usage message; the launcher exits 64 on it.
@@ -47,8 +53,19 @@ pub fn parse_launcher_argv<S: AsRef<OsStr>>(argv: &[S]) -> Result<LauncherArgv<'
             daemon: daemon_argv(argv)?,
         });
     }
-    let [_, root, flag, instance, separator, rest @ ..] = argv else {
+    let [_, root, flag, instance, after @ ..] = argv else {
         return Err(TRIAL_USAGE.to_string());
+    };
+    let (plan_anchor, separator, rest) = match after {
+        [anchor_flag, anchor, separator, rest @ ..] if anchor_flag.as_ref() == "--plan-anchor" => {
+            let anchor = PathBuf::from(anchor.as_ref());
+            if !anchor.is_absolute() {
+                return Err("--plan-anchor must be absolute".to_string());
+            }
+            (Some(anchor), separator, rest)
+        }
+        [separator, rest @ ..] => (None, separator, rest),
+        [] => return Err(TRIAL_USAGE.to_string()),
     };
     if flag.as_ref() != "--instance" || separator.as_ref() != "--" {
         return Err(TRIAL_USAGE.to_string());
@@ -76,6 +93,7 @@ pub fn parse_launcher_argv<S: AsRef<OsStr>>(argv: &[S]) -> Result<LauncherArgv<'
         trial: Some(TrialArgs {
             host_root,
             instance,
+            plan_anchor,
         }),
         daemon: daemon_argv(rest)?,
     })
@@ -202,9 +220,28 @@ mod tests {
             Some(TrialArgs {
                 host_root: "/var/lib/x0x".into(),
                 instance: "alice".into(),
+                plan_anchor: None,
             })
         );
         assert_eq!(trial.daemon, ["/usr/bin/x0xd"]);
+        let anchored = parse_launcher_argv(&[
+            "--host-root",
+            "/var/lib/x0x",
+            "--instance",
+            "alice",
+            "--plan-anchor",
+            "/etc/x0x/launcher/x0xd.anchor.json",
+            "--",
+            "/usr/bin/x0xd",
+            "--name",
+            "a",
+        ])
+        .unwrap();
+        assert_eq!(
+            anchored.trial.and_then(|trial| trial.plan_anchor),
+            Some("/etc/x0x/launcher/x0xd.anchor.json".into())
+        );
+        assert_eq!(anchored.daemon, ["/usr/bin/x0xd", "--name", "a"]);
     }
 
     #[test]
@@ -218,6 +255,36 @@ mod tests {
             &["--host-root", "/r", "--instance", "a", "/x0xd"][..],
             &["--host-root", "/r", "--instance", "a", "--"][..],
             &["--host-root", "/r", "--instance", "a", "--", "x0xd"][..],
+            &[
+                "--host-root",
+                "/r",
+                "--instance",
+                "a",
+                "--plan-anchor",
+                "rel",
+                "--",
+                "/x0xd",
+            ][..],
+            &[
+                "--host-root",
+                "/r",
+                "--instance",
+                "a",
+                "--plan-anchor",
+                "/a",
+                "/x0xd",
+            ][..],
+            &[
+                "--host-root",
+                "/r",
+                "--instance",
+                "a",
+                "--plan-anchor",
+                "/a",
+                "--",
+            ][..],
+            &["--host-root", "/r", "--instance", "a", "--plan-anchor"][..],
+            &["--host-root", "/r", "--instance", "a"][..],
         ] {
             assert!(parse_launcher_argv(argv).is_err(), "{argv:?}");
         }

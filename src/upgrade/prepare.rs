@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use super::install_lock::InstallLock;
 use super::journal::{self, ArtifactPlan, FrozenPlan, JournalRecord, Participant, Phase};
+use super::plan_binding::{self, Anchored};
 
 /// What the apply path knows when it prepares: the release, the two
 /// staged artifacts and the participants it observed.
@@ -199,6 +200,85 @@ fn check_root(root: &Path) -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Remove a leftover binding at the NEW transaction's path that the strict
+/// writer would refuse to replace: a symlink (removed as a link; its
+/// target is not touched), or any regular file it cannot read as a
+/// binding, for whatever reason (corrupt, a later schema, oversized, or a
+/// read that fails, such as EACCES or EIO). A valid one stays, for the
+/// atomic replace. Only `stage` calls this, under the host lock, for a
+/// transaction that no journal names (the current journal's id is
+/// refused). Anything else at the path (a directory) is refused and left
+/// alone.
+fn clear_unusable_binding(path: &Path) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let usable = metadata.is_file()
+        && journal::read_auxiliary_record(path)
+            .and_then(|bytes| plan_binding::validate_binding(&bytes))
+            .is_ok();
+    if usable {
+        return Ok(());
+    }
+    if !metadata.is_file() && !metadata.file_type().is_symlink() {
+        return Err(refused(format!(
+            "{} is not a file; remove it by hand",
+            path.display()
+        )));
+    }
+    std::fs::remove_file(path)
+}
+
+/// Best effort: remove every plan binding file in `data_root` whose name
+/// is not in `keep` (a symlink as a link; a directory is left alone).
+#[cfg(unix)]
+fn remove_bindings_except(data_root: &Path, keep: &[Option<&str>]) {
+    let Ok(entries) = std::fs::read_dir(data_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !plan_binding::is_binding_file_name(name) || keep.contains(&Some(name)) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| !kind.is_dir()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The new transaction's binding write. A test can make it fail at one
+/// barrier step (`tests::fail_binding_write`).
+#[cfg(unix)]
+fn write_binding(path: &Path, binding: &plan_binding::PlanBinding) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(step) = tests::BINDING_FAILURE.with(std::cell::Cell::take) {
+        return journal::write_auxiliary_record_with_failure(
+            path,
+            binding,
+            plan_binding::validate_binding,
+            step,
+        );
+    }
+    journal::write_auxiliary_record(path, binding, plan_binding::validate_binding)
+}
+
+/// The Staged journal write. A test can make it fail at one barrier step
+/// (`tests::fail_journal_write`), as a crash or a full disk would.
+#[cfg(unix)]
+fn write_staged_journal(path: &Path, record: &JournalRecord) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(step) = tests::JOURNAL_FAILURE.with(std::cell::Cell::take) {
+        return journal::write_record_with_failure(path, record, step);
+    }
+    journal::write_record(path, record)
 }
 
 fn sha256_of(path: &Path) -> io::Result<[u8; 32]> {
@@ -397,12 +477,42 @@ impl Prepared {
     /// in-flight or unreadable one is refused. The check and the write are
     /// both under `lock`, so of two concurrent runs the second sees the
     /// first's journal in flight and is refused.
+    ///
+    /// The plan must name exactly the install that `anchor` approves
+    /// (#2012, B4). Before the Staged journal it writes this transaction's
+    /// plan binding beside it (`plan_binding::binding_file_name`, mode
+    /// 0600): the transaction, the generation, the plan digest and the
+    /// anchor digest. The binding does not change for the rest of the
+    /// transaction.
+    ///
+    /// Each transaction has its own binding file (#2171 review). A settled
+    /// earlier journal (HostCommitted, Restored) still gives its launcher a
+    /// trial, so its binding must stay valid until the new journal is
+    /// durable: stage never writes or removes the binding the current
+    /// journal names before that. A transaction id equal to the current
+    /// journal's is refused, since its binding would be the current one.
+    /// A settled journal for another install pair is refused too: the
+    /// launcher reads this data root under the lock of the journal's own
+    /// daemon target, which a stage for another pair would not hold.
+    ///
+    /// A crash or a failed journal write after the new binding leaves one
+    /// of two states, both startable. If it happens before the journal's
+    /// rename, the current journal and its binding are as they were, plus
+    /// an orphan binding. If it happens after the rename (at the directory
+    /// sync), the new Staged journal is in place with its own binding.
+    /// Orphans (bindings of neither the current nor the new transaction)
+    /// are removed before the new binding is written, and every binding
+    /// but the new one after the new journal is written. Each removal is
+    /// best effort: when all succeed at most two binding files exist; a
+    /// removal that fails leaves a harmless leftover that the next stage
+    /// retries.
     #[cfg(unix)]
     pub(crate) fn stage(
         lock: &HostLock,
         data_root: &Path,
         transaction_id: &str,
         plan: FrozenPlan,
+        anchor: &Anchored,
     ) -> io::Result<Self> {
         lock.covers(&plan)?;
         check_root(data_root)?;
@@ -416,13 +526,41 @@ impl Prepared {
             return Err(refused("empty transaction id"));
         }
         let path = data_root.join(journal::JOURNAL_FILE_NAME);
+        let mut current = None;
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
             Ok(_) => {
                 let bytes = journal::read_auxiliary_record(&path)?;
                 match journal::classify_record(&bytes, "journal") {
-                    journal::RecordRead::Journal(earlier) if settled(earlier.phase) => {}
+                    journal::RecordRead::Journal(earlier) if settled(earlier.phase) => {
+                        if earlier.transaction_id == transaction_id {
+                            return Err(refused(format!(
+                                "transaction {transaction_id} is the current journal's"
+                            )));
+                        }
+                        // The launcher reads this data root's journal and
+                        // binding under the lock of the journal's daemon
+                        // target; a stage for another pair would hold other
+                        // locks and could remove that binding between its
+                        // two reads (#2171 review). Refused rather than also
+                        // taking the earlier pair's locks: a third and
+                        // fourth lock beside the plan's two has no order
+                        // every holder agrees on, so it could deadlock.
+                        if earlier.plan.daemon.target_path != plan.daemon.target_path
+                            || earlier.plan.cli.target_path != plan.cli.target_path
+                        {
+                            return Err(refused(format!(
+                                "the host journal in {} is for another install pair \
+                                 ({}, {}); this data root cannot be staged for a different \
+                                 install until that journal is removed by hand",
+                                data_root.display(),
+                                earlier.plan.daemon.target_path.display(),
+                                earlier.plan.cli.target_path.display()
+                            )));
+                        }
+                        current = Some(plan_binding::binding_file_name(&earlier.transaction_id));
+                    }
                     journal::RecordRead::Journal(earlier) => {
                         return Err(refused(format!(
                             "transaction {} is in flight ({:?})",
@@ -435,7 +573,17 @@ impl Prepared {
         }
         let record = record(transaction_id, plan, Phase::Staged);
         checked(&record)?;
-        journal::write_record(&path, &record)?;
+        let binding = anchor
+            .bind(&record.transaction_id, record.generation, &record.plan)
+            .map_err(|error| refused(error.to_string()))?;
+        let name = plan_binding::binding_file_name(&record.transaction_id);
+        remove_bindings_except(data_root, &[Some(name.as_str()), current.as_deref()]);
+        let binding_path = data_root.join(&name);
+        clear_unusable_binding(&binding_path)?;
+        write_binding(&binding_path, &binding)?;
+        write_staged_journal(&path, &record)?;
+        // The new journal is durable: the current one's binding is history.
+        remove_bindings_except(data_root, &[Some(name.as_str())]);
         Ok(Self { path, record })
     }
 
@@ -529,6 +677,29 @@ impl Prepared {
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// The barrier step at which this thread's next Staged journal
+        /// write fails.
+        pub(crate) static JOURNAL_FAILURE: std::cell::Cell<Option<journal::BarrierStep>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    thread_local! {
+        /// The barrier step at which this thread's next binding write fails.
+        pub(crate) static BINDING_FAILURE: std::cell::Cell<Option<journal::BarrierStep>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Make this thread's next binding write fail at `step`.
+    pub(crate) fn fail_binding_write(step: journal::BarrierStep) {
+        BINDING_FAILURE.with(|failure| failure.set(Some(step)));
+    }
+
+    /// Make this thread's next Staged journal write fail at `step`.
+    pub(crate) fn fail_journal_write(step: journal::BarrierStep) {
+        JOURNAL_FAILURE.with(|failure| failure.set(Some(step)));
+    }
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
 
@@ -592,11 +763,23 @@ pub(crate) mod tests {
         (dir, root)
     }
 
+    /// `Prepared::stage` with an anchor for `plan`'s own install (#2012,
+    /// B4).
+    pub(crate) fn stage(
+        lock: &HostLock,
+        data_root: &Path,
+        transaction_id: &str,
+        plan: FrozenPlan,
+    ) -> io::Result<Prepared> {
+        let anchor = plan_binding::test_anchored(&plan);
+        Prepared::stage(lock, data_root, transaction_id, plan, &anchor)
+    }
+
     /// Stage, then move through every forward phase to `SwappedCli`.
     pub(crate) fn prepared_in(root: &Path, input: PlanInput) -> Prepared {
         let plan = freeze_plan(input).unwrap();
         let lock = HostLock::acquire(&plan).unwrap();
-        let mut prepared = Prepared::stage(&lock, root, "tx-2012", plan).unwrap();
+        let mut prepared = stage(&lock, root, "tx-2012", plan).unwrap();
         for phase in [
             Phase::Probed,
             Phase::Prepared,
@@ -627,6 +810,218 @@ pub(crate) mod tests {
             read.daemon_progress.observed_sha256,
             Some(read.plan.daemon.candidate_sha256)
         );
+    }
+
+    /// #2012 (B4): staging writes the plan binding (0600) that binds the
+    /// Staged journal to the anchor, and it refuses a plan the anchor does
+    /// not name, before it writes anything.
+    #[test]
+    fn staging_binds_the_plan_to_the_anchor() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let binding_path = root.join(plan_binding::binding_file_name("tx"));
+        let journal_path = root.join(journal::JOURNAL_FILE_NAME);
+
+        let mut other_install = plan.clone();
+        other_install.participants[0].instance_id = "bob".into();
+        let foreign = plan_binding::test_anchored(&other_install);
+        assert!(Prepared::stage(&lock, &root, "tx", plan.clone(), &foreign).is_err());
+        assert!(!binding_path.exists() && !journal_path.exists());
+
+        let anchor = plan_binding::test_anchored(&plan);
+        let prepared = Prepared::stage(&lock, &root, "tx", plan, &anchor).unwrap();
+        let mode = std::fs::metadata(&binding_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let binding = plan_binding::parse_binding(&std::fs::read(&binding_path).unwrap()).unwrap();
+        anchor.verify(&binding, prepared.record()).unwrap();
+        assert!(foreign.verify(&binding, prepared.record()).is_err());
+    }
+
+    /// #2171 review: a leftover binding the strict writer would refuse to
+    /// replace (corrupt, a later schema, a symlink) is replaced by the next
+    /// stage; a symlink's target is not touched.
+    #[test]
+    fn staging_replaces_an_unusable_leftover_binding() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let path = root.join(plan_binding::binding_file_name("tx"));
+        let journal_path = root.join(journal::JOURNAL_FILE_NAME);
+        let anchor = plan_binding::test_anchored(&plan);
+        let target = root.join("elsewhere.json");
+        std::fs::write(&target, b"not mine").unwrap();
+        let leftovers: [&dyn Fn(); 3] = [
+            &|| std::fs::write(&path, b"{corrupt").unwrap(),
+            &|| {
+                std::fs::write(
+                    &path,
+                    br#"{"schema":2,"record_kind":"plan_binding","future":true}"#,
+                )
+                .unwrap()
+            },
+            &|| std::os::unix::fs::symlink(&target, &path).unwrap(),
+        ];
+        for (index, leftover) in leftovers.into_iter().enumerate() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&journal_path);
+            leftover();
+            let prepared = Prepared::stage(&lock, &root, "tx", plan.clone(), &anchor)
+                .unwrap_or_else(|error| panic!("leftover {index}: {error}"));
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.is_file(), "leftover {index}");
+            let binding = plan_binding::parse_binding(&std::fs::read(&path).unwrap()).unwrap();
+            anchor.verify(&binding, prepared.record()).unwrap();
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"not mine");
+        // A directory there is not removed.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&journal_path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(Prepared::stage(&lock, &root, "tx", plan, &anchor).is_err());
+        assert!(path.is_dir() && !journal_path.exists());
+    }
+
+    /// #2171 review: a stage keeps at most the current and the new
+    /// binding while it runs, and only the new one after its journal is
+    /// durable. An orphan from an earlier failed stage is removed; a
+    /// directory with a binding's name is left alone.
+    #[test]
+    fn staging_cleans_orphan_bindings_after_a_durable_journal() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let anchor = plan_binding::test_anchored(&plan);
+        let bindings = || {
+            let mut names: Vec<String> = std::fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| plan_binding::is_binding_file_name(n))
+                .collect();
+            names.sort();
+            names
+        };
+        let mut first = Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).unwrap();
+        for phase in [Phase::Prepared, Phase::SwappedDaemon, Phase::SwappedCli] {
+            first.advance(&lock, phase).unwrap();
+        }
+        settle(&root, Phase::HostCommitted);
+        // An orphan of a stage that failed after its binding.
+        fail_journal_write(journal::BarrierStep::Write);
+        assert!(Prepared::stage(&lock, &root, "tx-failed", plan.clone(), &anchor).is_err());
+        let orphan = plan_binding::binding_file_name("tx-failed");
+        assert_eq!(bindings().len(), 2);
+        assert!(bindings().contains(&orphan));
+        let directory = root.join(plan_binding::binding_file_name("a-directory"));
+        std::fs::create_dir(&directory).unwrap();
+
+        Prepared::stage(&lock, &root, "tx-2", plan, &anchor).unwrap();
+        let mut expected = vec![
+            plan_binding::binding_file_name("tx-2"),
+            plan_binding::binding_file_name("a-directory"),
+        ];
+        expected.sort();
+        assert_eq!(bindings(), expected);
+        assert!(directory.is_dir());
+    }
+
+    /// #2171 review: the binding is written before the journal; a binding
+    /// write that fails at any step before its rename writes no journal.
+    #[test]
+    fn a_failed_binding_write_writes_no_journal() {
+        for step in [
+            journal::BarrierStep::Write,
+            journal::BarrierStep::FileSync,
+            journal::BarrierStep::Rename,
+        ] {
+            let (_dir, root) = root();
+            let plan = freeze_plan(input_in(&root)).unwrap();
+            let lock = HostLock::acquire(&plan).unwrap();
+            let anchor = plan_binding::test_anchored(&plan);
+            fail_binding_write(step);
+            assert!(Prepared::stage(&lock, &root, "tx", plan, &anchor).is_err());
+            assert!(!root.join(journal::JOURNAL_FILE_NAME).exists(), "{step:?}");
+        }
+    }
+
+    /// #2171 review: over a settled journal for another install pair, a
+    /// stage is refused and changes nothing.
+    #[test]
+    fn staging_refuses_another_install_pair_over_a_journal() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let anchor = plan_binding::test_anchored(&plan);
+        Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).unwrap();
+        settle(&root, Phase::HostCommitted);
+        drop(lock);
+        let (_other_dir, other_root) = super::tests::root();
+        let mut other = freeze_plan(input_in(&other_root)).unwrap();
+        // The other pair, staged into this data root.
+        other.participants = plan.participants.clone();
+        for participant in &mut other.participants {
+            participant.executable = other.daemon.target_path.clone();
+            participant.argv[0] = other.daemon.target_path.to_string_lossy().into_owned();
+        }
+        let other_lock = HostLock::acquire(&other).unwrap();
+        let other_anchor = plan_binding::test_anchored(&other);
+        let before = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+        let error =
+            Prepared::stage(&other_lock, &root, "tx-2", other, &other_anchor).expect_err("refused");
+        assert!(
+            error.to_string().contains("another install pair"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap(),
+            before
+        );
+        assert!(root.join(plan_binding::binding_file_name("tx-1")).exists());
+        assert!(!root.join(plan_binding::binding_file_name("tx-2")).exists());
+    }
+
+    /// #2171 review: a transaction id equal to the current journal's is
+    /// refused (its binding is the current one).
+    #[test]
+    fn staging_refuses_the_current_transaction_id() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let anchor = plan_binding::test_anchored(&plan);
+        Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).unwrap();
+        settle(&root, Phase::Restored);
+        let before = std::fs::read(root.join(plan_binding::binding_file_name("tx-1"))).unwrap();
+        assert!(Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).is_err());
+        assert_eq!(
+            std::fs::read(root.join(plan_binding::binding_file_name("tx-1"))).unwrap(),
+            before
+        );
+        assert!(Prepared::stage(&lock, &root, "tx-2", plan, &anchor).is_ok());
+    }
+
+    /// Rewrite the journal in `root` in a settled `phase`, as a launcher's
+    /// commit or restore leaves it.
+    pub(crate) fn settle(root: &Path, phase: Phase) {
+        let path = root.join(journal::JOURNAL_FILE_NAME);
+        let bytes = std::fs::read(&path).unwrap();
+        let journal::RecordRead::Journal(mut record) = journal::classify_record(&bytes, "journal")
+        else {
+            panic!("no journal");
+        };
+        record.phase = phase;
+        if phase == Phase::Restored {
+            record.cause = Some(journal::Cause {
+                class: journal::CauseClass::Failed,
+                reason: "fixture".into(),
+            });
+        }
+        std::fs::remove_file(&path).unwrap();
+        journal::write_record(&path, &*record).unwrap();
     }
 
     #[test]
@@ -683,16 +1078,16 @@ pub(crate) mod tests {
         let lock = HostLock::acquire(&plan).unwrap();
         let other = root.join("other");
         std::fs::create_dir(&other).unwrap();
-        assert!(Prepared::stage(&lock, &other, "tx", plan.clone()).is_err());
+        assert!(stage(&lock, &other, "tx", plan.clone()).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(Prepared::stage(&lock, &root, "tx", plan.clone()).is_err());
+        assert!(stage(&lock, &root, "tx", plan.clone()).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(Prepared::stage(&lock, &root, " ", plan.clone()).is_err());
+        assert!(stage(&lock, &root, " ", plan.clone()).is_err());
         // The host lock of another install pair does not cover this plan.
         let (_other_dir, other_root) = super::tests::root();
         let other_plan = freeze_plan(input_in(&other_root)).unwrap();
         let other_lock = HostLock::acquire(&other_plan).unwrap();
-        assert!(Prepared::stage(&other_lock, &root, "tx", plan).is_err());
+        assert!(stage(&other_lock, &root, "tx", plan).is_err());
     }
 
     #[test]
@@ -701,13 +1096,13 @@ pub(crate) mod tests {
         let prepared = prepared_in(&root, input_in(&root));
         let plan = prepared.record().plan.clone();
         let lock = HostLock::acquire(&plan).unwrap();
-        assert!(Prepared::stage(&lock, &root, "tx-next", plan.clone()).is_err());
+        assert!(stage(&lock, &root, "tx-next", plan.clone()).is_err());
         // A settled journal may be replaced.
         let mut settled = prepared.record().clone();
         settled.phase = Phase::HostCommitted;
         settled.sequence += 1;
         journal::write_record(prepared.path(), &settled).unwrap();
-        assert!(Prepared::stage(&lock, &root, "tx-next", plan).is_ok());
+        assert!(stage(&lock, &root, "tx-next", plan).is_ok());
     }
 
     /// #2065 review: two concurrent runs. The second waits for the host
@@ -723,14 +1118,14 @@ pub(crate) mod tests {
         let racer = std::thread::spawn(move || {
             let lock = HostLock::acquire(&racer_plan).unwrap();
             acquired.send(()).unwrap();
-            Prepared::stage(&lock, &racer_root, "tx-racer", racer_plan).map(|_| ())
+            stage(&lock, &racer_root, "tx-racer", racer_plan).map(|_| ())
         });
         let wait = std::time::Duration::from_millis(300);
         assert!(
             waiting.recv_timeout(wait).is_err(),
             "the racer did not wait"
         );
-        let first = Prepared::stage(&held, &root, "tx-first", plan).unwrap();
+        let first = stage(&held, &root, "tx-first", plan).unwrap();
         drop(held);
         waiting
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -762,7 +1157,7 @@ pub(crate) mod tests {
         let Ok(adopted) = HostLock::adopt(&plan, cli, daemon) else {
             panic!("adopt the caller's own locks");
         };
-        Prepared::stage(&adopted, &root, "tx", plan.clone()).unwrap();
+        stage(&adopted, &root, "tx", plan.clone()).unwrap();
         let waited = HostLock::acquire_within(&plan, std::time::Duration::from_millis(200));
         assert_eq!(
             waited.err().map(|error| error.kind()),
@@ -796,7 +1191,7 @@ pub(crate) mod tests {
         let (_dir, root) = root();
         let plan = freeze_plan(input_in(&root)).unwrap();
         let lock = HostLock::acquire(&plan).unwrap();
-        let mut prepared = Prepared::stage(&lock, &root, "tx", plan).unwrap();
+        let mut prepared = stage(&lock, &root, "tx", plan).unwrap();
         let edits: [fn(&mut JournalRecord); 3] = [
             |r: &mut JournalRecord| r.transaction_id = "tx-other".into(),
             |r: &mut JournalRecord| r.phase = Phase::Probed,
@@ -829,7 +1224,7 @@ pub(crate) mod tests {
         let (_dir, root) = root();
         let plan = freeze_plan(input_in(&root)).unwrap();
         let lock = HostLock::acquire(&plan).unwrap();
-        let mut prepared = Prepared::stage(&lock, &root, "tx", plan).unwrap();
+        let mut prepared = stage(&lock, &root, "tx", plan).unwrap();
         // No swap before Prepared, and no CLI swap before the daemon's.
         assert!(prepared.advance(&lock, Phase::SwappedDaemon).is_err());
         prepared.advance(&lock, Phase::Prepared).unwrap();
