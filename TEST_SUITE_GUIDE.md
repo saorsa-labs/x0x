@@ -1076,8 +1076,11 @@ correlate sender ↔ receiver).
 
 `.github/workflows/`:
 
-- **ci.yml** — fmt, clippy, nextest, doc (symlinks `ant-quic` and
-  `saorsa-gossip` from `.deps/`)
+- **ci.yml** — the slim hosted set: fmt, clippy, the library unit tests
+  (W3-H cases skipped), doc, parity, deployment authority
+- **ci-full.yml** — nightly and on dispatch: the full workspace suite,
+  W3-H shards and gate, released-binary rows, Windows, coverage. The
+  studio1 trains run the full suite as the merge gate (`docs/cicd.md`).
 - **security.yml** — `cargo audit`
 - **release.yml** — multi-platform builds (7 targets), macOS code
   signing, ML-DSA-65 manifest signing, `crates.io` publish

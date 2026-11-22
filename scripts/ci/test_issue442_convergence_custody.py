@@ -248,7 +248,7 @@ class Custody(unittest.TestCase):
         self.assertIsNotNone(result['phases'])
 
     def test_workflow_keeps_command_and_closed_upload(self):
-        workflow = Path(__file__).resolve().parents[2].joinpath('.github/workflows/ci.yml').read_text()
+        workflow = Path(__file__).resolve().parents[2].joinpath('.github/workflows/ci-full.yml').read_text()
         job = workflow[workflow.index('  test:'):workflow.index('  coverage:')]
         self.assertIn("run: bash scripts/ci/nextest-isolated.sh --all-features --workspace -- -E '!binary(x0x_0041_synthetic_kill_restart)'", job)
         self.assertIn('X0X_ISOLATION_ROLE: acceptance', job)

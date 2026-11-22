@@ -101,7 +101,7 @@ class ShardPlanTest(unittest.TestCase):
         # its receipts are absent (`--require`) or not GREEN (`--expect`).
         case = 'w3h_1356_control_s3_d2_fork_exposure_contained'
         self.assertIn(case, self.names)
-        workflow = (SHARDS.ROOT / '.github' / 'workflows' / 'ci.yml').read_text(
+        workflow = (SHARDS.ROOT / '.github' / 'workflows' / 'ci-full.yml').read_text(
             encoding='utf-8')
         start = workflow.index('- name: W3-H gate (verdict-stable reruns, D196)')
         end = workflow.find('\n      - ', start + 1)

@@ -1,0 +1,1540 @@
+name: CI (full)
+
+# The heavy suites that do not fit a standard GitHub-hosted runner on every
+# push and pull request: the full workspace Test Suite, the W3-H shards and
+# their D196 determinism gate, the released-binary rows, the Linux systemd
+# and 100k signing acceptances, Windows, and the Coverage Gate. On hosted
+# runners these jobs ran out of memory or lost the runner (exit 143, "lost
+# communication with the server"). They run nightly on main and on
+# `workflow_dispatch` for any branch, so a harness-first pull request can
+# still get its 20 CI reruns before it merges (A08, D196). The studio1
+# trains run the full suite as the merge gate.
+#
+# This workflow is not ci.yml. release.yml `require-green-ci` reads ci.yml
+# runs only, so a red nightly here never blocks a release by itself.
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # CMake 4 (ubuntu-26.04 runners) rejects the bundled opus in audiopus_sys
+  # 0.2.2 (cmake_minimum_required < 3.5). The env var alone did not reach the
+  # configure call in CI, so the cmake crate also runs a wrapper that adds
+  # -DCMAKE_POLICY_VERSION_MINIMUM=3.5. See scripts/ci/cmake-policy-min.sh
+  # (#1816). Do not pin or downgrade cmake.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_x86_64_unknown_linux_gnu: ${{ github.workspace }}/scripts/ci/cmake-policy-min.sh
+  RUST_BACKTRACE: 1
+
+# A newer run of the same event on the same ref replaces an older one
+# still in flight. The event is in the group, so a dispatch on main never
+# cancels an in-flight nightly run, and a nightly never cancels a dispatch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test Suite (full)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      # Job 120231656380 died with 54 MB free. Record the raw runner before
+      # this job deletes disposable toolchains.
+      - name: Record disk at Test Suite start
+        run: |
+          echo "=== disk at Test Suite start ==="
+          df -h
+
+      # Preinstalled SDKs are not Test Suite inputs. Removing them is the
+      # same headroom the Coverage Gate uses. It is not enough on its own:
+      # the default-feature M2 compile below still needs the all-features
+      # target removed first (#1584).
+      - name: Free preinstalled runner disk
+        run: |
+          echo "=== disk before freeing preinstalled tools ==="
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/share/vcpkg \
+            /opt/az \
+            /usr/local/.ghcup \
+            /usr/share/miniconda \
+            /usr/local/graalvm \
+            /usr/local/share/boost \
+            || true
+          sudo apt-get clean || true
+          echo "=== disk after freeing preinstalled tools ==="
+          df -h
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      # Resolve an untracked graph before caching; preserve a tracked lock exactly
+      # when an integration candidate pins dependencies for test provenance.
+      - name: Resolve test dependency graph
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
+
+      # Restore here. Save after the all-features lane, before that target
+      # is removed for the default-feature M2 controls (#1584).
+      - name: Restore target directory
+        id: restore_target
+        uses: actions/cache/restore@v5
+        with:
+          path: target
+          # Do not restore a different graph: stale test artifacts can consume the
+          # hosted runner disk when changed dependencies must be compiled again.
+          key: ${{ runner.os }}-rust-1.95.0-target-test-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
+
+      - name: Inert shared wrapper argument controls
+        run: |
+          python3 -B scripts/ci/test_nextest_isolated.py -v
+          python3 -B scripts/ci/test_prune_target_cache.py -v
+
+      - name: Prepare bounded convergence custody
+        id: prepare_convergence
+        run: python3 scripts/ci/issue442-convergence-custody.py prepare
+
+      # nextest drains a test group's queue only when a test of that group
+      # finishes, so mixed `threads-required` values in one group can end
+      # the run with tests "not run" and no failure (scripts/ci/
+      # check-nextest-groups.py, .config/nextest.toml quic-localhost).
+      - name: Check nextest test-group weights
+        run: |
+          python3 -B scripts/ci/test_check_nextest_groups.py -v
+          python3 -B scripts/ci/check-nextest-groups.py
+
+      - name: Record disk before Run tests
+        run: |
+          echo "=== disk before Run tests ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+
+      - name: Run tests
+        id: tests
+        env:
+          X0X_ISOLATION_ROLE: acceptance
+        # x0x_0041_synthetic_kill_restart is a documented timing-flaky test
+        # (500ms kill/restart bound) — filtered in CI as it is in local dev
+        # runs. Tracked separately; do not let it gate unrelated PRs.
+        # NB: `binary()` (test-binary name), not `test()` — `test()` would
+        # match the test function name, which is different from the binary.
+        run: bash scripts/ci/nextest-isolated.sh --all-features --workspace -- -E '!binary(x0x_0041_synthetic_kill_restart)'
+
+      - name: Collect bounded convergence custody
+        if: always()
+        id: collect_convergence
+        env:
+          X0X_CUSTODY_EXPECT: ${{ steps.tests.outcome }}
+          X0X_ISSUE442_NONCE: ${{ steps.prepare_convergence.outputs.run_nonce }}
+        run: python3 scripts/ci/issue442-convergence-custody.py collect
+
+      - name: Upload bounded convergence custody
+        if: always() && steps.collect_convergence.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue442-convergence-custody
+          path: ${{ runner.temp }}/x0x-issue442-receipt/custody-receipt.json
+          if-no-files-found: error
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-results
+          path: target/nextest/
+
+      # #1355: the installer regression tests must actually run in CI; one
+      # had silently rotted while it ran nowhere. The manifest-verify fixture
+      # compiles with `cargo build --offline` against this job's warmed cargo
+      # registry, so it runs here, after the workspace build. The ps1 suite
+      # fails on CI when pwsh is missing (fail-closed, as ubuntu-latest
+      # ships pwsh); it skips itself only on developer machines. Runs even
+      # when the test step failed, so a flaky nextest run still gets an
+      # installer verdict.
+      - name: Installer script tests
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        run: |
+          python3 -B tests/test_install_shell_autostart.py -v
+          python3 -B tests/test_install_manifest_verify.py -v
+          python3 -B tests/test_install_ps1_verify.py -v
+          python3 -B tests/test_launcher_dropin.py -v
+
+      # Cargo marks the x0x binary test=false. Select its real parser/registry
+      # controls explicitly after preserving the broad suite's results above.
+      - name: M2 CLI apply-now parser and registry controls
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        id: upgrade_now_cli
+        env:
+          X0X_ISOLATION_ROLE: m2-cli-now-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --all-features --bin x0x -- -E 'test(upgrade_now_cli_regressions)' --no-tests=fail
+
+      # Run while the all-features target is still on disk, and after the
+      # workspace artifact upload, so this invocation cannot replace those
+      # results. A voice failure must not skip the default-feature M2 controls.
+      - name: Record disk before Voice pipeline acceptance
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        run: |
+          echo "=== disk before Voice pipeline acceptance ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+
+      - name: Voice pipeline acceptance
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        env:
+          X0X_ISOLATION_ROLE: voice-pipeline-acceptance
+          X0X_RUNTIME_TIMEOUT_SECONDS: 180
+        shell: bash
+        run: |
+          voice_artifact="${RUNNER_TEMP}/voice-pipeline"
+          mkdir -p -- "$voice_artifact"
+          set +e
+          RUNNER_TEMP="$voice_artifact" bash scripts/ci/nextest-isolated.sh --locked --all-features --test voice_e2e -- \
+            --run-ignored ignored-only --no-tests=fail \
+            -E 'test(=voice_pipeline_delivers_decodable_audio)' \
+            >"$voice_artifact/voice-pipeline.log" 2>&1
+          status=$?
+          set -e
+          cat "$voice_artifact/voice-pipeline.log"
+          printf '{"native_exit":%d}\n' "$status" >"$voice_artifact/voice-pipeline-exit.json"
+          exit "$status"
+
+      - name: Upload voice pipeline results
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        uses: actions/upload-artifact@v5
+        with:
+          name: voice-pipeline-results
+          path: ${{ runner.temp }}/voice-pipeline/
+          if-no-files-found: error
+
+      # The full target holds ~115 workspace test binaries that change on every
+      # PR; archiving them filled the runner disk (#1543). Cache only the
+      # third-party build output from this all-features lane.
+      - name: Prune target directory for the cache
+        if: steps.restore_target.outputs.cache-hit != 'true'
+        run: |
+          echo "=== disk before pruning the all-features target cache ==="
+          df -h
+          du -sh target || true
+          python3 -B scripts/ci/prune-target-cache.py target
+          du -sh target || true
+
+      - name: Save target directory
+        if: steps.restore_target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: target
+          key: ${{ steps.restore_target.outputs.cache-primary-key }}
+
+      # The steps above use --all-features. The M2 controls below compile the
+      # default feature set, which is a second graph in the same target.
+      # Job 120231656380 kept both and rustc died at 54 MB free. Remove the
+      # all-features output after the cache save. always() keeps this step
+      # when Voice failed; the outcome checks still require the tests and the
+      # all-features CLI control.
+      - name: Free intermediate target output
+        id: free_intermediate
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success'
+        run: |
+          echo "=== disk before freeing intermediate target output ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+          rm -rf target
+          echo "=== disk after freeing intermediate target output ==="
+          df -h
+
+      # The workspace all-features lane exercises the debug seam. Also run the
+      # committed H controls with the default production trust root in isolation.
+      - name: M2 default-key and debug-signing controls
+        id: m2_signing
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.free_intermediate.outcome == 'success'
+        env:
+          X0X_ISOLATION_ROLE: m2-signing-controls
+        run: |
+          echo "=== disk before M2 default-key and debug-signing controls ==="
+          df -h
+          bash scripts/ci/nextest-isolated.sh --locked --workspace --test upgrade_test_signing -- --no-tests=fail
+
+      # Library fleet guards must also use the production key, not the
+      # all-features debug rehearsal key that permits zero-minute windows.
+      - name: Record disk before M2 production fleet staging controls
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.m2_signing.outcome == 'success'
+        run: |
+          echo "=== disk before M2 production fleet staging controls ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+
+      - name: M2 production fleet staging controls
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.m2_signing.outcome == 'success'
+        env:
+          X0X_ISOLATION_ROLE: m2-fleet-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --lib -- -E 'test(fleet_)' --no-tests=fail
+
+      - name: Record disk at Test Suite end
+        if: always()
+        run: |
+          echo "=== disk at Test Suite end ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+
+  signing-path-100k:
+    name: Signing path 100k acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Bound concurrent crates and LLVM workers on the standard 16 GiB runner.
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-issue703-cargo-${{ hashFiles('Cargo.toml') }}
+
+      - name: Resolve acceptance dependency graph
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
+
+      - name: Cache acceptance target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-issue703-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+
+      - name: Exercise proof and isolation wrapper controls
+        run: |
+          python3 -B scripts/ci/validate-703-signing-proof.py --self-test
+          python3 -B scripts/ci/test_nextest_isolated.py -v
+
+      - name: Prepare acceptance artifact
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          mkdir -m 700 "${artifact}"
+          test ! -e "${artifact}/proof.json"
+
+      # The x0x lib test unit at opt-level 3 peaked at 15.7 of 16 GB RAM
+      # and 2.9 of 3 GB swap (run 40002832571). A larger lib went past
+      # that, and the runner stopped with exit 143 before a test ran
+      # (#1533 runs 40003771420, 39995270646).
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
+
+      - name: Sample signing-path build resources
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          nohup bash -c '
+            while true; do
+              date -u
+              free -m
+              df -h / "$RUNNER_TEMP"
+              sleep 30
+            done
+          ' >>"${artifact}/resources.log" 2>&1 </dev/null &
+          echo "$!" >"${artifact}/resources.pid"
+
+      - name: Run exact ignored 100k signing-path test
+        id: signing_test
+        shell: bash
+        env:
+          X0X_ISOLATION_ROLE: issue703-signing-acceptance
+          X0X_RUNTIME_TIMEOUT_SECONDS: 660
+          X0X_SLOW_CONSUMER_PROOF: ${{ runner.temp }}/issue703-signing-test/proof.json
+        run: |
+          set +e
+          /usr/bin/time -v -o "${RUNNER_TEMP}/issue703-signing-test/build-and-test.time.txt" \
+            bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
+            --run-ignored ignored-only --no-tests=fail \
+            -E 'test(=gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages)'
+          status=$?
+          set -e
+          printf '{"native_exit":%d}\n' "${status}" \
+            >"${RUNNER_TEMP}/issue703-signing-test/native-exit.json"
+          if [[ ${status} -ne 0 ]]; then
+            exit "${status}"
+          fi
+          python3 -B scripts/ci/validate-703-signing-proof.py \
+            "${RUNNER_TEMP}/issue703-signing-test/proof.json"
+
+      - name: Print signing-path resource samples
+        if: always()
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          if [[ -f "${artifact}/resources.pid" ]]; then
+            kill "$(cat "${artifact}/resources.pid")" 2>/dev/null || true
+          fi
+          if [[ -f "${artifact}/resources.log" ]]; then
+            tail -n 120 "${artifact}/resources.log"
+          fi
+          if [[ -f "${artifact}/build-and-test.time.txt" ]]; then
+            cat "${artifact}/build-and-test.time.txt"
+          fi
+
+      - name: Upload signing-path acceptance custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue703-signing-path-100k
+          path: |
+            ${{ runner.temp }}/issue703-signing-test/
+            ${{ runner.temp }}/x0x-metadata-*/
+            ${{ runner.temp }}/x0x-isolation-*/
+          if-no-files-found: error
+
+  # ADR 0109 H-S3-home released-binary gate (#1571). It runs the published
+  # v0.45.0 and v0.46.1 daemons against the real Home placeholder rule.
+  # The run has about 30 minutes of real-time waits, so it is its own job
+  # and the Test Suite shards do not carry it. It is not a required check.
+  # nextest-isolated.sh fetches the pinned binaries before the loopback-only
+  # namespace (scripts/ci/prepare-released-h-s3-home.sh).
+  h-s3-home-released:
+    name: H-S3-home released binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-h-s3-home-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Resolve test dependency graph
+        run: cargo metadata --locked --format-version 1 >/dev/null
+
+      - name: Cache released-binary target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-h-s3-home-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'scripts/ci/prepare-released-h-s3-home.sh') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+
+      - name: Run H-S3-home against v0.45.0 and v0.46.1
+        env:
+          X0X_ISOLATION_ROLE: h-s3-home-released
+          X0X_RUNTIME_TIMEOUT_SECONDS: 3000
+        run: >-
+          bash scripts/ci/nextest-isolated.sh --locked --test h_s3_home_released --
+          --run-ignored ignored-only --no-tests=fail
+
+      - name: Upload H-S3-home custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: h-s3-home-released
+          # The reports and the released daemon logs only; the run data
+          # directories hold identity keys and the API token.
+          path: |
+            ${{ runner.temp }}/x0x-metadata-*/
+            ${{ runner.temp }}/x0x-isolation-*/
+            target/h-s3-home/*-report.json
+            target/h-s3-home/*/*/std*-*.log
+          if-no-files-found: warn
+
+  # ADR 0109 §10 H-S3-rm released-binary rows (#1572): rm1 (capability
+  # floor) and rm3 (i) and (ii) (older receiver after the seal), and
+  # H-S3-m (v0.46.1 on J's data dir between the H-S3-s segments; about
+  # 100 s in the VM, with two 45 s real-time waits), and its OwnerCertified
+  # variant (v0.46.1 on J's copy after the H-S3-c phase 1, then rm1's
+  # re-seat on real sockets). The filter also selects later rows in the
+  # same module. In rm1 and rm3, phase 1
+  # runs on the paused W3-H sim and phase 2 runs candidate daemons on
+  # real loopback sockets, with member M on the published v0.46.1
+  # daemon. H-S3-m stays on the paused sim: the published v0.46.1 runs
+  # on J's data dir with no peers while the sim waits, then J resumes
+  # on the candidate in the sim.
+  # The rows are `#[ignore]` and run only here, one at a time.
+  # A row took 145-250 s on a 12-CPU VM, and the 4-vCPU runner takes
+  # about twice as long. The job is separate because it needs the
+  # released binary. It is not a required check.
+  # The pinned v0.46.1 is installed before the loopback-only namespace:
+  # nextest-isolated.sh fetches it only for the `h_s3_home_released`
+  # binary, and these rows are in the lib test binary. `tokio_unstable`
+  # matches the VM runs.
+  h-s3-released-rows:
+    name: H-S3-rm released-binary rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-h-s3-rm-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Resolve test dependency graph
+        run: cargo metadata --locked --format-version 1 >/dev/null
+
+      - name: Cache released-rows target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-h-s3-rm-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'scripts/ci/prepare-released-h-s3-home.sh') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+
+      - name: Install the published v0.46.1
+        run: bash scripts/ci/prepare-released-h-s3-home.sh
+
+      - name: Run the H-S3-rm rows against v0.46.1
+        env:
+          X0X_ISOLATION_ROLE: h-s3-released-rows
+          X0X_RUNTIME_TIMEOUT_SECONDS: 3000
+        run: |
+          if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+            export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"--cfg"$'\x1f'"tokio_unstable"
+          else
+            export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable"
+          fi
+          # Keep the run output, with each row's W3H-RECEIPT line, as an
+          # artifact. The file is outside `target` so the cache does not
+          # keep it. pipefail keeps the nextest exit status.
+          set -o pipefail
+          mkdir -p h-s3-released-rows-logs
+          bash scripts/ci/nextest-isolated.sh --locked --all-features --lib -- \
+            --run-ignored ignored-only --no-tests=fail --success-output final \
+            -E 'test(/::owner_axis::released::/)' \
+            2>&1 | tee h-s3-released-rows-logs/nextest.log
+
+      - name: Upload H-S3-rm custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: h-s3-released-rows
+          # The isolation reports only; the row data directories hold
+          # identity keys and the API token, and they are temporary.
+          path: |
+            ${{ runner.temp }}/x0x-metadata-*/
+            ${{ runner.temp }}/x0x-isolation-*/
+          if-no-files-found: warn
+
+      - name: Upload H-S3-rm row logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: h-s3-released-rows-logs
+          # The nextest output: each row's notes and W3H-RECEIPT line, and
+          # the v0.46.1 stderr if that daemon stopped before its API.
+          path: h-s3-released-rows-logs/nextest.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  linux-systemd-policy:
+    name: Linux systemd policy acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Resolve acceptance dependency graph
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-linux690-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Cache acceptance target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-linux690-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'examples/linux690_systemd_probe.rs') }}
+
+      - name: Build only the systemd acceptance probe
+        env:
+          CARGO_BUILD_JOBS: 4
+        # The launcher hashes the probe as a candidate binary, which it
+        # bounds at 200 MiB; debug info makes the debug probe larger.
+        run: |
+          cargo build --locked --example linux690_systemd_probe
+          strip --strip-debug target/debug/examples/linux690_systemd_probe
+
+      # The launcher lifecycle cases (#690 exec/crash/hang/restart/stop and
+      # the S3c coordinator cases of #1376) run from this test binary under
+      # a real systemd job.
+      - name: Build the launcher lifecycle tests
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: |
+          cargo test --locked --no-run --features m2-launcher --bin x0x-launcher --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.name == "x0x-launcher") | .executable' \
+            | tail -n 1 >"${RUNNER_TEMP}/launcher-tests-path"
+          test -x "$(cat "${RUNNER_TEMP}/launcher-tests-path")"
+
+      - name: Exercise inert runner controls
+        run: python3 -B scripts/ci/test_linux690_systemd_acceptance.py -v
+
+      - name: Exercise inert M2 release metadata controls
+        run: python3 -B .github/scripts/test_m2_release_signing_gate.py -v
+
+      - name: Prepare Linux acceptance custody
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/linux690-systemd-acceptance"
+          mkdir -m 700 "${artifact}"
+          git rev-parse HEAD >"${artifact}/source-head.txt"
+          git rev-parse 'HEAD^{tree}' >"${artifact}/source-tree.txt"
+          sha256sum Cargo.lock >"${artifact}/cargo-lock-sha256.txt"
+          sha256sum target/debug/examples/linux690_systemd_probe >"${artifact}/probe-pre-run-sha256.txt"
+
+      - name: Exercise loaded systemd policy and clean-exit respawn
+        id: systemd_acceptance
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/linux690-systemd-acceptance"
+          set +e
+          sudo scripts/ci/linux690-systemd-acceptance.sh \
+            --probe "${GITHUB_WORKSPACE}/target/debug/examples/linux690_systemd_probe" \
+            --manager system \
+            --artifact-root "${artifact}" \
+            --launcher-tests "$(cat "${RUNNER_TEMP}/launcher-tests-path")"
+          acceptance_status=$?
+          set -e
+          if ! sudo test -d "${artifact}"; then
+            sudo mkdir -m 700 -p "${artifact}"
+          fi
+          sudo chown -R "$(id -u):$(id -g)" "${artifact}"
+          sha256sum target/debug/examples/linux690_systemd_probe >"${artifact}/probe-post-run-sha256.txt"
+          printf 'ACCEPTANCE_EXIT=%s\n' "${acceptance_status}" >"${artifact}/workflow-exit.txt"
+          exit "${acceptance_status}"
+
+      - name: Exercise literal systemd paths and arguments
+        shell: bash
+        run: |
+          # A sibling keeps the dropped fixture owner from traversing the
+          # acceptance directory after it has been returned to the runner.
+          artifact="${RUNNER_TEMP}/linux690-systemd-literals"
+          python3 -B scripts/ci/test_systemd_literals.py --self-test
+          set +e
+          sudo python3 -B scripts/ci/test_systemd_literals.py \
+            --probe "${GITHUB_WORKSPACE}/target/debug/examples/linux690_systemd_probe" \
+            --artifact-root "${artifact}"
+          literal_status=$?
+          set -e
+          sudo chown -R "$(id -u):$(id -g)" "${artifact}"
+          printf 'LITERAL_ACCEPTANCE_EXIT=%s\n' "${literal_status}" >"${artifact}/workflow-exit.txt"
+          mv "${artifact}" "${RUNNER_TEMP}/linux690-systemd-acceptance/literals"
+          exit "${literal_status}"
+
+      - name: Upload Linux systemd acceptance custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux690-systemd-acceptance
+          path: ${{ runner.temp }}/linux690-systemd-acceptance/
+          if-no-files-found: error
+
+
+  w3h-plan:
+    # Names the case groups for the matrix. A case is in exactly one group.
+    # S3 (`w3h_1356_`) and S4 (`w3h_1357_`) each have a group, so more of
+    # those cases extend that shard only. The H-S3-c/c2/c3/d8/d3 rows each have
+    # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`, `s3-d8`, `s3-d3`). H-S3-d3
+    # runs as four parallel parts (`s3-d3.1` to `s3-d3.4`, 5 reruns each;
+    # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
+    # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
+    # H-S3-rm4 variants share `s3-rm4.1` to `s3-rm4.5`, H-S3-rm2 has its
+    # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), H-S3-d2 has
+    # `s3-d2`, H-S3-r has `s3-r` (its replay variant `s3-rr`), H-S3-q (1)
+    # has `s3-q`, H-S3-q2 has `s3-q2`, and H-S3-q (3) has `s3-q3.1` and
+    # `s3-q3.2` (10 reruns each). The #1973 S4 owner-recovery arm has
+    # `s4-1973`, and the #2004 expired-member arm has `s4-2004`.
+    # A group is omitted when the tree has no matching test.
+    name: W3-H shard plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the shard plan and the trace gate
+        run: |
+          python3 -B scripts/ci/test_w3h_shards.py -v
+          python3 -B scripts/ci/test_w3h_trace_check.py -v
+
+      - id: plan
+        name: Emit the shard matrix
+        run: |
+          matrix="$(python3 -B scripts/ci/w3h-shards.py --matrix)"
+          echo "W3-H shards: ${matrix}"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  w3h-shard:
+    # One group, still `--stress-count 20`, or one part of a split group
+    # with its share of the 20 (`w3h-shards.py --stress`). The summary job
+    # below is the D196 gate and counts 20 receipts per case.
+    # `fail-fast: false` so one bad group still uploads traces.
+    name: W3-H shard (${{ matrix.group }})
+    needs: w3h-plan
+    runs-on: ubuntu-latest
+    # Every S3 group (`s3`, and `s3-c`, `s3-c2`, `s3-c3`, `s3-d8` for the
+    # H-S3-c/c2/c3/d8 owner-axis rows) gets 185 min (Engineer ruling, 30 Oct, 165 min;
+    # raised by option (b) of the 31 Oct ruling, #1727). Every other group
+    # keeps 120 min. The isolated test phase has its own deadline
+    # (`X0X_RUNTIME_TIMEOUT_SECONDS` below), which must also fit inside this
+    # limit with room for setup and upload. The one-job lib build below
+    # takes about 20 min (19m 32s in job 124482285010, against 10m 20s with
+    # parallel jobs in job 124477009427), so 165 min no longer held setup,
+    # build, the 155-min test deadline and upload. The 31 Oct ruling on
+    # #1733 keeps this budget: when an S3 group no longer fits, split it.
+    # Do not raise the budget. One H-S3-d3 rerun alone is 940-1000 s
+    # (job 125609571831: 9 of 20 in the 9300 s deadline), so its 20
+    # reruns are split into parts inside this budget (#1736).
+    timeout-minutes: ${{ startsWith(matrix.group, 's3') && 185 || 120 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v5
+        with:
+          path: target
+          # Per shard. Parallel saves of one key race, and each shard's
+          # `target/` differs after its own test run.
+          key: ${{ runner.os }}-rust-1.95.0-target-w3h-${{ matrix.group }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151  # same exact pin as the Test Suite
+
+      - name: Build the W3-H preload shim
+        run: |
+          mkdir -p target/w3h
+          cc -O2 -Wall -Wextra -Werror -shared -fPIC -o target/w3h/libw3h_shim.so scripts/w3h/w3h_shim.c -ldl
+          rm -rf target/w3h/traces
+
+      - name: Run W3-H cases 20 times
+        env:
+          X0X_ISOLATION_ROLE: w3h-harness
+          # The deadline of the isolated test phase only (the build runs
+          # before it). Every S3 group gets 9300 s (155 min) inside its
+          # 185-min job; every other group keeps 6600 s. One rerun is as
+          # long as its longest case: with the H-S3-c/c2 rows in `s3`, a
+          # rerun took 490 s and 20 reruns did not fit 9300 s (job
+          # 124802273633, 18 of 20). The PR body of #1733 has the measured
+          # time of each S3 group. So each H-S3-c/c2/c3 row has its own
+          # group. `isolated-runtime.py` caps the value at 21600 s.
+          X0X_RUNTIME_TIMEOUT_SECONDS: ${{ startsWith(matrix.group, 's3') && 9300 || 6600 }}
+        # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
+        # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
+        # The profile default-filter still intersects this expression, so
+        # only `w3h_` tests run. Repeat count stays 20.
+        # `--cfg tokio_unstable` is this job only. Release binaries and the
+        # other CI jobs do not set it (#1245). `CARGO_ENCODED_RUSTFLAGS`
+        # replaces `RUSTFLAGS` when it is set, so append to whichever is live.
+        # `--build-jobs 1` applies only to the host `cargo nextest list` of
+        # this lib test unit. The isolated run reuses that binary and does
+        # not compile again. On image ubuntu24/20261025.353 the runner stops
+        # that build with exit 143 and "The runner has received a shutdown
+        # signal", with no "exceeded the maximum execution time" line.
+        # #1704 run 41011145001 rest jobs 123917553873 and 123947546006, and
+        # all three rest attempts of #1719 run 40996713847, died about 10 min
+        # into the job in the silent rustc after tikv-jemalloc. There was no
+        # "Finished" line and no "Isolation evidence" line, so no test had
+        # started. The 300 s w3h-gate slow-timeout and the 6600 s isolation
+        # deadline were not in force. The same cold build finishes on main
+        # (7m27s in run 41010602403, 11m34s in run 40993619879, 11m43s in run
+        # 41029213415) and on the sibling shards of those pull requests.
+        # #1597 long-1023 job 123955870023 died the same way, so the rest
+        # filter is not the cause. Property tests already pass
+        # `--build-jobs 1` after the same 143 on this image during
+        # `cargo nextest list` (run 40530790509). One build job does not
+        # change the test binary. The 120 min job budget stays; the s3 budget
+        # rises to 185 min for the longer build (see `timeout-minutes`).
+        run: |
+          if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+            export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"--cfg"$'\x1f'"tokio_unstable"
+          else
+            export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable"
+          fi
+          filter="$(python3 -B scripts/ci/w3h-shards.py --filter "${{ matrix.group }}")"
+          stress="$(python3 -B scripts/ci/w3h-shards.py --stress "${{ matrix.group }}")"
+          echo "W3H-SHARD-START group=${{ matrix.group }} stress-count=${stress} filter=${filter}"
+          python3 -B scripts/ci/w3h-shards.py --list "${{ matrix.group }}"
+          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --lib -- \
+            --profile w3h-gate --run-ignored all --stress-count "$stress" -E "$filter"
+          echo "W3H-SHARD-END group=${{ matrix.group }}"
+
+      # Parts of a split group run the same case on different runners, and
+      # a runner can reuse a pid, so their `<case>-<pid>` names could
+      # collide in the merge. Tag them with the part first.
+      - name: Tag split-part traces
+        if: always() && contains(matrix.group, '.')
+        run: |
+          if [ -d target/w3h/traces ]; then
+            python3 -B scripts/ci/w3h-shards.py --tag-traces "${{ matrix.group }}" target/w3h/traces
+          fi
+
+      # Each part also writes pid-less `<case>.first-digest` and
+      # `.divergent-digest` markers; the merge below keeps one. Nothing
+      # reads them after the run (see `tag_traces` in w3h-shards.py).
+      - name: Upload W3-H shard traces
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: w3h-traces-${{ matrix.group }}
+          path: target/w3h/traces/
+          if-no-files-found: warn
+          retention-days: 7
+
+  w3h-harness:
+    # W3-H (#1164): deterministic simulation harness. The shards above run
+    # every `w3h_` case 20 times. This job merges their traces and requires
+    # the same verdict in every rerun with complete receipts (ruling D196).
+    # Distinct canonical traces per case are reported, not required.
+    # The check name stays `W3-H harness (determinism)`.
+    name: W3-H harness (determinism)
+    needs: w3h-shard
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download shard traces
+        uses: actions/download-artifact@v5
+        with:
+          pattern: w3h-traces-*
+          path: w3h-incoming
+          merge-multiple: true
+
+      - name: Merge shard traces
+        run: |
+          mkdir -p target/w3h/traces
+          find w3h-incoming -type f -print0 | while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            dest="target/w3h/traces/${base}"
+            if [ -e "$dest" ]; then
+              echo "duplicate W3-H trace file ${base}" >&2
+              exit 1
+            fi
+            cp "$file" "$dest"
+          done
+          traces="$(find target/w3h/traces -name '*.trace' | wc -l)"
+          echo "W3H-MERGED traces=${traces}"
+          test "${traces}" -gt 0
+
+      # D196: blocking on the verdict (the same in all 20 reruns, every
+      # receipt complete); the per-case distinct-trace counts are printed
+      # (`W3H-TRACES`) and do not fail the job.
+      # D30 restart-cold row for #1105: w3h_1105_red_baseline_restarted_replica_stays_at_n
+      # (RED), w3h_1105_restarted_replica_obtains_n_plus_one_snapshot (GREEN),
+      # and w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin
+      # (GREEN, D272). This is the existing 20-rerun gate, not a separate workflow.
+      - name: W3-H gate (verdict-stable reruns, D196)
+        run: >-
+          python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20
+          --require w3h_s1_control_group_invite_join_over_public_api
+          --require w3h_red_1256_gossip_only_event_after_a_gossip_member_added
+          --require w3h_1256_control_second_event_also_by_dm
+          --require w3h_1256_control_member_restarted_after_the_first_event
+          --expect w3h_red_1256_gossip_only_event_after_a_gossip_member_added=GREEN
+          --expect w3h_1256_control_second_event_also_by_dm=GREEN
+          --expect w3h_1256_control_member_restarted_after_the_first_event=GREEN
+          --require w3h_s1_negative_control_offline_joiner_is_not_admitted
+          --require w3h_1143_positive_control_consented_owner_announce_admits
+          --require w3h_red_1143_promoted_admin_admits_with_owner_offline
+          --require w3h_s4_control_evidence_hello_over_sim_streams
+          --require w3h_s4_control_owner_sync_over_sim_streams
+          --require w3h_1207_red_baseline_roster_then_discovery_hello_never_sent
+          --require w3h_1207_discovery_then_roster_recovers_through_the_commit_push
+          --require w3h_1207_red_baseline_no_mapping_on_either_side
+          --require w3h_1207_control_admin_knows_joiner
+          --require w3h_1207_control_intact_persisted_evidence
+          --require w3h_1207_control_authorized_third_holder
+          --require w3h_red_1207_ready_hello_roster_then_discovery
+          --require w3h_red_1207_ready_hello_no_mapping_stays_red
+          --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN
+          --expect w3h_red_1143_promoted_admin_admits_with_owner_offline=GREEN
+          --expect w3h_1207_red_baseline_roster_then_discovery_hello_never_sent=RED
+          --expect w3h_1207_discovery_then_roster_recovers_through_the_commit_push=GREEN
+          --expect w3h_1207_red_baseline_no_mapping_on_either_side=RED
+          --expect w3h_1207_control_admin_knows_joiner=GREEN
+          --expect w3h_1207_control_intact_persisted_evidence=GREEN
+          --expect w3h_1207_control_authorized_third_holder=GREEN
+          --expect w3h_red_1207_ready_hello_roster_then_discovery=GREEN
+          --expect w3h_red_1207_ready_hello_no_mapping_stays_red=RED
+          --require w3h_811_late_joiner_reads_history_from_plain_member
+          --expect w3h_811_late_joiner_reads_history_from_plain_member=GREEN
+          --require w3h_811_control_web_request_dropped_is_infra
+          --expect w3h_811_control_web_request_dropped_is_infra=INFRA
+          --require w3h_811_control_web_history_withheld_is_red
+          --expect w3h_811_control_web_history_withheld_is_red=RED
+          --require w3h_1105_red_baseline_restarted_replica_stays_at_n
+          --expect w3h_1105_red_baseline_restarted_replica_stays_at_n=RED
+          --require w3h_1105_restarted_replica_obtains_n_plus_one_snapshot
+          --expect w3h_1105_restarted_replica_obtains_n_plus_one_snapshot=GREEN
+          --require w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin
+          --expect w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin=GREEN
+          --require w3h_1191_attempt_exit
+          --expect w3h_1191_attempt_exit=GREEN
+          --require w3h_1427_offline_member_reaches_the_epoch_it_missed
+          --expect w3h_1427_offline_member_reaches_the_epoch_it_missed=GREEN
+          --require w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer
+          --expect w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer=GREEN
+          --require w3h_1427_silent_return_reaches_the_epoch
+          --expect w3h_1427_silent_return_reaches_the_epoch=GREEN
+          --require w3h_1427_silent_return_after_signer_restart_reaches_the_epoch
+          --expect w3h_1427_silent_return_after_signer_restart_reaches_the_epoch=GREEN
+          --require w3h_1427_member_up_through_an_outage_reaches_the_epoch
+          --expect w3h_1427_member_up_through_an_outage_reaches_the_epoch=GREEN
+          --require w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate
+          --expect w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate=RED
+          --require w3h_1161_card_import_invite
+          --expect w3h_1161_card_import_invite=GREEN
+          --require w3h_1161_control_share_withheld_is_red
+          --expect w3h_1161_control_share_withheld_is_red=RED
+          --require w3h_1149_treekem_banned_agent_not_readmitted_by_pre_ban_invite
+          --expect w3h_1149_treekem_banned_agent_not_readmitted_by_pre_ban_invite=GREEN
+          --require w3h_1149_signed_public_banned_agent_not_readmitted_by_pre_ban_invite
+          --expect w3h_1149_signed_public_banned_agent_not_readmitted_by_pre_ban_invite=GREEN
+          --require w3h_969_leave_rekey_restart_seals_under_the_current_epoch
+          --expect w3h_969_leave_rekey_restart_seals_under_the_current_epoch=GREEN
+          --require w3h_1471_forged_card_import_invite
+          --expect w3h_1471_forged_card_import_invite=GREEN
+          --require w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined
+          --expect w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined=GREEN
+          --require w3h_818_control_ownerless_invite_after_the_removal_joins
+          --expect w3h_818_control_ownerless_invite_after_the_removal_joins=GREEN
+          --require w3h_1357_red_s4_idle_revocation_one_admin
+          --expect w3h_1357_red_s4_idle_revocation_one_admin=GREEN
+          --require w3h_1357_control_s4_self_leave_crypto_only
+          --expect w3h_1357_control_s4_self_leave_crypto_only=GREEN
+          --require w3h_1357_control_s4_self_leave_lost_join_copy
+          --expect w3h_1357_control_s4_self_leave_lost_join_copy=GREEN
+          --require w3h_1357_red_s4_fallback_rank_manual
+          --expect w3h_1357_red_s4_fallback_rank_manual=GREEN
+          --require w3h_1357_control_s4_manual_remove_without_obligation
+          --expect w3h_1357_control_s4_manual_remove_without_obligation=GREEN
+          --require w3h_1357_red_s4_idle_revocation_one_admin_home
+          --expect w3h_1357_red_s4_idle_revocation_one_admin_home=GREEN
+          --require w3h_1357_control_s4_self_leave_then_revocation
+          --expect w3h_1357_control_s4_self_leave_then_revocation=GREEN
+          --require w3h_1357_red_s4_restart_intake_prepare
+          --expect w3h_1357_red_s4_restart_intake_prepare=GREEN
+          --require w3h_1357_red_s4_designated_late_observation
+          --expect w3h_1357_red_s4_designated_late_observation=GREEN
+          --require w3h_1357_red_s4_designated_stalled_a_fallback
+          --expect w3h_1357_red_s4_designated_stalled_a_fallback=GREEN
+          --require w3h_1357_control_s4_designated_no_early_sibling
+          --expect w3h_1357_control_s4_designated_no_early_sibling=GREEN
+          --require w3h_1357_s4_certificate_rebind_pre_cutoff
+          --expect w3h_1357_s4_certificate_rebind_pre_cutoff=GREEN
+          --require w3h_1357_s4_certificate_rebind_post_cutoff
+          --expect w3h_1357_s4_certificate_rebind_post_cutoff=GREEN
+          --require w3h_1357_s4_owner_recovery
+          --expect w3h_1357_s4_owner_recovery=GREEN
+          --require w3h_1357_s4_owner_recovery_revoked_member_1973
+          --expect w3h_1357_s4_owner_recovery_revoked_member_1973=GREEN
+          --require w3h_1357_s4_owner_recovery_expired_member_2004
+          --expect w3h_1357_s4_owner_recovery_expired_member_2004=GREEN
+          --require w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes
+          --expect w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes=RED
+          --require w3h_1023_restart_one_holder_online_admits
+          --expect w3h_1023_restart_one_holder_online_admits=GREEN
+          --require w3h_1023_control_holders_never_return_fail_closed
+          --expect w3h_1023_control_holders_never_return_fail_closed=GREEN
+          --require w3h_1023_control_holder_returns_recovers
+          --expect w3h_1023_control_holder_returns_recovers=GREEN
+          --require w3h_1356_red_s3_aligned_stale_joiner_catches_up
+          --expect w3h_1356_red_s3_aligned_stale_joiner_catches_up=GREEN
+          --require w3h_1356_control_s3_attestation_touches_only_the_subject
+          --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
+          --require w3h_1356_control_s3_d7_request_flood_rate_limited
+          --expect w3h_1356_control_s3_d7_request_flood_rate_limited=GREEN
+          --require w3h_1356_control_s3_d6_provisional_ata_bogus_hashes
+          --expect w3h_1356_control_s3_d6_provisional_ata_bogus_hashes=GREEN
+          --require w3h_1356_control_s3_s64_segment_boundary
+          --expect w3h_1356_control_s3_s64_segment_boundary=GREEN
+          --require w3h_1356_control_s3_s_two_link_segments_across_a_restart
+          --expect w3h_1356_control_s3_s_two_link_segments_across_a_restart=GREEN
+          --require w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix
+          --expect w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix=GREEN
+          --require w3h_1356_control_s3_q_joiner_unreadable_sidecar
+          --expect w3h_1356_control_s3_q_joiner_unreadable_sidecar=GREEN
+          --require w3h_1356_control_s3_q_member_unreadable_sidecar
+          --expect w3h_1356_control_s3_q_member_unreadable_sidecar=GREEN
+          --require w3h_1356_control_s3_q3_issuer_unreadable_sidecar
+          --expect w3h_1356_control_s3_q3_issuer_unreadable_sidecar=GREEN
+          --require w3h_1356_control_s3_q2_sidecar_fault_cases
+          --expect w3h_1356_control_s3_q2_sidecar_fault_cases=GREEN
+          --require w3h_1356_control_s3_r_beyond_retention
+          --expect w3h_1356_control_s3_r_beyond_retention=GREEN
+          --require w3h_1356_control_s3_r_replay_benign
+          --expect w3h_1356_control_s3_r_replay_benign=GREEN
+          --require w3h_1356_red_s3_forked_node_shows_reseat_required
+          --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
+          --require w3h_1356_control_s3_forked_node_not_auto_recovered
+          --expect w3h_1356_control_s3_forked_node_not_auto_recovered=GREEN
+          --require w3h_1356_red_s3_manual_reseat_recovers_forked_node
+          --expect w3h_1356_red_s3_manual_reseat_recovers_forked_node=GREEN
+          --require w3h_1356_red_s3_b_provisional_admin_ata_promotes
+          --expect w3h_1356_red_s3_b_provisional_admin_ata_promotes=GREEN
+          --require w3h_1356_red_s3_t_typed_waits_name_their_cause
+          --expect w3h_1356_red_s3_t_typed_waits_name_their_cause=GREEN
+          --require w3h_1356_red_s3_t_deferred_until_host_commit
+          --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
+          --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
+          --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
+          --require w3h_1356_control_s3_d4_reseat_route_refusals
+          --expect w3h_1356_control_s3_d4_reseat_route_refusals=GREEN
+          --require w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node
+          --expect w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node=GREEN
+          --require w3h_1356_red_s3_c2_reseat_retires_marker_and_gap
+          --expect w3h_1356_red_s3_c2_reseat_retires_marker_and_gap=GREEN
+          --require w3h_1356_control_s3_c3_owner_reseats_owner_axis_node
+          --expect w3h_1356_control_s3_c3_owner_reseats_owner_axis_node=GREEN
+          --require w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node
+          --expect w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node=GREEN
+          --require w3h_1356_control_s3_d3_authorisation_refusals_typed
+          --expect w3h_1356_control_s3_d3_authorisation_refusals_typed=GREEN
+          --require w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed
+          --expect w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed=GREEN
+          --require w3h_1356_control_s3_d2_fork_exposure_contained
+          --expect w3h_1356_control_s3_d2_fork_exposure_contained=GREEN
+          --require w3h_1666_control_certificate_only_admin_seals
+          --expect w3h_1666_control_certificate_only_admin_seals=GREEN
+          --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
+          --expect w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless=GREEN
+          --require w3h_1581_s4_ordinary_admin_revoked
+          --expect w3h_1581_s4_ordinary_admin_revoked=GREEN
+          --require w3h_1581b_control_dropped_eager_frame_retry_floor
+          --expect w3h_1581b_control_dropped_eager_frame_retry_floor=GREEN
+          --require w3h_1581b_red_dropped_eager_frame_total_a_loss
+          --expect w3h_1581b_red_dropped_eager_frame_total_a_loss=GREEN
+          --require w3h_1581c_control_restart_stale_head_resume
+          --expect w3h_1581c_control_restart_stale_head_resume=GREEN
+          --require w3h_1581c_red_restart_stale_head_no_sync_past_wait
+          --expect w3h_1581c_red_restart_stale_head_no_sync_past_wait=GREEN
+          --require w3h_1581e_red_crash_commit_fork_contained
+          --expect w3h_1581e_red_crash_commit_fork_contained=RED
+          --require w3h_1581e_control_crash_commit_same_chain_resume
+          --expect w3h_1581e_control_crash_commit_same_chain_resume=GREEN
+          --require w3h_1581f_control_local_authority_exit_revoked_committer
+          --expect w3h_1581f_control_local_authority_exit_revoked_committer=GREEN
+          --require w3h_1581f_red_local_authority_exit_demoted_form
+          --expect w3h_1581f_red_local_authority_exit_demoted_form=GREEN
+          --require w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds
+          --expect w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds=GREEN
+          --require w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume
+          --expect w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume=GREEN
+          --require w3h_1581g_control_sidecar_lifecycle_pending_resume_forms
+          --expect w3h_1581g_control_sidecar_lifecycle_pending_resume_forms=GREEN
+          --require w3h_1581d_control_evidence_holder_resume_after_holder_returns
+          --expect w3h_1581d_control_evidence_holder_resume_after_holder_returns=GREEN
+          --require w3h_1581d_red_evidence_holder_all_holders_offline
+          --expect w3h_1581d_red_evidence_holder_all_holders_offline=GREEN
+          --require w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion
+          --expect w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion=INFRA
+          --require w3h_1581d_control_completion_past_the_budget_is_red
+          --expect w3h_1581d_control_completion_past_the_budget_is_red=RED
+          --require w3h_1581h_control_sidecar_rebuild_body_damage_rederives
+          --expect w3h_1581h_control_sidecar_rebuild_body_damage_rederives=GREEN
+          --require w3h_1581h_control_sidecar_rebuild_newer_file_memory_only
+          --expect w3h_1581h_control_sidecar_rebuild_newer_file_memory_only=GREEN
+          --require w3h_1581i_control_machine_revoked_device_keeps_its_seat
+          --expect w3h_1581i_control_machine_revoked_device_keeps_its_seat=GREEN
+          --require w3h_1581i_egress_machine_revoked_device_gets_no_new_key
+          --expect w3h_1581i_egress_machine_revoked_device_gets_no_new_key=RED
+          --require w3h_1581j_expiry_skew_run1_all_offsets_zero
+          --expect w3h_1581j_expiry_skew_run1_all_offsets_zero=GREEN
+          --require w3h_1581j_expiry_skew_run5a_announced_renewal_rebinds_at_expiry
+          --expect w3h_1581j_expiry_skew_run5a_announced_renewal_rebinds_at_expiry=GREEN
+          --require w3h_1581j_expiry_skew_run8_signed_public
+          --expect w3h_1581j_expiry_skew_run8_signed_public=GREEN
+          --require w3h_1581k_staged_join_machine_revoked_device_gets_no_key
+          --expect w3h_1581k_staged_join_machine_revoked_device_gets_no_key=GREEN
+          --require w3h_1581k_staged_join_agent_revoked_gets_no_key
+          --expect w3h_1581k_staged_join_agent_revoked_gets_no_key=GREEN
+          --require w3h_1581k_control_staged_join_unrevoked_gets_its_key
+          --expect w3h_1581k_control_staged_join_unrevoked_gets_its_key=GREEN
+          --require w3h_1581m_recovery_not_needed_while_d_is_eligible
+          --expect w3h_1581m_recovery_not_needed_while_d_is_eligible=GREEN
+          --require w3h_1581m_recovery_offline_promotee_commits_on_return
+          --expect w3h_1581m_recovery_offline_promotee_commits_on_return=GREEN
+          --require w3h_1581m_recovery_refuses_a_revoked_member
+          --expect w3h_1581m_recovery_refuses_a_revoked_member=GREEN
+          --require w3h_1765_red_newer_file_revocation_waits_for_store_write
+          --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
+          --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
+          --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome=GREEN
+          --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed2
+          --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed2=GREEN
+          --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed4
+          --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed4=GREEN
+          --require w3h_1623_red_pre_welcome_joiner_applies_removal_and_ban_links
+          --expect w3h_1623_red_pre_welcome_joiner_applies_removal_and_ban_links=GREEN
+
+      # A shard can upload traces and still exit non-zero (runner error
+      # after the cases). The gate above already fails a short or unstable
+      # case. This step fails the summary check for any other shard failure.
+      - name: Fail unless every shard succeeded
+        if: needs.w3h-shard.result != 'success'
+        run: |
+          echo "W3-H shard matrix result: ${{ needs.w3h-shard.result }}"
+          exit 1
+
+      # Traces, receipts, per-thread entropy stats and raw payload dumps
+      # (test identities only; the `w3h-gate` profile is the only producer
+      # of payload dumps, at most two per case, each capped at 32 MiB).
+      - name: Upload W3-H traces
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: w3h-traces
+          path: target/w3h/traces/
+          if-no-files-found: warn
+          retention-days: 7
+
+  test-windows:
+    name: Test Suite (Windows)
+    runs-on: windows-latest
+    # Every other test lane gives libtest threads 16 MiB (.config/nextest.toml,
+    # scripts/ci/isolated-runtime.py). This job runs plain `cargo test`, so its
+    # test threads had the 2 MiB default: after #2056 (ant-quic 0.28.0)
+    # `reserve_during_drain_is_refused_until_the_supervisor_finishes`, which
+    # awaits `serve_with_options` three times, overflowed it
+    # (STATUS_STACK_OVERFLOW, job 134966531122). #2083 shrank the serve
+    # frames, and that test now runs on an explicit 2 MiB thread in every
+    # lane; the 16 MiB default stays for the rest of this job.
+    env:
+      RUST_MIN_STACK: "16777216"
+    steps:
+      - uses: actions/checkout@v5
+
+      # #894: scripts/install.ps1 must at least parse under both Windows
+      # PowerShell 5.1 (what `irm | iex` runs on a stock machine) and pwsh 7.
+      - name: Parse-check scripts/install.ps1
+        shell: pwsh
+        run: |
+          $check = '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1).Path, [ref]$null, [ref]$e); if ($e) { $e | Out-String | Write-Host; exit 1 }'
+          foreach ($exe in @('powershell', 'pwsh')) {
+            & $exe -NoProfile -Command $check
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed to parse under $exe" }
+          }
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-target-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-test-
+
+      # #661 / #645 bullet 4: the Windows contention path used to be
+      # compile-only in CI (the Build matrix links it; nothing ran it).
+      # `cargo test --lib` did not even compile on Windows until the
+      # unix-only adr0028 control modules were cfg-gated. Compile the whole
+      # lib test suite, then run the instance-lock family so the Windows
+      # share-mode guard finally executes in CI.
+      - name: Compile the lib test suite
+        run: cargo test --lib --no-run
+
+      - name: Run the instance-lock suite
+        run: cargo test --lib instance_lock
+
+      # #2083: x0xd runs its daemon future on an explicit 8 MiB thread, not on
+      # the 1 MiB Windows main thread. One test serves a hermetic loopback
+      # daemon (no bootstrap peers, no mDNS, no port mapping) through
+      # `run_daemon_runtime` from a 256 KiB caller thread. One re-runs itself
+      # in a child with RUST_MIN_STACK removed and touches 3 MiB of stack on
+      # the daemon thread and on a worker, so it fails if either explicit
+      # size is lost, whatever this job's RUST_MIN_STACK is. One checks that a
+      # daemon-thread panic is returned as an error.
+      - name: Run the daemon-runtime suite
+        run: cargo test --lib daemon_runtime
+
+      # #1588: the Windows flush owner (named pipe, boot clock, record
+      # directory barrier) and the `x0x start --foreground` exit propagation
+      # were compile-only. These selectors are inert: temp dirs, local pipes
+      # and child `cmd` processes only, no daemon and no network.
+      - name: Run the Windows flush-owner suite
+        run: cargo test --lib windows_exec_regressions
+
+      - name: Run the upgrade journal integration tests
+        run: cargo test --test upgrade_journal
+
+  coverage:
+    name: Coverage Gate
+    runs-on: ubuntu-latest
+    # 150 min holds the serialised build below: the full job measured
+    # 75m48s (job 130877153343) and 64m21s on a same-head rerun (job
+    # 130941943108). The parallel baseline, job 130773703573, compiled
+    # for 11m26s (20:04:45 to 20:16:11), then ran 8573 tests in about
+    # 27.5 min. Its disk banners (20:04:41 to 20:45:23) bracket the
+    # whole nextest call, so they are build plus tests, not the compile
+    # alone.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      # The coverage compile died with "No space left on device" before any
+      # later cleanup could run (jobs 117343704258, 117354063249, 117363548428).
+      # Preinstalled SDKs are not inputs. Removing them is the headroom.
+      - name: Free preinstalled runner disk
+        run: |
+          echo "=== disk before freeing preinstalled tools ==="
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/share/vcpkg \
+            /opt/az \
+            /usr/local/.ghcup \
+            /usr/share/miniconda \
+            /usr/local/graalvm \
+            /usr/local/share/boost \
+            || true
+          sudo apt-get clean || true
+          echo "=== disk after freeing preinstalled tools ==="
+          df -h
+
+      - name: Record disk before dependency restore
+        run: |
+          echo "=== disk before dependency restore ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+
+      # Exact Rust 1.95.0 and lockfile namespace. coverage-v2 does not match
+      # coverage-v1 or the old target-coverage- prefix. No restore-keys: a
+      # broader restore puts another dependency graph on the runner, and the
+      # rebuild fills the disk (job 117354063249). The instrumented target is
+      # not cached. Main's clean build already leaves no room to archive it
+      # (run 39011430228, zstd error 70 on the target cache save).
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-rust-1.95.0-coverage-v2-registry-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-coverage-v2-git-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Record disk after dependency restore
+        run: |
+          echo "=== disk after dependency restore ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+          # Incremental objects and raw profiles are retained build output.
+          # They are not inputs for this coverage run.
+          rm -rf target/debug/incremental target/release/incremental target/llvm-cov-target
+          if [ -d target ]; then
+            find target -name '*.profraw' -delete
+          fi
+          echo "=== disk after cutting retained artifacts ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Upload before the compile. A worker that dies in the gate keeps this
+      # artifact; the job log does not survive a full disk.
+      - name: Publish coverage preflight
+        run: |
+          mkdir -p "$RUNNER_TEMP/coverage-preflight"
+          {
+            echo "=== coverage preflight ==="
+            df -h
+            df -P /
+            du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+          } | tee "$RUNNER_TEMP/coverage-preflight/disk.txt"
+
+      - name: Upload coverage preflight
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-preflight
+          path: ${{ runner.temp }}/coverage-preflight/disk.txt
+          if-no-files-found: error
+
+      - name: Run line coverage gate
+        # Filter timing-flaky binaries from the coverage run only — they
+        # keep running in the Test Suite + integration tiers. See the
+        # per-binary reasons below (#607); a flake here must not abort the
+        # coverage computation:
+        #   * x0x_0041_synthetic_kill_restart — documented, matches Test Suite.
+        #   * x0x_0041_prefer_newest_test — sibling binary; the
+        #     direct_send_reissues_on_replaced_connection_within_500ms test's 2s
+        #     lifecycle_deadline is exceeded under coverage contention (#148).
+        #     Same class as #139; excluded here only — keeps running in the Test
+        #     Suite + integration tiers (binary()-scoped, not test()-scoped).
+        #   * named_group_join_metadata_event — gossip-convergence forgery tests
+        #     (e.g. forged_member_joined_*) poll a rejection counter that can
+        #     exceed the wait window under coverage; the same code paths are
+        #     covered by named_group_integration + the x0xd unit tests.
+        #
+        # Coverage ratchet (issue #124, plan WS1.3). The floor is the kill
+        # switch: it must sit just below *current* actual so a coverage
+        # regression fails CI before it merges. Bump cadence: raise this floor
+        # +3–5 percentage points every release toward the 70% target. Each
+        # ratchet bump MUST be accompanied by targeted tests (priority order:
+        # exec ACL denial paths → auth middleware → storage/identity error
+        # paths → shutdown ordering) or a documented entry in
+        # docs/coverage-exclusions.md — never lower the floor to make a red
+        # run green.
+        #   tranche 1 (#140): 48 → 65.0  (auth-matrix; actual 66.46%)
+        #   tranche 2 (#141): 65.0 → 65.6 (exec-ACL denials; actual 66.61%)
+        #   tranche 3 (#124): 65.6 → 65.7 (storage/identity errors; actual 66.70%)
+        run: |
+          disk_snapshot() {
+            echo "=== disk: $1 ==="
+            df -h
+            du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+          }
+          cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
+          source "$RUNNER_TEMP/coverage-env.sh"
+          # Incremental objects are retained build output, not coverage data.
+          export CARGO_INCREMENTAL=0
+          # Full debuginfo is retained object size, not line data. Workspace
+          # members keep line tables so the 65.7 line floor still maps.
+          # Dependencies are not workspace members; they keep no debuginfo.
+          # This file is runner-local. It is not a committed Cargo config.
+          mkdir -p .cargo
+          {
+            echo '[profile.dev]'
+            echo 'debug = "line-tables-only"'
+            echo 'incremental = false'
+            echo
+            echo '[profile.dev.package."*"]'
+            echo 'debug = false'
+            echo
+            echo '[profile.test]'
+            echo 'debug = "line-tables-only"'
+            echo 'incremental = false'
+            echo
+            echo '[profile.test.package."*"]'
+            echo 'debug = false'
+          } > .cargo/config.toml
+          cargo llvm-cov clean --workspace
+          disk_snapshot "before coverage compilation"
+          # #607: --no-fail-fast + exit capture. A red test must not abort
+          # the step before the report/ratchet below (bash -e would), and the
+          # remaining tests' profile data must still be produced. The job
+          # still fails on it — see the status merge at the end.
+          # #1862: one build job for the instrumented compile. Three
+          # coverage runs died before a test ran on 10 Nov 2026: #1855
+          # runs 42894312156 and 42902863828 stopped with exit 143
+          # about 13 min into the compile (12m55s and 13m09s), and the
+          # main rerun of 42875909838 lost its runner. The w3h shards
+          # and the property tests hit the same 143 class inside
+          # `cargo nextest list` and fixed it with `--build-jobs 1`
+          # (see the shard job above and integration.yml). The default
+          # was 4 concurrent rustc/link jobs on the 4 vCPUs; one at a
+          # time cuts the peak from about 4 to 1. The isolated run
+          # reuses these binaries, so only this host build is serialised.
+          coverage_test_status=0
+          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --workspace -- --no-fail-fast -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)' || coverage_test_status=$?
+          disk_snapshot "after coverage compilation"
+          # #607: report and ratchet are still ATTEMPTED after a red test
+          # pass; their own failures are captured the same way.
+          coverage_report_status=0
+          cargo llvm-cov report --workspace --lcov --output-path lcov.info --fail-under-lines 65.7 || coverage_report_status=$?
+          coverage_ratchet_status=0
+          python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global || coverage_ratchet_status=$?
+          # Any phase failure fails the job; the first nonzero phase exit
+          # becomes the job's exit code (test → report → ratchet).
+          status="$coverage_test_status"
+          if [ "$status" -eq 0 ]; then status="$coverage_report_status"; fi
+          if [ "$status" -eq 0 ]; then status="$coverage_ratchet_status"; fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::coverage gate failed (test=$coverage_test_status report=$coverage_report_status ratchet=$coverage_ratchet_status)" >&2
+          fi
+          exit "$status"
+
+      - name: Cut retained coverage artifacts
+        if: always()
+        run: |
+          echo "=== disk before cutting retained coverage artifacts ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+          rm -rf target/debug/incremental target/release/incremental target/llvm-cov-target
+          if [ -d target ]; then
+            find target -name '*.profraw' -delete
+          fi
+          # Crate sources are needed only while compiling. The registry
+          # cache keeps the downloaded crates.
+          rm -rf "${HOME}/.cargo/registry/src"
+          avail_kb="$(df -P . | awk 'NR==2 {print $4}')"
+          echo "available_kb=${avail_kb}"
+          # A restored instrumented target plus the next compile does not
+          # fit when less than 8 GiB remains. Drop the retained deps.
+          if [ "${avail_kb}" -lt 8388608 ]; then
+            echo "free space below 8 GiB; removing retained target deps"
+            rm -rf target/debug/deps target/release/deps
+          fi
+          echo "=== disk after cutting retained coverage artifacts ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+
+      - name: Upload LCOV report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: lcov-info
+          path: lcov.info
+          if-no-files-found: error

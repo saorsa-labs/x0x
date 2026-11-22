@@ -254,6 +254,18 @@ opt-level = 0
 # Keep CI's non-incremental codegen units small; the job bounds parallel work.
 codegen-units = 256
 
+# The hosted `Test Suite` job (ci.yml) builds the library unit tests with
+# this profile so the build fits a 16 GB GitHub-hosted runner. It keeps the
+# `test` crypto overrides above.
+[profile.ci-hosted]
+inherits = "test"
+debug = 0
+lto = "off"
+
+[profile.ci-hosted.package.x0x]
+opt-level = 0
+codegen-units = 256
+
 [profile.release-profiling]
 inherits = "release"
 debug = "line-tables-only"

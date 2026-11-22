@@ -37,9 +37,44 @@ fn seat_member(
     hex
 }
 
+/// The ids of the detached tasks that are registered now.
+fn detached_ids(state: &AppState) -> std::collections::HashSet<tokio::task::Id> {
+    state
+        .detached_tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(tokio::task::JoinHandle::id)
+        .collect()
+}
+
+/// Join the detached tasks registered after `known` was taken.
+async fn join_detached_since(state: &AppState, known: &std::collections::HashSet<tokio::task::Id>) {
+    let spawned: Vec<_> = {
+        let mut guard = state.detached_tasks.lock().unwrap();
+        let tasks = guard.as_mut().unwrap();
+        let (new, old) = std::mem::take(tasks)
+            .into_iter()
+            .partition(|task| !known.contains(&task.id()));
+        *tasks = old;
+        new
+    };
+    for task in spawned {
+        task.await.unwrap();
+    }
+}
+
 /// Store `info`, sign the recovery mandate for this node, and run one
-/// commit attempt. Returns the stable id and the mandate's `next_at`
-/// before the attempt.
+/// commit attempt. Returns the stable id and the clock just before the
+/// attempt.
+///
+/// The mandate route spawns its own `drive`, and that makes a commit
+/// attempt too. It is joined before the head is synced. Unjoined, it could
+/// run inside `sync_head`'s paused-clock advance, refuse on the unsynced
+/// head and set `next_at` to the same paused instant this attempt later
+/// sets, so the retry-time check failed although this attempt recorded
+/// its refusal (seen on a loaded hosted runner, PR #2169).
 async fn commit_attempt(state: &Arc<AppState>, info: &mut GroupInfo) -> (String, Instant) {
     info.recompute_state_hash();
     let stable = info.stable_group_id().to_string();
@@ -50,10 +85,12 @@ async fn commit_attempt(state: &Arc<AppState>, info: &mut GroupInfo) -> (String,
         .insert(stable.clone(), info.clone());
     let owner = state.agent.identity().user_keypair().unwrap();
     let local_hex = hex::encode(state.agent.identity().agent_keypair().agent_id().as_bytes());
+    let known = detached_ids(state);
     let (status, Json(body)) = sign_recovery_mandate(state, owner, &stable, &local_hex).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    join_detached_since(state, &known).await;
     sync_head(state, info).await;
-    let before = pending_field(state, &stable, |p| p.next_at).await;
+    let before = Instant::now();
     try_commit(state, &stable).await;
     (stable, before)
 }
@@ -74,7 +111,8 @@ async fn pending_field<T>(
 }
 
 /// The seal refusal recorded its wait: a commit attempt that returned
-/// before the seal leaves `next_at` where the mandate put it.
+/// before the seal leaves `next_at` where an earlier attempt put it,
+/// before `before`.
 async fn assert_seal_refusal_recorded(state: &Arc<AppState>, stable: &str, before: Instant) {
     let after = pending_field(state, stable, |p| p.next_at).await;
     assert!(
