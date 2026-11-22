@@ -275,6 +275,9 @@ jobs:
       - name: Coverage Gate step controls
         run: bash scripts/ci/test_coverage_gate.sh
 
+      - name: Windows flush-owner acceptance controls
+        run: python3 -B scripts/ci/test_windows_flush_acceptance.py -v
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest

@@ -61,11 +61,25 @@ compiler or test error.
   2x the projection.
 - The `Inert CI script controls` job runs the script self-tests behind the `ci-full.yml` jobs (W3-H shard
   plan and trace gate, systemd acceptance, M2 signing gate, the #703 proof validator, the Coverage Gate
-  step controls) on every PR. They take seconds.
+  step controls, the Windows flush-owner acceptance controls) on every PR. They take seconds.
 - The studio1 trains run the full suite and are the merge gate.
 - `ci-full.yml` runs the heavy jobs nightly on `main` and on `workflow_dispatch` for any branch. They gate
   neither merges nor releases. That includes `Test Suite (Windows)` and the `Coverage Gate`, which no
   longer run on PRs at all.
+- `Test Suite (Windows)` ends with the Windows flush-owner acceptance (#1764),
+  `scripts/ci/windows-flush-acceptance.ps1`. It builds `x0xd` and `x0x`, makes the wrapper with the real
+  `x0x autostart --name accept1764` (then deletes the logon task it registers), and runs the real `x0xd`
+  under that wrapper with an isolated loopback config: no seeds, no mDNS, no port mapping, no update
+  check. It checks that the flush owner starts and serves its named pipe at the derived name, that the
+  pipe server is `x0xd`, that the API token is checked, that a second non-admin local user (made with
+  `net user` for the run) is refused by the pipe DACL while it can open an Everyone pipe, that an ordinary
+  stop ends `x0xd` and the wrapper with exit 0, that the wrapper restarts a stub child after exit 100 and
+  75 and then propagates exit 3, and that the record directory barrier passes on NTFS. The evidence
+  (`summary.json`, the wrapper, the config, the daemon log, the second-user result) is the
+  `windows-flush-acceptance` artifact. It runs no supervised apply: there is no signed test release for
+  it to download, so it does not prove a real exit-100 upgrade or an exit-75 restore. Its literal
+  inputs (wrapper markers, daemon messages, pipe name rule, request fields) are checked on every PR by
+  `scripts/ci/test_windows_flush_acceptance.py`.
 - The 20 W3-H reruns that D196 (A08) requires for a harness case are not automatic on a PR. Someone must
   dispatch `CI (full)` on the PR branch by hand.
 - `integration.yml`, `build.yml` and `security.yml` still run on every PR (ADR 0087 rule 1).

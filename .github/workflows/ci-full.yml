@@ -1230,14 +1230,22 @@ jobs:
 
       # #894: scripts/install.ps1 must at least parse under both Windows
       # PowerShell 5.1 (what `irm | iex` runs on a stock machine) and pwsh 7.
-      - name: Parse-check scripts/install.ps1
+      # #1764: the flush-owner acceptance scripts run under pwsh 7 (main) and
+      # Windows PowerShell 5.1 (the second-user client); parse both early.
+      - name: Parse-check the PowerShell scripts
         shell: pwsh
         run: |
-          $check = '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1).Path, [ref]$null, [ref]$e); if ($e) { $e | Out-String | Write-Host; exit 1 }'
-          foreach ($exe in @('powershell', 'pwsh')) {
-            & $exe -NoProfile -Command $check
-            if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed to parse under $exe" }
+          $scripts = @('scripts/install.ps1', 'scripts/ci/windows-flush-acceptance-peer.ps1')
+          foreach ($script in $scripts) {
+            $check = "`$e = `$null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path '$script').Path, [ref]`$null, [ref]`$e); if (`$e) { `$e | Out-String | Write-Host; exit 1 }"
+            foreach ($exe in @('powershell', 'pwsh')) {
+              & $exe -NoProfile -Command $check
+              if ($LASTEXITCODE -ne 0) { throw "$script failed to parse under $exe" }
+            }
           }
+          $e = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/ci/windows-flush-acceptance.ps1').Path, [ref]$null, [ref]$e)
+          if ($e) { $e | Out-String | Write-Host; throw 'windows-flush-acceptance.ps1 failed to parse under pwsh' }
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
@@ -1300,6 +1308,35 @@ jobs:
 
       - name: Run the upgrade journal integration tests
         run: cargo test --test upgrade_journal
+
+      # #1764: process-level acceptance of the flush owner on this hosted
+      # Windows Server runner. The real x0xd runs under the real
+      # `x0x autostart` v2 wrapper with an isolated loopback config (no seeds,
+      # no mDNS, no port mapping, no update check). The script checks the
+      # owner start, the pipe name and server, the token checks, a refusal for
+      # a second non-admin local user, the wrapper restart rule (stub child)
+      # and the directory barrier on NTFS. It runs no supervised apply.
+      - name: Build x0xd and x0x for the flush-owner acceptance
+        id: acceptance_build
+        if: always()
+        run: cargo build --bin x0xd --bin x0x
+
+      - name: Windows flush-owner acceptance (#1764)
+        if: always() && steps.acceptance_build.outcome == 'success'
+        shell: pwsh
+        run: >-
+          ./scripts/ci/windows-flush-acceptance.ps1
+          -X0xd target/debug/x0xd.exe -X0x target/debug/x0x.exe
+          -Evidence "$env:RUNNER_TEMP/windows-flush-acceptance"
+          -Work "$env:RUNNER_TEMP/windows-flush-acceptance-work"
+
+      - name: Upload Windows flush-owner acceptance evidence
+        if: always() && steps.acceptance_build.outcome == 'success'
+        uses: actions/upload-artifact@v5
+        with:
+          name: windows-flush-acceptance
+          path: ${{ runner.temp }}/windows-flush-acceptance/
+          if-no-files-found: error
 
   coverage:
     name: Coverage Gate
