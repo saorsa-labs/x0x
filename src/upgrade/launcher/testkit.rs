@@ -122,7 +122,7 @@ pub(super) fn bind(root: &Path, record: &journal::JournalRecord) {
         .bind(&record.transaction_id, record.generation, &record.plan)
         .unwrap();
     journal::write_auxiliary_record(
-        &root.join(plan_binding::BINDING_FILE_NAME),
+        &root.join(plan_binding::binding_file_name(&record.transaction_id)),
         &binding,
         plan_binding::validate_binding,
     )

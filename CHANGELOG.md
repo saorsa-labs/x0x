@@ -11,8 +11,9 @@ All notable changes to this project will be documented in this file.
   `--plan-anchor <path>`, which names a root-owned file that lists the
   approved install (daemon and CLI targets, and each instance id with its
   data root). Once the launcher is turned on, it starts a trial only when
-  that anchor checks and a new `upgrade-plan-binding.json` beside the host
-  journal binds the journal's transaction and plan to it; otherwise an
+  that anchor checks and a per-transaction `upgrade-plan-binding.<key>.json`
+  beside the host journal binds the journal's transaction and plan to it;
+  otherwise an
   in-flight journal is a refusal (exit 78). The prepare producer refuses a
   plan the anchor does not name and writes the binding before the journal.
   The binding limits which install a plan can name; it does not

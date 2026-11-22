@@ -498,23 +498,37 @@ fields), so two more records bind it (`upgrade::plan_binding`):
   The launcher argv names it with `--plan-anchor <absolute path>`. No
   installer writes one yet; the drop-in installer will (a later step of
   the launcher enable plan on #2012).
-- **Plan binding.** `<data_root>/upgrade-plan-binding.json`, mode 0600,
-  beside the journal: `{schema: 1, record_kind: "plan_binding",
+- **Plan binding.** One per transaction:
+  `<data_root>/upgrade-plan-binding.<key>.json`, mode 0600, beside the
+  journal, where `<key>` is the lowercase hex SHA-256 of the transaction id
+  (any id names one fixed-length file in the data root). It holds `{schema: 1, record_kind: "plan_binding",
   transaction_id, generation, plan_sha256, anchor_sha256}`. `plan_sha256`
   is the SHA-256 of the frozen plan's JSON (the digest the trial binding
   uses); `anchor_sha256` is the SHA-256 of the anchor file's bytes.
 
 `Prepared::stage` takes the read anchor by type. It refuses a plan whose
 daemon target, CLI target, or set of (instance id, data root) is not
-exactly the anchor's, before it writes anything. It writes the binding,
-then the Staged journal. The binding stays the same for the whole
-transaction.
+exactly the anchor's, before it writes anything. It writes the new
+transaction's binding, then the Staged journal. The binding stays the same
+for the whole transaction.
 
-A leftover binding that the strict writer would refuse to replace (corrupt,
-a later schema, or a symlink) is removed first, under the host lock and
-only after the journal there is found settled or absent; a symlink is
-removed as a link and its target is not touched. Anything else at that
-path, such as a directory, refuses the stage.
+A HostCommitted or Restored journal is settled for the producer, but its
+launcher still owns a trial there and reads its binding on every start. So
+`stage` never writes or removes the binding the current journal names until
+the new journal is durable, and it refuses a transaction id equal to the
+current journal's. A crash, or a failed journal write, after the new
+binding leaves the current journal and its binding as they were, plus an
+orphan binding that no journal names.
+
+Orphans (bindings of neither the current nor the new transaction) are
+removed under the host lock before the new binding is written, and every
+binding but the new one after the new journal is written, so at most two
+binding files exist at any time. Removal is best effort; a leftover is
+harmless and the next stage retries. At the new transaction's own path, a
+leftover the strict writer would refuse to replace is removed first: any
+regular file it cannot read as a binding (corrupt, a later schema, or a
+read that fails, EACCES or EIO included) or a symlink (removed as a link;
+its target is not touched). A directory there refuses the stage.
 
 The issuer checks both only where it would give a trial. Each failure is a
 typed refusal (78):
@@ -526,9 +540,11 @@ typed refusal (78):
 - the anchor, opened once without following a symlink, is not a regular
   file of root that no group or other account can write, is over 64 KiB,
   or does not parse as schema 1;
-- the binding, opened through the checked host root without following a
-  symlink, is missing or not a 0600 regular file of the launcher's
-  account;
+- the binding named by the journal's transaction id, opened through the
+  checked host root without following a symlink, is missing, cannot be
+  opened by the launcher's account, or is not a 0600 regular file of that
+  account. It is read under the same daemon install lock as the journal,
+  so no stage can change it between the two reads;
 - the binding names another transaction, generation, plan or anchor, or
   the plan names another install pair or other participants than the
   anchor.

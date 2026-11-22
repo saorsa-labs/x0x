@@ -10,8 +10,9 @@
 //!   `--plan-anchor <path>`. Root owns it, no group or other account can
 //!   write it or any directory above it, so the daemon's account cannot
 //!   change it.
-//! - The **plan binding**: a sidecar `upgrade-plan-binding.json` beside the
-//!   journal, written by the prepare producer before the Staged journal.
+//! - The **plan binding**: a sidecar `upgrade-plan-binding.<key>.json`
+//!   beside the journal, one per transaction (`binding_file_name`), written
+//!   by the prepare producer before the Staged journal.
 //!   It holds the transaction, the generation, the SHA-256 of the frozen
 //!   plan and the SHA-256 of the anchor the plan was checked against.
 //!
@@ -43,8 +44,39 @@ use sha2::{Digest, Sha256};
 
 use super::journal::{FrozenPlan, JournalRecord};
 
-/// The sidecar beside each host journal.
-pub(crate) const BINDING_FILE_NAME: &str = "upgrade-plan-binding.json";
+/// The sidecar's file name starts with this, then the transaction key,
+/// then [`BINDING_SUFFIX`].
+pub(crate) const BINDING_PREFIX: &str = "upgrade-plan-binding.";
+pub(crate) const BINDING_SUFFIX: &str = ".json";
+
+/// The plan binding's file name for one transaction:
+/// `upgrade-plan-binding.<sha256(transaction id) in hex>.json`.
+///
+/// Each transaction has its own binding (#2171 review), so a new
+/// transaction never replaces the binding the current journal names: a
+/// crash between the new binding and the new journal leaves the current
+/// pair intact. The name is a hash of the id, so any id (a path
+/// separator, `..`, any length, any text) maps to one fixed-length name
+/// in the data root, and two ids collide only if SHA-256 does.
+pub(crate) fn binding_file_name(transaction_id: &str) -> String {
+    let digest = Sha256::digest(transaction_id.as_bytes());
+    let mut name = String::with_capacity(BINDING_PREFIX.len() + 64 + BINDING_SUFFIX.len());
+    name.push_str(BINDING_PREFIX);
+    for byte in digest {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name.push_str(BINDING_SUFFIX);
+    name
+}
+
+/// Whether `name` has the shape of a plan binding's file name.
+pub(crate) fn is_binding_file_name(name: &str) -> bool {
+    name.strip_prefix(BINDING_PREFIX)
+        .and_then(|rest| rest.strip_suffix(BINDING_SUFFIX))
+        .is_some_and(|key| {
+            key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
 /// Upper bound on the anchor's and the binding's size.
 pub(crate) const MAX_BYTES: u64 = 64 * 1024;
 const SCHEMA: u32 = 1;
@@ -249,6 +281,8 @@ fn valid_instance(id: &str) -> bool {
 
 /// The uid that owns a production anchor: root.
 pub(crate) const ANCHOR_OWNER: u32 = 0;
+// The production anchor owner is pinned to root (#2171 review).
+const _: () = assert!(ANCHOR_OWNER == 0);
 
 /// Read the plan anchor at `path`. `owner` is the account that must own
 /// the anchor and may own its ancestors besides root ([`ANCHOR_OWNER`] in
@@ -437,6 +471,46 @@ mod tests {
             serde_json::from_slice(&test_anchor_bytes(plan)).unwrap();
         edit(&mut value);
         Anchored::parse(serde_json::to_vec(&value).unwrap())
+    }
+
+    /// #2171 review: any transaction id maps to one fixed-length name in
+    /// the data root; distinct ids do not collide.
+    #[test]
+    fn hostile_transaction_ids_name_a_file_in_the_root() {
+        let long = "x".repeat(10_000);
+        let ids = [
+            "tx",
+            "tx ",
+            "../../etc/passwd",
+            "a/b",
+            "..",
+            ".",
+            "",
+            "\0",
+            "é😀",
+            long.as_str(),
+        ];
+        let mut names = BTreeSet::new();
+        for id in ids {
+            let name = binding_file_name(id);
+            assert!(is_binding_file_name(&name), "{id:?}: {name}");
+            assert_eq!(name.len(), BINDING_PREFIX.len() + 64 + BINDING_SUFFIX.len());
+            assert!(!name.contains('/') && !name.contains('\0'));
+            assert_eq!(
+                Path::new("/root").join(&name).parent(),
+                Some(Path::new("/root"))
+            );
+            assert!(names.insert(name), "{id:?} collides");
+        }
+        assert_eq!(binding_file_name("tx"), binding_file_name("tx"));
+        for other in [
+            "upgrade-plan-binding.json",
+            "upgrade-journal.json",
+            "upgrade-plan-binding.ABC.json",
+            "upgrade-plan-binding..json",
+        ] {
+            assert!(!is_binding_file_name(other), "{other}");
+        }
     }
 
     #[test]

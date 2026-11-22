@@ -87,7 +87,13 @@ impl Owners {
 /// unprivileged, so they expect their own account; a test that needs a
 /// foreign anchor passes the owner itself (`issue_owned`).
 fn anchor_owner() -> u32 {
-    if cfg!(test) {
+    anchor_owner_for(cfg!(test))
+}
+
+/// The anchor owner outside a unit test is root (pinned by
+/// `the_production_anchor_owner_is_root`).
+fn anchor_owner_for(unit_test: bool) -> u32 {
+    if unit_test {
         effective_uid()
     } else {
         plan_binding::ANCHOR_OWNER
@@ -198,6 +204,13 @@ fn issue_held(
         *held = daemon.map(|(_, lock)| lock);
         return Ok(None);
     }
+    // The binding is read under the same daemon install lock as the
+    // journal (#2171 review): a producer stages, and removes an old
+    // transaction's binding, only under that lock, so this start reads the
+    // binding of the journal it read, never one changed in between.
+    #[cfg(test)]
+    tests::before_binding_read();
+    check_binding(args, &root, &record, owners)?;
     drop(daemon);
     let participant = record
         .plan
@@ -221,7 +234,6 @@ fn issue_held(
             "launcher argv does not match its participant in the host journal",
         ));
     }
-    check_binding(args, &root, &record, owners)?;
     // Canonical install and participant paths (`Host::new`). A plan path
     // that is not canonical stays so on a restart: `Host::new` returns a
     // typed refusal (78). A missing path may appear by itself (a data root
@@ -428,7 +440,8 @@ fn check_binding(
             error
         }
     })?;
-    let bytes = match read_owned_at(root, plan_binding::BINDING_FILE_NAME, owners.record) {
+    let name = plan_binding::binding_file_name(&record.transaction_id);
+    let bytes = match read_owned_at(root, &name, owners.record) {
         Ok(bytes) => bytes,
         Err(error) if fixed(&error) => {
             return Err(start::refused(format!("plan binding: {error}")));
@@ -650,6 +663,115 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use testkit::*;
 
+    thread_local! {
+        /// Runs once, on this thread, just before the issuer reads the
+        /// plan binding.
+        static BEFORE_BINDING_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_binding_read() {
+        if let Some(hook) = BEFORE_BINDING_READ.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[test]
+    fn the_production_anchor_owner_is_root() {
+        assert_eq!(anchor_owner_for(false), 0);
+        assert_eq!(anchor_owner_for(true), effective_uid());
+    }
+
+    /// Stage a new transaction `tx` over the journal in `root` (as the
+    /// producer does), with the journal write failing at `failure` if set.
+    fn stage_over(
+        root: &Path,
+        record: &journal::JournalRecord,
+        tx: &str,
+        failure: Option<journal::BarrierStep>,
+    ) -> io::Result<()> {
+        use super::super::prepare::{tests as producer, HostLock, Prepared};
+        let lock = HostLock::acquire_within(&record.plan, std::time::Duration::from_millis(200))?;
+        if let Some(step) = failure {
+            producer::fail_journal_write(step);
+        }
+        let anchor = plan_binding::test_anchored(&record.plan);
+        Prepared::stage(&lock, root, tx, record.plan.clone(), &anchor).map(drop)
+    }
+
+    /// #2171 review (a), (b): on a committed or restored host, which still
+    /// gives its launcher a trial, a new stage that dies after its binding
+    /// (a binding-only write, or a journal write that fails at any barrier
+    /// step) leaves a startable host: the start issues the current
+    /// transaction, or the new journal if it became durable.
+    #[test]
+    fn a_stage_that_dies_after_its_binding_leaves_a_startable_host() {
+        for phase in [journal::Phase::HostCommitted, journal::Phase::Restored] {
+            // A binding-only write for the next transaction, then a crash.
+            let (_dir, root, record) = rooted(phase);
+            let (args, command) = matching(&record);
+            let mut next = record.clone();
+            next.transaction_id = "tx-next".into();
+            let binding = plan_binding::test_anchored(&next.plan)
+                .bind(&next.transaction_id, next.generation, &next.plan)
+                .unwrap();
+            journal::write_auxiliary_record(
+                &root.join(plan_binding::binding_file_name("tx-next")),
+                &binding,
+                plan_binding::validate_binding,
+            )
+            .unwrap();
+            let issued = issue_as(&args, &command, effective_uid());
+            assert!(matches!(issued, Ok(Some(_))), "{phase:?}: binding-only");
+
+            // A real stage whose journal write fails at each barrier step.
+            for step in [
+                journal::BarrierStep::Write,
+                journal::BarrierStep::FileSync,
+                journal::BarrierStep::Rename,
+                journal::BarrierStep::DirectorySync,
+            ] {
+                let (_dir, root, record) = rooted(phase);
+                let (args, command) = matching(&record);
+                assert!(stage_over(&root, &record, "tx-next", Some(step)).is_err());
+                match issue_as(&args, &command, effective_uid()) {
+                    // The journal stayed: the current transaction issues.
+                    Ok(Some(issued)) => {
+                        assert_eq!(issued.host.root(), root, "{phase:?} {step:?}")
+                    }
+                    // The rename landed before the failure: the new Staged
+                    // journal is an ordinary start.
+                    Ok(None) => assert!(
+                        matches!(step, journal::BarrierStep::DirectorySync),
+                        "{phase:?} {step:?}"
+                    ),
+                    Err(error) => panic!("{phase:?} {step:?}: {error}"),
+                }
+            }
+        }
+    }
+
+    /// #2171 review (c): a stage that tries to run between the start's
+    /// journal read and its binding read cannot, because the start holds
+    /// the daemon install lock across both; it issues the journal it read.
+    #[test]
+    fn a_stage_cannot_run_between_the_journal_and_the_binding_read() {
+        let (_dir, root, record) = rooted(journal::Phase::HostCommitted);
+        let (args, command) = matching(&record);
+        let staged = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (hook_root, hook_record, hook_staged) = (root.clone(), record.clone(), staged.clone());
+        BEFORE_BINDING_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                hook_staged.set(Some(
+                    stage_over(&hook_root, &hook_record, "tx-racer", None).is_ok(),
+                ));
+            }))
+        });
+        let issued = issue_as(&args, &command, effective_uid());
+        assert_eq!(staged.get(), Some(false), "the racing stage got the lock");
+        assert!(matches!(issued, Ok(Some(_))));
+    }
+
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
     }
@@ -857,7 +979,7 @@ mod tests {
         let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
         let (args, command) = matching(&record);
         let uid = effective_uid();
-        let binding = root.join(plan_binding::BINDING_FILE_NAME);
+        let binding = root.join(plan_binding::binding_file_name(&record.transaction_id));
         let refused_for = |reason: &str| {
             let error = issue_as(&args, &command, uid).err().expect("refused");
             assert!(start::is_refusal(&error), "{error}");
@@ -873,8 +995,12 @@ mod tests {
         std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(issue_as(&args, &command, uid).unwrap().is_some());
         let dir = open_root(&root, uid).unwrap();
-        let error =
-            read_owned_at(&dir, plan_binding::BINDING_FILE_NAME, uid + 1).expect_err("foreign");
+        let error = read_owned_at(
+            &dir,
+            &plan_binding::binding_file_name(&record.transaction_id),
+            uid + 1,
+        )
+        .expect_err("foreign");
         assert!(
             error.to_string().contains("not owned by this account"),
             "{error}"
@@ -964,7 +1090,7 @@ mod tests {
                 anchor_sha256: anchored.sha256(),
             };
             journal::write_auxiliary_record(
-                &root.join(plan_binding::BINDING_FILE_NAME),
+                &root.join(plan_binding::binding_file_name(&record.transaction_id)),
                 &binding,
                 plan_binding::validate_binding,
             )
@@ -1000,7 +1126,8 @@ mod tests {
             .unwrap()
             .is_none());
         // A passthrough needs no anchor and no binding (#2012, B4).
-        std::fs::remove_file(root.join(plan_binding::BINDING_FILE_NAME)).unwrap();
+        std::fs::remove_file(root.join(plan_binding::binding_file_name(&record.transaction_id)))
+            .unwrap();
         let mut unanchored = args.clone();
         unanchored.plan_anchor = None;
         assert!(issue_as(&unanchored, &command, effective_uid())
