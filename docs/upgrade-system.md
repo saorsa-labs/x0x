@@ -495,9 +495,9 @@ fields), so two more records bind it (`upgrade::plan_binding`):
    "participants": [{"instance_id": "x0xd", "data_root": "/var/lib/x0x"}]}
   ```
 
-  The launcher argv names it with `--plan-anchor <absolute path>`. No
-  installer writes one yet; the drop-in installer will (a later step of
-  the launcher enable plan on #2012).
+  The launcher argv names it with `--plan-anchor <absolute path>`. The
+  drop-in installer (`.deployment/install.sh --launcher`) writes it; see
+  "The installer's plan anchor" below.
 - **Plan binding.** One per transaction:
   `<data_root>/upgrade-plan-binding.<key>.json`, mode 0600, beside the
   journal, where `<key>` is the lowercase hex SHA-256 of the transaction id
@@ -506,7 +506,13 @@ fields), so two more records bind it (`upgrade::plan_binding`):
   is the SHA-256 of the frozen plan's JSON (the digest the trial binding
   uses); `anchor_sha256` is the SHA-256 of the anchor file's bytes.
 
-`Prepared::stage` takes the read anchor by type. It refuses a plan whose
+`Prepared::stage` takes the read anchor by type. It holds the data root's
+stage lock (`<data_root>/upgrade-stage.lock`, mode 0600) from its journal
+read to its last binding removal, after the host lock, so two stages in
+one data root never interleave, whatever install pair each is for. Without
+it, two pairs that stage for the first time in a data root with no journal
+would hold different install locks, and each could remove the other's new
+binding. It refuses a plan whose
 daemon target, CLI target, or set of (instance id, data root) is not
 exactly the anchor's, before it writes anything. It writes the new
 transaction's binding, then the Staged journal. The binding stays the same
@@ -551,11 +557,19 @@ typed refusal (78):
   account. The journal and the binding are both read under the install
   lock of the journal plan's daemon target, taken beside that target even
   when the binary is missing (a lock that cannot be taken is a failed
-  read, 75). Every stage in this data root holds that lock, so none can
-  change the binding between the two reads;
+  read, 75). When the start does not already hold that lock it takes it,
+  reads the journal again under it, and a journal that changed in between
+  is a failed read (75). A stage that writes in this data root while this
+  journal exists is for the same install pair (a stage for another pair is
+  refused), so it holds that same lock and cannot change the binding
+  between the two reads. A lock file that is the start's own daemon lock
+  through another path (a plan target under a symlinked directory) is the
+  lock already held; the start does not wait on it;
 - the binding names another transaction, generation, plan or anchor, or
   the plan names another install pair or other participants than the
-  anchor.
+  anchor. The install pair is checked against the anchor before the start
+  creates or takes any lock file at the plan's daemon target, so a lock
+  file is created only beside the anchored daemon.
 
 A missing anchor, or one the launcher's account cannot read, is a typed
 refusal (78) too, not a failed read: root writes it in a root directory,
@@ -565,6 +579,99 @@ only; an access control list is not read (only root can set one on a
 root-owned anchor or directory). A
 passthrough needs neither file, so a unit without `--plan-anchor` (one an
 older installer wrote) still starts, but can never own a trial.
+
+#### The installer's plan anchor (#2012, dormant)
+
+`.deployment/install.sh --launcher` writes the plan anchor through
+`.deployment/launcher-dropin.py` and adds `--plan-anchor <path>` to the
+drop-in's `ExecStart`:
+
+- **One anchor per install.** The file is
+  `/etc/x0x/launcher/install-<key>.anchor.json`, where `<key>` is the first
+  16 hex digits of the SHA-256 of the canonical daemon target. Every unit
+  that runs that install names the same file. Each unit's install adds or
+  replaces its own participant (instance id, data root). A binding carries
+  one anchor digest and a plan must name every participant of the
+  install, so units that share one install (the fleet's `x0xd` and
+  `x0xd-443`, both running `/opt/x0x/x0xd`) must name byte-identical
+  anchors; one shared file makes that so. A file there for another daemon
+  target is refused.
+- **Canonical form.** The file is written with sorted keys, participants
+  sorted by instance id, a two-space indent and a final newline, so a rerun
+  that changes nothing writes the same bytes. The CLI target is the `x0x`
+  beside the daemon (resolved if it is a link); the daemon target is the
+  installed binary's canonical path.
+- **Owner and place.** Root writes it (`install.sh` runs as root), mode
+  0644, through a 0700 temporary file, fsync, rename and a directory fsync.
+  The directory is created 0755 if missing. It and every directory above it
+  must be root's and not writable by group or others (a sticky directory is
+  allowed), as the launcher checks. The path in the drop-in is canonical:
+  on macOS `/etc` is `/private/etc`.
+- **No change while a journal may be read.** A new anchor changes the
+  digest every binding of the install was made against, and the launcher
+  refuses (78) a trial whose binding does not match. So the installer
+  changes the anchor only when no data root it names, before or after,
+  holds a host journal other than an `idle` or `superseded` one (an
+  unreadable journal counts as one that may be read). Otherwise it exits
+  with "nothing changed": the anchor and the drop-in are as they were, and
+  the check runs before systemd is asked, so systemd never reloads the
+  unit without its drop-in. A rerun that leaves the same bytes is always
+  allowed.
+- **Launcher replacement.** A launcher binary that differs from the one
+  installed is written only when no data root of the install holds a
+  journal in an unsettled phase (anything but `host_committed`,
+  `restored`, `idle` and `superseded`); the old one is kept as
+  `x0x-launcher.previous` (ADR 0094 §5). Otherwise the install exits with
+  "nothing changed".
+- **Limit.** The installer does not take the data root's stage lock. An
+  anchor change and a stage that read the old anchor at the same moment can
+  still leave a binding for the old anchor, which the launcher refuses
+  (78) at the next trial start. The producer must read the anchor under
+  the stage lock once the apply path calls it (the next step of the plan).
+- **Removal.** `install.sh` without `--launcher` removes the drop-in and
+  this unit's participant from the anchor, and the file with its last
+  participant, under the same rule.
+- **A host where only some units are launcher-bound** has an anchor that
+  names only those units. A plan of that install names every running
+  participant, so it does not match and the producer refuses it: such a
+  host has no trial until every unit of the install is launcher-bound.
+- **A failure** before the drop-in is written leaves no new anchor; a
+  drop-in that cannot be written restores the anchor it replaced.
+
+`install.sh --launcher` with no path fetches the release asset
+`x0x-launcher-<platform>.tar.gz` for the installed x0xd's own version
+(`x0xd --version`; Linux x86_64 and aarch64), its `.sha256`, its GPG
+signature (`.asc`) and `SAORSA_PUBLIC_KEY.asc`. It needs curl and gpg. The
+key must have the pinned fingerprint and the signature must be a `VALIDSIG`
+of it, checked in a throwaway GnuPG home; a failure changes nothing. The
+release workflow builds `x0x-launcher` (`--features m2-launcher`) for
+linux-x64-gnu, linux-arm64-gnu, macos-x64 and macos-arm64 and ships it as
+that archive, signed with ML-DSA-65 (`.sig`) and GPG (`.asc`). It is not in
+the signed release manifest or the release custody set: self-update never
+replaces the launcher.
+
+#### Moving a data root to another install (#2012)
+
+A host journal names its install pair. A launcher whose daemon is not that
+journal's install, over that data root, refuses to start (78) with the
+reason `other-install-journal: ...`, and the producer refuses to stage
+another pair there. This happens when a data root moves to another install
+(a new daemon path) or two installs share one data root. `x0x doctor`, with
+the daemon down, shows it as its own state (`refusal_kind:
+"other-install-journal"`) with the journal's phase, transaction and install
+targets, and gives the remedy:
+
+- **Settled journal** (`host_committed`, `restored`, `idle`,
+  `superseded`): it is history for the new install. Stop the unit (every
+  unit of the old install that uses this data root), move
+  `upgrade-journal.json` and every `upgrade-plan-binding.*.json` in the
+  data root aside, then start the unit.
+- **Any other phase:** an update of the other install is still in
+  progress. Do not remove the journal. Run the other install until its
+  update settles (or its launcher restores it), then move the settled
+  journal as above.
+
+There is no command for this yet; it is a manual step.
 
 **Limit.** The binding fixes which install a plan can name: the install
 pair, the participants and their data roots. The daemon's account cannot
@@ -978,8 +1085,10 @@ The readback checks only what decides the restart. The launcher's own
 `--host-root` and `--instance` select its journal, so the readback does not
 bind them; the installer takes them from x0xd itself.
 
-`.deployment/install.sh --launcher /path/to/x0x-launcher` (off by default)
-installs the launcher next to the instance's `x0xd` and writes
+`.deployment/install.sh --launcher /path/to/x0x-launcher` (off by default;
+with no path it fetches the signed release asset) installs the launcher
+next to the instance's `x0xd`, writes the install's plan anchor ("The
+installer's plan anchor" above) and writes
 `<unit>.service.d/30-x0x-launcher.conf` (by a temporary file and a rename):
 
 ```ini
@@ -987,7 +1096,7 @@ installs the launcher next to the instance's `x0xd` and writes
 # and run `systemctl daemon-reload` to return to the direct job.
 [Service]
 ExecStart=
-ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> -- /opt/x0x/x0xd <unit args>
+ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> --plan-anchor /etc/x0x/launcher/install-<key>.anchor.json -- /opt/x0x/x0xd <unit args>
 Restart=always
 RestartPreventExitStatus=64 78
 KillMode=mixed

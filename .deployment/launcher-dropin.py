@@ -23,11 +23,37 @@ and, when systemd answers, asks it too (`systemctl daemon-reload`, then
 unit file or drop-in that shadows this one or a later drop-in that would
 undo the launcher drop-in. Any failure leaves no launcher drop-in behind, so
 the unit runs x0xd directly; install.sh then reloads systemd.
+
+The plan anchor (#2012). The trial form also names a root-owned plan anchor,
+`--plan-anchor <path>`, that the launcher checks before it gives a trial: a
+JSON file that names the approved install (the daemon and CLI targets) and
+each participant (instance id and data root). There is ONE anchor per
+install, `<anchor dir>/install-<key>.anchor.json`, where `<key>` is the first
+16 hex digits of the SHA-256 of the canonical daemon target. Every unit that
+runs that install names the same file, and each install of a unit adds or
+replaces its own participant there. A journal's plan binding carries one
+anchor digest and the plan must name every participant of the install, so
+units that share one install (the fleet's x0xd and x0xd-443) must name
+byte-identical anchors; one shared file makes that true by construction. The
+file is written in one canonical form (sorted keys and participants), so a
+rerun that changes nothing leaves the same bytes. The anchor directory and
+every directory above it must be root's and not writable by group or others
+(a sticky directory is allowed), as the launcher checks; its path is
+canonical (on macOS /etc is /private/etc).
+
+A new anchor changes the digest that every binding of the install was made
+against, and a launcher refuses (exit 78) a trial whose binding does not
+match. So the anchor is rewritten only when no data root it names, before or
+after, holds a host journal other than an idle or superseded one. Removing a
+unit's launcher drop-in (`--remove`) also removes its participant from the
+anchor, and the file with the last one, under the same rule.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import pwd
 import re
@@ -82,10 +108,27 @@ DATA_ENV = ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
 # Present when systemd is the running service manager (sd_booted(3)).
 SYSTEMD_RUNTIME = "/run/systemd/system"
 SHOW_PROPERTIES = ("LoadState", "FragmentPath", "DropInPaths", "User", "ExecStart")
+# The launcher's plan anchor (src/upgrade/plan_binding.rs).
+ANCHOR_SCHEMA = 1
+ANCHOR_KIND = "plan_anchor"
+ANCHOR_MAX_BYTES = 64 * 1024
+DEFAULT_ANCHOR_DIR = "/etc/x0x/launcher"
+JOURNAL_FILE_NAME = "upgrade-journal.json"
+# Journal phases under which no launcher reads the anchor again.
+ANCHOR_FREE_PHASES = ("idle", "superseded")
+# Journal phases of no active transaction: the launcher may be replaced
+# (ADR 0094 §5).
+SETTLED_PHASES = ("host_committed", "restored", "idle", "superseded")
 
 
 class Refused(Exception):
     pass
+
+
+class Held(Refused):
+    """A host journal holds the install as it is: the plan anchor or the
+    launcher cannot change now. Nothing was changed: the launcher, the
+    drop-in and the anchor are as they were."""
 
 
 class Settings(NamedTuple):
@@ -378,14 +421,14 @@ def render(
     home: str,
     owner: int,
     user: str,
+    anchor: str | None = None,
 ) -> str:
-    if not INSTANCE_ID.fullmatch(instance) or instance in (".", ".."):
-        raise Refused(f"instance id {instance!r} is not valid for the launcher")
-    for path in (binary, launcher):
-        if not os.path.isabs(path) or not SAFE_TOKEN.fullmatch(path):
-            raise Refused(f"{path!r} must be an absolute path without spaces or quotes")
-    if os.path.basename(launcher) != "x0x-launcher":
-        raise Refused(f"{launcher} is not named x0x-launcher")
+    return render_with_root(exec_start, binary, launcher, instance, home, owner, user, anchor)[0]
+
+
+def unit_host_root(exec_start: list[str], binary: str, home: str, owner: int, user: str) -> str:
+    """The data root the unit's x0xd reports, checked as the launcher
+    checks its host root."""
     if exec_start[0] != binary:
         raise Refused(f"the unit runs {exec_start[0]}, not {binary}")
     args = exec_start[1:]
@@ -394,21 +437,257 @@ def render(
             raise Refused("x0xd does not read --config=; use --config <absolute path>")
         if token == "--config" and not os.path.isabs(args[index + 1] if index + 1 < len(args) else ""):
             raise Refused("the unit's --config must be an absolute path (WorkingDirectory= is not used)")
-    root = check_host_root(daemon_data_root(binary, args, home, user), owner)
-    exec_start = " ".join(
-        [launcher, "--host-root", root, "--instance", instance, "--", binary, *args]
+    return check_host_root(daemon_data_root(binary, args, home, user), owner)
+
+
+def render_with_root(
+    exec_start: list[str],
+    binary: str,
+    launcher: str,
+    instance: str,
+    home: str,
+    owner: int,
+    user: str,
+    anchor: str | None = None,
+) -> tuple[str, str]:
+    """The drop-in text and the host root it names."""
+    if not INSTANCE_ID.fullmatch(instance) or instance in (".", ".."):
+        raise Refused(f"instance id {instance!r} is not valid for the launcher")
+    for path in (binary, launcher):
+        if not os.path.isabs(path) or not SAFE_TOKEN.fullmatch(path):
+            raise Refused(f"{path!r} must be an absolute path without spaces or quotes")
+    if os.path.basename(launcher) != "x0x-launcher":
+        raise Refused(f"{launcher} is not named x0x-launcher")
+    if anchor is not None and (not os.path.isabs(anchor) or not SAFE_TOKEN.fullmatch(anchor)):
+        raise Refused(f"the plan anchor {anchor!r} must be an absolute path without spaces")
+    root = unit_host_root(exec_start, binary, home, owner, user)
+    named = ["--plan-anchor", anchor] if anchor is not None else []
+    command = " ".join(
+        [launcher, "--host-root", root, "--instance", instance, *named, "--", *exec_start]
     )
-    return (
+    text = (
         "# Installed by .deployment/install.sh --launcher (#1378). Remove this file\n"
         "# and run `systemctl daemon-reload` to return to the direct job.\n"
         "[Service]\n"
         "ExecStart=\n"
-        f"ExecStart={exec_start}\n"
+        f"ExecStart={command}\n"
         "Restart=always\n"
         "RestartPreventExitStatus=64 78\n"
         "KillMode=mixed\n"
         "TimeoutStopSec=60\n"
     )
+    return text, root
+
+
+def check_anchor_dir(path: str) -> Path:
+    """The anchor directory, created (0755) if missing, in canonical form.
+    It and every directory above it must be a directory of root (or of the
+    account that runs this, which install.sh requires to be root) that no
+    group or other account can write unless it is sticky: the launcher
+    refuses an anchor under any other directory."""
+    if not os.path.isabs(path):
+        raise Refused(f"the anchor directory {path} is not absolute")
+    # Each missing directory is made 0755 whatever the umask.
+    missing = []
+    probe = Path(path)
+    while not os.path.lexists(probe):
+        missing.append(probe)
+        probe = probe.parent
+    for directory in reversed(missing):
+        os.mkdir(directory, 0o700)
+        os.chmod(directory, 0o755)
+    canonical = Path(os.path.realpath(path, strict=True))
+    owners = {0, os.geteuid()}
+    for directory in (canonical, *canonical.parents):
+        info = os.lstat(directory)
+        if not stat.S_ISDIR(info.st_mode):
+            raise Refused(f"{directory} is not a directory")
+        if info.st_uid not in owners:
+            raise Refused(f"{directory} is owned by uid {info.st_uid}, not root")
+        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            raise Refused(f"{directory} is writable by group or others")
+    if not SAFE_TOKEN.fullmatch(str(canonical)):
+        raise Refused(f"the anchor directory {canonical!r} needs systemd quoting")
+    return canonical
+
+
+def anchor_path(anchor_dir: Path, daemon_target: str) -> Path:
+    key = hashlib.sha256(daemon_target.encode("utf-8")).hexdigest()[:16]
+    return anchor_dir / f"install-{key}.anchor.json"
+
+
+def install_targets(binary: str) -> tuple[str, str]:
+    """The canonical daemon target and the CLI target beside it (`x0x`, the
+    companion the self-update swaps with the daemon)."""
+    try:
+        daemon = os.path.realpath(binary, strict=True)
+    except OSError as error:
+        raise Refused(f"x0xd is not installed at {binary}: {error}")
+    cli = os.path.join(os.path.dirname(daemon), "x0x")
+    if os.path.lexists(cli):
+        cli = os.path.realpath(cli)
+    if cli == daemon:
+        raise Refused(f"the CLI target {cli} is the daemon")
+    return daemon, cli
+
+
+def read_anchor(path: Path) -> tuple[bytes, dict] | None:
+    """The anchor at `path` and its bytes; None when there is none. One that
+    is not a regular file of root (or this account), is writable by group
+    or others, or is not a plan anchor is refused, not replaced."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise Refused(f"cannot read the plan anchor {path}: {error}")
+    with os.fdopen(fd, "rb") as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.geteuid()}:
+            raise Refused(f"the plan anchor {path} is not a regular file of root; remove it")
+        if info.st_mode & 0o022:
+            raise Refused(f"the plan anchor {path} is writable by group or others; remove it")
+        data = file.read(ANCHOR_MAX_BYTES + 1)
+    try:
+        anchor = json.loads(data)
+    except ValueError:
+        anchor = None
+    if (
+        len(data) > ANCHOR_MAX_BYTES
+        or not isinstance(anchor, dict)
+        or anchor.get("schema") != ANCHOR_SCHEMA
+        or anchor.get("record_kind") != ANCHOR_KIND
+        or not isinstance(anchor.get("participants"), list)
+    ):
+        raise Refused(f"{path} is not a plan anchor of schema {ANCHOR_SCHEMA}; remove it")
+    return data, anchor
+
+
+def render_anchor(daemon: str, cli: str, participants: dict[str, str]) -> bytes:
+    """The anchor in its one canonical form: sorted keys, participants
+    sorted by instance id, two-space indent, a final newline."""
+    anchor = {
+        "schema": ANCHOR_SCHEMA,
+        "record_kind": ANCHOR_KIND,
+        "daemon_target": daemon,
+        "cli_target": cli,
+        "participants": [
+            {"instance_id": instance, "data_root": root}
+            for instance, root in sorted(participants.items())
+        ],
+    }
+    return (json.dumps(anchor, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def journal_phase(data_root: str) -> str | None:
+    """The phase of the host journal in `data_root`; None when there is
+    none. One that cannot be read counts as in flight."""
+    path = os.path.join(data_root, JOURNAL_FILE_NAME)
+    try:
+        with open(path, "rb") as file:
+            data = file.read(ANCHOR_MAX_BYTES * 16)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"unreadable ({error.strerror})"
+    try:
+        phase = json.loads(data).get("phase")
+    except (ValueError, AttributeError):
+        phase = None
+    return phase if isinstance(phase, str) else "unreadable"
+
+
+def check_settled(data_roots: set[str]) -> None:
+    """Refuse to replace the launcher while a transaction is active in any
+    of `data_roots` (ADR 0094 §5: the launcher is updated only with no
+    active transaction)."""
+    for root in sorted(data_roots):
+        phase = journal_phase(root)
+        if phase is not None and phase not in SETTLED_PHASES:
+            raise Held(
+                f"the host journal in {root} is {phase}: an update is in progress, so the "
+                "launcher cannot be replaced now; run the install again when it settles"
+            )
+
+
+def anchored_roots(path: Path) -> set[str]:
+    current = read_anchor(path)
+    if current is None:
+        return set()
+    return {
+        str(entry["data_root"])
+        for entry in current[1]["participants"]
+        if isinstance(entry, dict) and "data_root" in entry
+    }
+
+
+def install_launcher_kept(source: Path, launcher: Path) -> None:
+    """Install the launcher. A different launcher already there is kept as
+    `<launcher>.previous` first (ADR 0094 §5: the old launcher is
+    preserved)."""
+    if not source.is_file():
+        raise Refused(f"launcher not found: {source}")
+    if launcher.is_file() and launcher.read_bytes() != source.read_bytes():
+        install_launcher(launcher, launcher.with_name(f"{launcher.name}.previous"))
+    install_launcher(source, launcher)
+
+
+def launcher_changes(source: Path, launcher: Path) -> bool:
+    return not (launcher.is_file() and source.is_file() and launcher.read_bytes() == source.read_bytes())
+
+
+def check_no_journal(data_roots: set[str]) -> None:
+    """Refuse an anchor change while a host journal in any of `data_roots`
+    can still be read with the anchor: its binding was made against the
+    current anchor bytes, so a new anchor would make the launcher refuse
+    (exit 78, daemon down; ADR 0094 §5)."""
+    for root in sorted(data_roots):
+        phase = journal_phase(root)
+        if phase is not None and phase not in ANCHOR_FREE_PHASES:
+            raise Held(
+                f"the host journal in {root} is {phase}; the plan anchor cannot change while "
+                "a launcher may still read it. Wait until the update settles; for a settled "
+                "journal (host_committed or restored), stop the install's units and move "
+                f"{JOURNAL_FILE_NAME} and its upgrade-plan-binding.*.json files aside "
+                "(docs/upgrade-system.md, 'Moving a data root to another install')"
+            )
+
+
+def anchor_change(
+    path: Path, daemon: str, cli: str, instance: str, root: str | None
+) -> tuple[bytes | None, bytes | None]:
+    """The anchor bytes before and after setting (`root`) or removing
+    (`root` None) this unit's participant; None for no file. An anchor for
+    another install at this path is refused. A change is refused with
+    `Held` while a data root named before or after holds a host
+    journal that a launcher may still read with the anchor."""
+    current = read_anchor(path)
+    participants: dict[str, str] = {}
+    if current is not None:
+        _, anchor = current
+        if anchor.get("daemon_target") != daemon:
+            raise Refused(f"{path} anchors {anchor.get('daemon_target')}, not {daemon}; remove it")
+        for entry in anchor["participants"]:
+            if not isinstance(entry, dict) or not {"instance_id", "data_root"} <= entry.keys():
+                raise Refused(f"{path} has a malformed participant; remove it")
+            participants[str(entry["instance_id"])] = str(entry["data_root"])
+    before = set(participants.values())
+    if root is None:
+        participants.pop(instance, None)
+    else:
+        participants[instance] = root
+    old = current[0] if current is not None else None
+    new = render_anchor(daemon, cli, participants) if participants else None
+    if old != new:
+        check_no_journal(before | set(participants.values()))
+    return old, new
+
+
+def write_anchor(path: Path, data: bytes | None) -> None:
+    if data is None:
+        path.unlink(missing_ok=True)
+    else:
+        replace_file(path, lambda file: file.write(data), 0o644)
 
 
 def replace_file(target: Path, write, mode: int) -> None:
@@ -461,40 +740,107 @@ def install(options: argparse.Namespace) -> None:
         raise Refused(f"{dropin} is not a 30-x0x-launcher.conf drop-in")
     if not os.access(options.binary, os.X_OK):
         raise Refused(f"x0xd is not installed at {options.binary}")
+    daemon, cli = install_targets(options.binary)
+    anchor = anchor_path(check_anchor_dir(options.anchor_dir), daemon)
+    # Before anything changes: would the anchor change while a journal is
+    # in flight? Asked with the unit files alone, since systemd still sees
+    # the earlier launcher drop-in.
+    files = file_settings(Path(options.unit), dropin)
+    account = unit_account(files.user)
+    early = unit_host_root(files.exec_start, options.binary, account.pw_dir, account.pw_uid, files.user)
+    anchor_change(anchor, daemon, cli, options.instance, early)
+    if launcher_changes(Path(options.launcher_source), Path(options.launcher)):
+        check_settled(anchored_roots(anchor) | {early})
+    previous = dropin.read_bytes() if dropin.is_file() and not dropin.is_symlink() else None
     # systemd must not see an earlier launcher drop-in when it is asked.
     dropin.unlink(missing_ok=True)
     settings = effective_settings(Path(options.unit), dropin)
-    user = settings.user
-    try:
-        account = pwd.getpwnam(user)
-    except KeyError:
-        raise Refused(f"the unit's user {user} does not exist")
-    install_launcher(Path(options.launcher_source), Path(options.launcher))
-    text = render(
+    account = unit_account(settings.user)
+    install_launcher_kept(Path(options.launcher_source), Path(options.launcher))
+    text, root = render_with_root(
         settings.exec_start,
         options.binary,
         options.launcher,
         options.instance,
         account.pw_dir,
         account.pw_uid,
-        user,
+        settings.user,
+        str(anchor),
     )
-    write_dropin(dropin, text)
+    try:
+        old, new = anchor_change(anchor, daemon, cli, options.instance, root)
+    except Held:
+        if previous is not None:
+            write_dropin(dropin, previous.decode("utf-8"))
+        raise
+    if new != old:
+        write_anchor(anchor, new)
+    try:
+        write_dropin(dropin, text)
+    except BaseException:
+        if new != old:
+            write_anchor(anchor, old)
+        raise
+    if not os.path.exists(cli):
+        print(f"[install] note: no CLI at {cli}; no trial can start until it is installed",
+              file=sys.stderr)
+
+
+def unit_account(user: str) -> pwd.struct_passwd:
+    try:
+        return pwd.getpwnam(user)
+    except KeyError:
+        raise Refused(f"the unit's user {user} does not exist")
+
+
+def remove(options: argparse.Namespace) -> None:
+    """Remove the unit's launcher drop-in and its participant from the
+    install's anchor. A refused anchor change leaves both as they were."""
+    dropin = Path(options.dropin)
+    if dropin.name != "30-x0x-launcher.conf":
+        raise Refused(f"{dropin} is not a 30-x0x-launcher.conf drop-in")
+    if os.path.lexists(options.binary) and os.path.isdir(options.anchor_dir):
+        daemon, cli = install_targets(options.binary)
+        anchor = anchor_path(Path(os.path.realpath(options.anchor_dir)), daemon)
+        old, new = anchor_change(anchor, daemon, cli, options.instance, None)
+        if new != old:
+            write_anchor(anchor, new)
+    dropin.unlink(missing_ok=True)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Install x0x-launcher and its systemd drop-in for one instance."
     )
-    parser.add_argument("--unit", required=True, help="the instance's installed unit file")
+    parser.add_argument("--unit", help="the instance's installed unit file")
     parser.add_argument("--binary", required=True, help="the installed x0xd path")
-    parser.add_argument("--launcher-source", required=True, help="the x0x-launcher to install")
-    parser.add_argument("--launcher", required=True, help="where to install the launcher")
+    parser.add_argument("--launcher-source", help="the x0x-launcher to install")
+    parser.add_argument("--launcher", help="where to install the launcher")
     parser.add_argument("--instance", required=True, help="the manifest instance id")
     parser.add_argument("--dropin", required=True, help="the drop-in path to write")
+    parser.add_argument(
+        "--anchor-dir", default=DEFAULT_ANCHOR_DIR, help="the directory of the plan anchors"
+    )
+    parser.add_argument(
+        "--remove", action="store_true", help="remove the drop-in and this unit's participant"
+    )
     options = parser.parse_args()
+    if options.remove:
+        try:
+            remove(options)
+        except Exception as error:
+            detail = str(error) if isinstance(error, Refused) else f"{type(error).__name__}: {error}"
+            print(f"error: {detail}", file=sys.stderr)
+            return 2 if isinstance(error, Held) else 1
+        print(f"[install] removed launcher drop-in: {options.dropin}")
+        return 0
+    if not (options.unit and options.launcher_source and options.launcher):
+        parser.error("--unit, --launcher-source and --launcher are required to install")
     try:
         install(options)
+    except Held as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     except Exception as error:
         dropin = Path(options.dropin)
         try:

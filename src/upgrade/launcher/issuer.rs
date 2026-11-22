@@ -196,30 +196,47 @@ fn issue_held(
     if passthrough {
         if let Some((canonical, _)) = &daemon {
             if *canonical != record.plan.daemon.target_path {
-                return Err(start::refused(
-                    "the launcher's daemon is not the host journal's daemon target",
+                return Err(other_install(
+                    &record,
+                    canonical,
+                    &record.plan.cli.target_path,
                 ));
             }
         }
         *held = daemon.map(|(_, lock)| lock);
         return Ok(None);
     }
+    // The plan must name the anchored install before any lock file is
+    // created at the plan's daemon target (#2171 fourth review): a journal
+    // of another install pair, or one written by anything else that runs
+    // as this account, cannot make the start create a lock file beside a
+    // path the anchor does not approve.
+    let anchor = read_checked_anchor(args, owners)?;
+    if anchor.anchor().daemon_target != record.plan.daemon.target_path
+        || anchor.anchor().cli_target != record.plan.cli.target_path
+    {
+        return Err(other_install(
+            &record,
+            &anchor.anchor().daemon_target,
+            &anchor.anchor().cli_target,
+        ));
+    }
     // The journal and its binding are read under the install lock of the
     // journal plan's daemon target (#2171 review). A producer stages, and
-    // removes an old transaction's binding, only while it holds that lock:
-    // `stage` refuses a plan for another install pair over a journal in
-    // this data root, so every stage here takes this same lock. When the
-    // lock taken above is not that one (the daemon is missing, or the
+    // removes an old transaction's binding, only while it holds that lock
+    // and the data root's stage lock: `stage` refuses a plan for another
+    // install pair over a journal in this data root, so every stage that
+    // can write here while this journal exists takes this same lock. When
+    // the lock taken above is not that one (the daemon is missing, or the
     // argv names another file), take it now and read the journal again
     // under it. A lock that cannot be taken is a failed read (75), never a
     // refusal from a torn read.
-    let plan_lock = match &daemon {
-        Some((canonical, _)) if *canonical == record.plan.daemon.target_path => None,
-        _ => Some(plan_daemon_lock(
-            &record.plan.daemon.target_path,
-            DAEMON_LOCK_WAIT,
-        )?),
-    };
+    let own_lock = daemon
+        .as_ref()
+        .map(|(canonical, lock)| (canonical.as_path(), lock));
+    #[cfg(test)]
+    tests::before_plan_lock();
+    let plan_lock = plan_daemon_lock(&record.plan.daemon.target_path, own_lock, DAEMON_LOCK_WAIT)?;
     let record = if plan_lock.is_some() {
         match read_journal(&root, record_uid)? {
             Some(again) if serde_json::to_vec(&again)? == serde_json::to_vec(&record)? => again,
@@ -235,7 +252,7 @@ fn issue_held(
     };
     #[cfg(test)]
     tests::before_binding_read();
-    check_binding(args, &root, &record, owners)?;
+    check_binding(&root, &record, owners, &anchor)?;
     drop(plan_lock);
     drop(daemon);
     let participant = record
@@ -374,11 +391,20 @@ fn daemon_lock_with(
 }
 
 /// The install lock of the journal plan's daemon target, taken within
-/// `wait`. The lock file is created beside the target even when the
+/// `wait`, or `None` when `held` (the daemon lock this start already holds,
+/// with its daemon's canonical path) is that same lock: the same path, or
+/// a lock file that is the same file through another path (a plan target
+/// that names the install through a symlinked directory). Taking a second
+/// lock on the same file would wait on the start's own lock (#2171 fourth
+/// review). The lock file is created beside the target even when the
 /// binary itself is missing. Every failure (no directory, no access, a
 /// lock held past the wait) is a failed read, so the start is retried; a
 /// read under no lock could see a torn journal and binding.
-fn plan_daemon_lock(target: &Path, wait: std::time::Duration) -> io::Result<File> {
+fn plan_daemon_lock(
+    target: &Path,
+    held: Option<(&Path, &File)>,
+    wait: std::time::Duration,
+) -> io::Result<Option<File>> {
     let retry = |error: io::Error| {
         io::Error::new(
             io::ErrorKind::Interrupted,
@@ -388,11 +414,23 @@ fn plan_daemon_lock(target: &Path, wait: std::time::Duration) -> io::Result<File
             ),
         )
     };
+    if held.is_some_and(|(canonical, _)| canonical == target) {
+        return Ok(None);
+    }
     let lock = recovery::lock(target).map_err(retry)?;
+    if let Some((_, held)) = held {
+        let (a, b) = (
+            held.metadata().map_err(retry)?,
+            lock.metadata().map_err(retry)?,
+        );
+        if a.dev() == b.dev() && a.ino() == b.ino() {
+            return Ok(None);
+        }
+    }
     let deadline = std::time::Instant::now() + wait;
     loop {
         match lock.try_lock() {
-            Ok(()) => return Ok(lock),
+            Ok(()) => return Ok(Some(lock)),
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -471,32 +509,37 @@ fn read_journal(root: &File, uid: u32) -> io::Result<Option<journal::JournalReco
     }
 }
 
-/// The journal's integrity binding (#2012, B4). The argv must name a plan
-/// anchor; the anchor must be root's and unchangeable by the launcher's
-/// account (`plan_binding::read_anchor`); the plan binding beside the
-/// journal must be a 0600 regular file of the launcher's account, read
-/// through the checked host root; and it must bind this journal's
-/// transaction, generation and plan to that anchor, whose install the plan
-/// names exactly. Every failure is a typed refusal (78): none of them
-/// clears by itself. Only an I/O error while reading is a failed read (75).
-fn check_binding(
-    args: &TrialArgs,
-    root: &File,
-    record: &journal::JournalRecord,
-    owners: Owners,
-) -> io::Result<()> {
+/// The plan anchor the argv names (#2012, B4): root's and unchangeable by
+/// the launcher's account (`plan_binding::read_anchor`). No `--plan-anchor`,
+/// and every failed check, is a typed refusal (78): none of them clears by
+/// itself. Only an I/O error while reading is a failed read (75).
+fn read_checked_anchor(args: &TrialArgs, owners: Owners) -> io::Result<plan_binding::Anchored> {
     let Some(anchor_path) = &args.plan_anchor else {
         return Err(start::refused(
             "a launcher trial needs --plan-anchor; this unit can only pass through",
         ));
     };
-    let anchor = plan_binding::read_anchor(anchor_path, owners.anchor).map_err(|error| {
+    plan_binding::read_anchor(anchor_path, owners.anchor).map_err(|error| {
         if fixed(&error) {
             start::refused(format!("plan anchor {}: {error}", anchor_path.display()))
         } else {
             error
         }
-    })?;
+    })
+}
+
+/// The journal's integrity binding (#2012, B4): the plan binding beside the
+/// journal must be a 0600 regular file of the launcher's account, read
+/// through the checked host root, and it must bind this journal's
+/// transaction, generation and plan to `anchor`, whose install the plan
+/// names exactly. Every failure is a typed refusal (78); only an I/O error
+/// while reading is a failed read (75).
+fn check_binding(
+    root: &File,
+    record: &journal::JournalRecord,
+    owners: Owners,
+    anchor: &plan_binding::Anchored,
+) -> io::Result<()> {
     let name = plan_binding::binding_file_name(&record.transaction_id);
     let bytes = match read_owned_at(root, &name, owners.record) {
         Ok(bytes) => bytes,
@@ -510,6 +553,23 @@ fn check_binding(
     anchor
         .verify(&binding, record)
         .map_err(|error| start::refused(error.to_string()))
+}
+
+/// The typed refusal for a host journal of another install pair in this
+/// data root (`contract::REFUSAL_OTHER_INSTALL`): `x0x doctor` names the
+/// remedy for it (docs/upgrade-system.md, "Moving a data root to another
+/// install").
+fn other_install(record: &journal::JournalRecord, daemon: &Path, cli: &Path) -> io::Error {
+    start::refused(format!(
+        "{}: the host journal ({:?}, transaction {}) is for the install {} with {}, not {} with {}",
+        contract::REFUSAL_OTHER_INSTALL,
+        record.phase,
+        record.transaction_id,
+        record.plan.daemon.target_path.display(),
+        record.plan.cli.target_path.display(),
+        daemon.display(),
+        cli.display()
+    ))
 }
 
 /// An error no restart changes: a missing, symlinked, foreign or malformed
@@ -727,6 +787,19 @@ mod tests {
             const { std::cell::RefCell::new(None) };
     }
 
+    thread_local! {
+        /// Runs once, on this thread, after the start's first journal read
+        /// and before it takes the plan's daemon lock.
+        static BEFORE_PLAN_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_plan_lock() {
+        if let Some(hook) = BEFORE_PLAN_LOCK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
     pub(super) fn before_binding_read() {
         if let Some(hook) = BEFORE_BINDING_READ.with(|hook| hook.borrow_mut().take()) {
             hook();
@@ -880,12 +953,141 @@ mod tests {
             .exists());
     }
 
+    /// Replace the journal in `root` with `record`, as a writer would.
+    fn rewrite(root: &Path, record: &journal::JournalRecord) {
+        let path = root.join(journal::JOURNAL_FILE_NAME);
+        std::fs::remove_file(&path).unwrap();
+        journal::write_record(&path, record).unwrap();
+    }
+
+    /// Point `record`'s plan, and every participant, at the daemon `target`.
+    fn retarget(record: &mut journal::JournalRecord, target: PathBuf) {
+        for participant in &mut record.plan.participants {
+            participant.executable = target.clone();
+            participant.argv[0] = target.to_string_lossy().into_owned();
+        }
+        record.plan.daemon.target_path = target;
+    }
+
+    /// #2171 fourth review: when the argv names another daemon file than the
+    /// journal plan's target, the start reads the binding under the lock of
+    /// the PLAN's daemon target, not the argv's: a same-pair stage cannot
+    /// run before the binding read.
+    #[test]
+    fn the_binding_is_read_under_the_plans_lock_not_the_argvs() {
+        let (dir, root, record) = rooted(journal::Phase::HostCommitted);
+        let (args, mut command) = matching(&record);
+        let other = dir.path().canonicalize().unwrap().join("argv-x0xd");
+        std::fs::write(&other, b"").unwrap();
+        command.executable = other.into_os_string();
+        let (hook_root, hook_record) = (root.clone(), record.clone());
+        let staged = race_before_binding_read(move || {
+            stage_over(&hook_root, &hook_record, "tx-racer", None)
+        });
+        let _ = issue_as(&args, &command, effective_uid());
+        assert_eq!(
+            staged.get(),
+            Some(false),
+            "the racing stage got the plan's lock"
+        );
+        assert!(root
+            .join(plan_binding::binding_file_name(&record.transaction_id))
+            .exists());
+    }
+
+    /// #2171 fourth review: a journal that changes between the start's
+    /// first read and the plan's daemon lock is a failed read (75), both
+    /// when a new transaction replaced it and when the same transaction
+    /// moved on. The read under the lock is what the start uses.
+    #[test]
+    fn a_journal_that_changes_before_the_plans_lock_is_a_failed_read() {
+        for same_transaction in [false, true] {
+            let (_dir, root, record) = rooted(journal::Phase::HostCommitted);
+            let (args, command) = matching(&record);
+            // No daemon, so the start holds no lock until the plan's.
+            std::fs::remove_file(&record.plan.daemon.target_path).unwrap();
+            let (hook_root, hook_record) = (root.clone(), record.clone());
+            BEFORE_PLAN_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if same_transaction {
+                        let mut moved = hook_record.clone();
+                        moved.sequence += 1;
+                        rewrite(&hook_root, &moved);
+                    } else {
+                        stage_over(&hook_root, &hook_record, "tx-racer", None).unwrap();
+                    }
+                }))
+            });
+            let error = issue_as(&args, &command, effective_uid())
+                .err()
+                .expect("a changed journal is an error");
+            let case = format!("same transaction {same_transaction}");
+            assert!(!start::is_refusal(&error), "{case}: {error}");
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{case}: {error}");
+            assert!(
+                error.to_string().contains("changed while"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    /// #2171 fourth review: the plan is checked against the root-owned
+    /// anchor before any lock file is created at the plan's daemon target.
+    /// A journal whose plan names a target the anchor does not approve is a
+    /// typed refusal and leaves no lock file there.
+    #[test]
+    fn no_plan_lock_file_is_created_outside_the_anchored_install() {
+        let (dir, root, mut record) = rooted(journal::Phase::HostCommitted);
+        let (args, command) = matching(&record);
+        let elsewhere = dir.path().canonicalize().unwrap().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        retarget(&mut record, elsewhere.join("x0xd"));
+        rewrite(&root, &record);
+        let error = issue_as(&args, &command, effective_uid())
+            .err()
+            .expect("refused");
+        assert!(start::is_refusal(&error), "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with(contract::REFUSAL_OTHER_INSTALL),
+            "{error}"
+        );
+        assert!(!recovery::lock_path(&elsewhere.join("x0xd")).exists());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// #2171 fourth review: a plan daemon target that names the argv's
+    /// daemon through a symlinked directory has the same lock file. The
+    /// start does not wait on its own lock (30 s, then a failed read); it
+    /// goes on at once to the checks, here the non-canonical plan path,
+    /// which is a typed refusal.
+    #[test]
+    fn a_plan_target_through_a_symlinked_directory_reuses_the_held_lock() {
+        let (dir, root, mut record) = rooted(journal::Phase::HostCommitted);
+        let (args, command) = matching(&record);
+        let target = record.plan.daemon.target_path.clone();
+        let alias = dir.path().canonicalize().unwrap().join("alias");
+        std::os::unix::fs::symlink(target.parent().unwrap(), &alias).unwrap();
+        retarget(&mut record, alias.join(target.file_name().unwrap()));
+        rewrite(&root, &record);
+        bind(&root, &record);
+        let begun = std::time::Instant::now();
+        let result = issue_as(&args, &command, effective_uid());
+        assert!(
+            begun.elapsed() < std::time::Duration::from_secs(10),
+            "the start waited on its own lock"
+        );
+        assert!(refused(result));
+    }
+
     /// #2171 review 3 (b): a plan lock that cannot be taken (its directory
     /// is gone) is a failed read, never a refusal.
     #[test]
     fn a_plan_lock_that_cannot_be_taken_is_a_failed_read() {
         let error = plan_daemon_lock(
             Path::new("/nonexistent-x0x-dir/x0xd"),
+            None,
             std::time::Duration::from_millis(10),
         )
         .expect_err("no directory");
@@ -1205,17 +1407,30 @@ mod tests {
         let (args, command) = matching(&record);
         let uid = effective_uid();
         let anchor = root.join(plan_binding::TEST_ANCHOR_NAME);
-        let edits: [fn(&mut serde_json::Value); 3] = [
-            |a| a["cli_target"] = "/usr/local/bin/other-x0x".into(),
-            |a| {
-                a["participants"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::json!({"instance_id": "bob", "data_root": "/var/lib/bob"}))
-            },
-            |a| a["participants"][0]["data_root"] = "/var/lib/elsewhere".into(),
+        type Edit = (fn(&mut serde_json::Value), &'static str);
+        let edits: [Edit; 4] = [
+            (
+                |a| a["cli_target"] = "/usr/local/bin/other-x0x".into(),
+                contract::REFUSAL_OTHER_INSTALL,
+            ),
+            (
+                |a| a["daemon_target"] = "/usr/local/bin/other-x0xd".into(),
+                contract::REFUSAL_OTHER_INSTALL,
+            ),
+            (
+                |a| {
+                    a["participants"].as_array_mut().unwrap().push(
+                        serde_json::json!({"instance_id": "bob", "data_root": "/var/lib/bob"}),
+                    )
+                },
+                "anchored",
+            ),
+            (
+                |a| a["participants"][0]["data_root"] = "/var/lib/elsewhere".into(),
+                "anchored",
+            ),
         ];
-        for edit in edits {
+        for (edit, expected) in edits {
             let mut value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&anchor).unwrap()).unwrap();
             edit(&mut value);
@@ -1239,7 +1454,7 @@ mod tests {
             .unwrap();
             let error = issue_as(&args, &command, uid).err().expect("refused");
             assert!(start::is_refusal(&error), "{error}");
-            assert!(error.to_string().contains("anchored"), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
             bind(&root, &record);
         }
     }
@@ -1749,7 +1964,12 @@ mod tests {
             panic!("no exec of another daemon")
         });
         assert!(start::is_refusal(&error), "{error}");
-        assert!(error.to_string().contains("daemon target"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with(contract::REFUSAL_OTHER_INSTALL),
+            "{error}"
+        );
         assert!(held.is_none());
 
         let (trial, command) = matching(&record);

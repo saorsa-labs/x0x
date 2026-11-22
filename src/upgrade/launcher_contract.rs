@@ -138,6 +138,12 @@ pub struct LauncherRefusal {
 
 pub const REFUSAL_SCHEMA: u32 = 1;
 
+/// The first word of a refusal reason when the host journal in the data
+/// root belongs to another install pair than this launcher's (#2012): the
+/// data root moved to another install, or two installs share it. `x0x
+/// doctor` gives the remedy for it.
+pub const REFUSAL_OTHER_INSTALL: &str = "other-install-journal";
+
 /// The start time of process `pid`, fixed for the life of the process: on
 /// Linux the `starttime` field of `/proc/<pid>/stat` (clock ticks since
 /// boot), on macOS the libproc start time in microseconds since the epoch.

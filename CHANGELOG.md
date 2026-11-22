@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Launcher enable step 2: data-root stage lock, installer plan anchor and
+  a signed launcher asset (#2012; A14 amendment of 22 Nov 2026).** The
+  prepare producer holds a lock on the data root
+  (`upgrade-stage.lock`) for every stage, so two install pairs staging in
+  one data root never interleave. The dormant launcher checks a plan
+  against its anchor before it creates any lock file at the plan's daemon
+  target, does not wait on its own lock when the plan names the daemon
+  through a symlinked directory, and reports a host journal of another
+  install with the typed reason `other-install-journal`, which `x0x doctor`
+  shows with its remedy. `.deployment/install.sh --launcher` now writes one
+  root-owned plan anchor per install (`/etc/x0x/launcher/install-<key>.anchor.json`,
+  shared by every unit of that install) and adds `--plan-anchor` to the
+  drop-in; it refuses to change the anchor while a host journal there can
+  still be read, and with no path it fetches and GPG-verifies the new
+  `x0x-launcher-<platform>.tar.gz` release asset (Linux x64 and ARM64; the
+  release also builds macOS). The launcher is still dormant (`ENABLED` is
+  false) and no apply path calls the producer, so no install changes
+  behaviour.
 - **Launcher journal integrity binding (#2012, design B4; A14 amendment of
   22 Nov 2026).** The launcher argv's trial form takes an optional
   `--plan-anchor <path>`, which names a root-owned file that lists the
