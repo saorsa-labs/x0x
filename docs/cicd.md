@@ -9,7 +9,8 @@ The main workflows in `.github/workflows/`:
   100k signing acceptances, Windows, and the Coverage Gate
 - **security.yml**: `cargo audit` (daily schedule + PRs)
 - **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io. Also generates `release-manifest.json` and signature for the self-update system (see [`upgrade-system.md`](upgrade-system.md)).
-- **build.yml**: PR validation
+- **build.yml**: release-metadata checks and release-mode builds. PRs build `linux-x64-gnu` only; pushes to `main`
+  and `workflow_dispatch` also build linux-x64-musl, linux-arm64-gnu, macos-x64, macos-arm64 and windows-x64
 - **sign-skill.yml**: GPG-signs `SKILL.md` (manual dispatch)
 - **integration.yml**: integration tests on pushes to `main` and on PRs to any base; the soak and timing suites run only on the weekly schedule
 - **adr-governance.yml**: ADR checks on PRs touching `docs/adr/**` or `.adr-kit.yaml`
@@ -69,6 +70,24 @@ compiler or test error.
 - The 20 W3-H reruns that D196 (A08) requires for a harness case are not automatic on a PR. Someone must
   dispatch `CI (full)` on the PR branch by hand.
 - `integration.yml`, `build.yml` and `security.yml` still run on every PR (ADR 0087 rule 1).
+- On a PR, `build.yml` builds only `Build linux-x64-gnu` (a required check) after `Validate release metadata`
+  and `Prepare M2 signing controls`. The other five platform builds run on pushes to `main` and on
+  `workflow_dispatch`. `Build linux-x64-gnu` is its own job, not a matrix entry, so it keeps its name when
+  it is skipped.
+- `train/*` bundle PRs start no hosted jobs. The orchestrator merges a bundle PR with admin rights on the
+  studio1 train result, and each member PR already had its own hosted run. A job skips a PR only when all
+  three hold: the head branch starts with `train/`, the head repository is this repository (not a fork), and
+  the PR author is in the bundle-author list (`["dirvine"]`). Any other `train/*` PR runs full CI. Every job in
+  `ci.yml`, `build.yml`, `integration.yml`, `security.yml`, `release-custody-check.yml`,
+  `python-client-example.yml` and `adr-governance.yml` carries this condition. Each workflow defines it once
+  as the YAML anchor `&run-unless-train-bundle`, and its other jobs use `*run-unless-train-bundle`; a
+  workflow with one job writes the condition in place. Push,
+  schedule and dispatch runs have no pull-request context, so every job runs. The workflows still trigger
+  on the PR (ADR 0087 rule 1), and each skipped job reports "skipped". GitHub counts a job skipped by `if:`
+  as passing a required check; a workflow that does not trigger would leave the check pending. The push of
+  the merge commit to `main` runs the full hosted set, and the release gate reads that push run.
+  `scripts/ci/test_train_bundle_skip.py` (in `Inert CI script controls`) fails if a job lacks the condition
+  or carries a different one. To change the author list, edit that test and the seven anchors together.
 - Every PR workflow cancels an older run for the same PR. Push runs on `main` are never cancelled, so each
   merge commit keeps a terminal `ci.yml` result for the release gate. `ci-full.yml` cancels only an older
   run of the same event on the same ref, so a dispatch never cancels a nightly run.
