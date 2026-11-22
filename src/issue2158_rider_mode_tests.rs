@@ -343,3 +343,132 @@ async fn later_owner_issuance_changes_the_mode() {
     assert_rider(&entry(&agent, &former_acp).await, "ACP re-issued as rider");
     agent.shutdown().await;
 }
+
+/// The line `x0x owner agents issue <PUB> --mode acp` writes: no label.
+fn unlabelled_issuance(
+    owner: &identity::UserKeypair,
+    cert: &identity::AgentCertificate,
+    mode: profile::CertMode,
+    issued_at: u64,
+) -> profile::IssuedCertRecord {
+    let mut record =
+        profile::IssuedCertRecord::from_cert_with_mode(&owner.user_id(), cert, mode, None)
+            .expect("issuance record");
+    record.issued_at = issued_at;
+    record
+}
+
+/// Certificates for `subject` with distinct digests (distinct expiries).
+fn certs(
+    owner: &identity::UserKeypair,
+    subject: &identity::AgentKeypair,
+    n: u64,
+) -> Vec<identity::AgentCertificate> {
+    let now = Agent::unix_timestamp_secs();
+    (1..=n)
+        .map(|i| {
+            identity::AgentCertificate::issue_with_expiry(owner, subject, Some(now + i * 86_400))
+                .expect("certificate")
+        })
+        .collect()
+}
+
+/// The default ACP re-issue carries no label; it still changes a rider to
+/// `acp`, because the issue route keeps the certificate bytes.
+#[tokio::test]
+async fn unlabelled_acp_reissue_changes_a_rider_to_acp() {
+    let owner = Owner::new();
+    let user = owner.user_keypair();
+    let agent = owner.agent().await;
+    let subject = identity::AgentKeypair::generate().expect("former rider");
+    let c = certs(&user, &subject, 2);
+    let now = Agent::unix_timestamp_secs();
+    journal(
+        &agent,
+        &issuance(&user, &c[0], profile::CertMode::Rider, "pi rider", now - 10),
+    )
+    .await;
+    journal(
+        &agent,
+        &unlabelled_issuance(&user, &c[1], profile::CertMode::Acp, now),
+    )
+    .await;
+    let reissued = entry(&agent, &subject).await;
+    assert_eq!(reissued.digest, profile::cert_storage_digest(&c[1]));
+    assert_eq!(reissued.mode, profile::CertMode::Acp, "{reissued:?}");
+    assert_eq!(reissued.label, None, "{reissued:?}");
+    agent.shutdown().await;
+}
+
+/// The local clock stepped back between a rider issuance and an ACP
+/// re-issue: the ACP line has the smaller `issued_at` but is later in the
+/// journal, and it decides the mode.
+#[tokio::test]
+async fn acp_reissue_after_a_clock_step_back_changes_the_mode() {
+    let owner = Owner::new();
+    let user = owner.user_keypair();
+    let agent = owner.agent().await;
+    let subject = identity::AgentKeypair::generate().expect("former rider");
+    let c = certs(&user, &subject, 2);
+    let now = Agent::unix_timestamp_secs();
+    journal(
+        &agent,
+        &issuance(&user, &c[0], profile::CertMode::Rider, "pi rider", now),
+    )
+    .await;
+    journal(
+        &agent,
+        &unlabelled_issuance(&user, &c[1], profile::CertMode::Acp, now - 100),
+    )
+    .await;
+    let reissued = entry(&agent, &subject).await;
+    // The certificate of a journal row is the last line in file order.
+    assert_eq!(reissued.digest, profile::cert_storage_digest(&c[1]));
+    assert_eq!(reissued.mode, profile::CertMode::Acp, "{reissued:?}");
+    assert_eq!(reissued.label, None);
+    agent.shutdown().await;
+}
+
+/// Two issuances in the same second in different modes: the later line in
+/// the journal wins, in both orders.
+#[tokio::test]
+async fn same_second_issuances_later_line_wins() {
+    let owner = Owner::new();
+    let user = owner.user_keypair();
+    let agent = owner.agent().await;
+    let now = Agent::unix_timestamp_secs();
+
+    let to_acp = identity::AgentKeypair::generate().expect("rider then ACP");
+    let c = certs(&user, &to_acp, 2);
+    journal(
+        &agent,
+        &issuance(&user, &c[0], profile::CertMode::Rider, "pi rider", now),
+    )
+    .await;
+    journal(
+        &agent,
+        &unlabelled_issuance(&user, &c[1], profile::CertMode::Acp, now),
+    )
+    .await;
+    let acp = entry(&agent, &to_acp).await;
+    assert_eq!(acp.mode, profile::CertMode::Acp, "{acp:?}");
+    assert_eq!(acp.label, None);
+
+    let to_rider = identity::AgentKeypair::generate().expect("ACP then rider");
+    let c = certs(&user, &to_rider, 2);
+    journal(
+        &agent,
+        &unlabelled_issuance(&user, &c[0], profile::CertMode::Acp, now),
+    )
+    .await;
+    journal(
+        &agent,
+        &issuance(&user, &c[1], profile::CertMode::Rider, "pi rider", now),
+    )
+    .await;
+    assert_rider(
+        &entry(&agent, &to_rider).await,
+        "ACP then rider, same second",
+    );
+    agent.shutdown().await;
+}

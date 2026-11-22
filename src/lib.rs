@@ -20828,11 +20828,14 @@ impl Agent {
     /// Every live certificate binds to the owner's `UserId` (verified at
     /// announce time), so foreign certs cannot enter the roster.
     ///
-    /// Hosting mode and label (#2158) come from the latest journal line
-    /// that states them (an owner issuance, see
+    /// Hosting mode and label (#2158) come from the last journal line, in
+    /// file order, that states them (an owner issuance, see
     /// [`profile::IssuedCertRecord::states_mode`]), whichever certificate
     /// wins: a renewal or a live sighting keeps a rider a rider; a later
-    /// owner issuance in another mode changes it.
+    /// owner issuance in another mode changes it. File order, not
+    /// `issued_at`: only this daemon's issue route writes such lines and it
+    /// appends them in order, so a local clock step back cannot reorder
+    /// them.
     ///
     /// Empty when no user identity is configured.
     pub async fn owner_issued_certificates(&self) -> Vec<OwnerIssuedCert> {
@@ -20846,12 +20849,9 @@ impl Agent {
         let mut journal_digests: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let owner_hex = hex::encode(owner.as_bytes());
-        // agent_id hex → (issued_at, mode, label) of the latest line that
-        // states a mode.
-        let mut stated: std::collections::HashMap<
-            String,
-            (u64, profile::CertMode, Option<String>),
-        > = std::collections::HashMap::new();
+        // agent_id hex → (mode, label) of the last line that states a mode.
+        let mut stated: std::collections::HashMap<String, (profile::CertMode, Option<String>)> =
+            std::collections::HashMap::new();
         if let Some(ref jp) = journal_path {
             for record in profile::IssuedCertRecord::load(jp).await {
                 // R3: records are owner-scoped — lines from a PREVIOUS
@@ -20861,15 +20861,8 @@ impl Agent {
                     continue;
                 }
                 journal_digests.insert(record.cert_digest.clone());
-                if record.states_mode()
-                    && stated
-                        .get(&record.agent_id)
-                        .is_none_or(|(at, _, _)| record.issued_at >= *at)
-                {
-                    stated.insert(
-                        record.agent_id.clone(),
-                        (record.issued_at, record.mode, record.label.clone()),
-                    );
+                if record.states_mode() {
+                    stated.insert(record.agent_id.clone(), (record.mode, record.label.clone()));
                 }
                 let entry = OwnerIssuedCert {
                     agent_id: record.agent_id.clone(),
@@ -20939,7 +20932,7 @@ impl Agent {
         for entry in &mut out {
             let (mode, label) = stated
                 .get(&entry.agent_id)
-                .map_or((profile::CertMode::Acp, None), |(_, mode, label)| {
+                .map_or((profile::CertMode::Acp, None), |(mode, label)| {
                     (*mode, label.clone())
                 });
             entry.mode = mode;

@@ -1030,7 +1030,12 @@ fine **when given both `--delegation-payload-b64` and
 `--delegation-signature`** (clap-required, mutually `requires`-bound).
 Certify the sub-agent first (`POST /owner/agents/issue` with
 `"mode": "rider"` — the CLI equivalent is `x0x owner agents issue
-<PUB_HEX> --mode rider`), then mint with a harness-side capability:
+<PUB_HEX> --mode rider`), then mint with a harness-side capability.
+Minting uses the agent's rider-mode journal line with the greatest
+`issued_at`. A later ACP re-issue of the same agent does not remove that
+line, so `POST /owner/riders` can still mint for it while
+`GET /owner/agents` shows it as `acp` (`POST /report` refuses it as a
+target for this reason):
 
 the harness signs `rider_delegation_bytes(sub_agent_id,
 daemon_agent_id, groups, not_after)` with the sub-agent's OWN key
@@ -1195,10 +1200,14 @@ publishing explicit no-name X0A4 beats so peers erase it.
 restarts), `mode` (`"acp"` \| `"rider"`), `journal_label`, `revoked` (bool),
 `placement` (nullable enrichment: `"pinned"`/`"roaming"` + epoch — null when
 no owner-verified placement record is held; P enforcement fails open for such
-agents). `mode` and `journal_label` come from the owner's latest
-`POST /owner/agents/issue` line for the agent, not from the certificate the
-row shows: a renewed or live-announced certificate keeps a rider `"rider"`
-with its label; a later issuance in the other mode changes it (#2158).
+agents). `mode` and `journal_label` come from the owner's last
+`POST /owner/agents/issue` line for the agent in journal file order, not
+from the certificate the row shows: a renewed or live-announced certificate
+keeps a rider `"rider"` with its label; a later issuance in the other mode
+changes it (#2158). Owner sync does not carry the mode (#2182): a rider
+re-issued as ACP on another owner device stays `"rider"` on this one, so
+placement minting pins it to this machine and `POST /report` refuses it
+as a target (fail closed).
 
 ## Home (ADR-0038)
 
