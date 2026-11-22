@@ -80,6 +80,10 @@ compiler or test error.
   it to download, so it does not prove a real exit-100 upgrade or an exit-75 restore. Its literal
   inputs (wrapper markers, daemon messages, pipe name rule, request fields) are checked on every PR by
   `scripts/ci/test_windows_flush_acceptance.py`.
+- A `workflow_dispatch` of `ci-full.yml` takes an `only` input: `all` (the default) or `windows`. With
+  `windows`, every job except `Test Suite (Windows)` is skipped, so one Windows run does not start the
+  W3-H matrix, the Coverage Gate and the full suite. The nightly schedule always runs every job. Example:
+  `gh workflow run ci-full.yml -R saorsa-labs/x0x --ref <branch> -f only=windows`.
 - The 20 W3-H reruns that D196 (A08) requires for a harness case are not automatic on a PR. Someone must
   dispatch `CI (full)` on the PR branch by hand.
 - `integration.yml`, `build.yml` and `security.yml` still run on every PR (ADR 0087 rule 1).

@@ -124,6 +124,24 @@ class WindowsFlushAcceptanceControls(unittest.TestCase):
         self.assertNotIn('windows-flush-acceptance', read('.github/workflows/ci.yml').replace(
             'test_windows_flush_acceptance.py', ''))
 
+    def test_dispatch_only_windows_skips_every_other_job(self):
+        workflow = WORKFLOW.read_text(encoding='utf-8')
+        self.assertIn("      only:\n", workflow)
+        self.assertIn("        default: all\n", workflow)
+        self.assertIn("          - windows\n", workflow)
+        gate = "github.event_name != 'workflow_dispatch' || inputs.only == 'all'"
+        jobs = re.split(r'\n  (?=[a-z0-9_-]+:\n)', workflow[workflow.index('\njobs:\n'):])[1:]
+        self.assertGreater(len(jobs), 5)
+        for job in jobs:
+            name = job.split(':', 1)[0]
+            header = job[:job.index('    steps:')] if '    steps:' in job else job
+            job_if = [line for line in header.splitlines() if line.startswith('    if: ')]
+            if name == 'test-windows':
+                self.assertEqual(job_if, [], name)
+            else:
+                self.assertEqual(len(job_if), 1, name)
+                self.assertIn(gate, job_if[0], name)
+
 
 if __name__ == '__main__':
     unittest.main()

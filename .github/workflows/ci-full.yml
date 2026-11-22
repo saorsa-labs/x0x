@@ -16,6 +16,14 @@ on:
   schedule:
     - cron: '17 2 * * *'
   workflow_dispatch:
+    inputs:
+      only:
+        description: "Jobs to run: all, or only Test Suite (Windows) (#1764). The nightly schedule always runs all."
+        type: choice
+        options:
+          - all
+          - windows
+        default: all
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,6 +46,7 @@ concurrency:
 jobs:
   test:
     name: Test Suite (full)
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -317,6 +326,7 @@ jobs:
 
   signing-path-100k:
     name: Signing path 100k acceptance
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -453,6 +463,7 @@ jobs:
   # namespace (scripts/ci/prepare-released-h-s3-home.sh).
   h-s3-home-released:
     name: H-S3-home released binaries
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -529,6 +540,7 @@ jobs:
   # matches the VM runs.
   h-s3-released-rows:
     name: H-S3-rm released-binary rows
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -609,6 +621,7 @@ jobs:
 
   linux-systemd-policy:
     name: Linux systemd policy acceptance
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -742,6 +755,7 @@ jobs:
     # `s4-1973`, and the #2004 expired-member arm has `s4-2004`.
     # A group is omitted when the tree has no matching test.
     name: W3-H shard plan
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -767,6 +781,7 @@ jobs:
     # below is the D196 gate and counts 20 receipts per case.
     # `fail-fast: false` so one bad group still uploads traces.
     name: W3-H shard (${{ matrix.group }})
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     needs: w3h-plan
     runs-on: ubuntu-latest
     # Every S3 group (`s3`, and `s3-c`, `s3-c2`, `s3-c3`, `s3-d8` for the
@@ -911,7 +926,7 @@ jobs:
     # The check name stays `W3-H harness (determinism)`.
     name: W3-H harness (determinism)
     needs: w3h-shard
-    if: always() && !cancelled()
+    if: always() && !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.only == 'all')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1340,6 +1355,7 @@ jobs:
 
   coverage:
     name: Coverage Gate
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     # 150 min holds the serialised build below: the full job measured
     # 75m48s (job 130877153343) and 64m21s on a same-head rerun (job
