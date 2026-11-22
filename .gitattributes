@@ -1,1 +1,5 @@
 Cargo.lock text eol=lf
+# Entries are added side by side under [Unreleased]; a union merge keeps both
+# sides, so two PRs that each add an entry do not conflict (local merges and
+# studio1 trains honour this; GitHub's own merge check does not).
+CHANGELOG.md merge=union
