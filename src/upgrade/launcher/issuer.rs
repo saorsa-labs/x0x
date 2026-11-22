@@ -462,15 +462,19 @@ fn read_owned_at(root: &File, name: &str, uid: u32) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let file = open_at(root, name)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != uid
-        || metadata.mode() & 0o777 != 0o600
-        || metadata.len() > plan_binding::MAX_BYTES
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} must be a regular file of this account with mode 0600"),
-        ));
+    let unusable =
+        |reason: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{name} {reason}"));
+    if !metadata.is_file() {
+        return Err(unusable("is not a regular file"));
+    }
+    if metadata.uid() != uid {
+        return Err(unusable("is not owned by this account"));
+    }
+    if metadata.mode() & 0o777 != 0o600 {
+        return Err(unusable("does not have mode 0600"));
+    }
+    if metadata.len() > plan_binding::MAX_BYTES {
+        return Err(unusable("exceeds the size limit"));
     }
     let mut bytes = Vec::new();
     file.take(plan_binding::MAX_BYTES + 1)
@@ -852,17 +856,40 @@ mod tests {
     fn a_missing_or_loose_plan_binding_is_refused() {
         let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
         let (args, command) = matching(&record);
-        let binding = root.join(plan_binding::BINDING_FILE_NAME);
-        std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(refused(issue_as(&args, &command, effective_uid())), "0644");
         let uid = effective_uid();
+        let binding = root.join(plan_binding::BINDING_FILE_NAME);
+        let refused_for = |reason: &str| {
+            let error = issue_as(&args, &command, uid).err().expect("refused");
+            assert!(start::is_refusal(&error), "{error}");
+            assert!(
+                error.to_string().contains(reason),
+                "want {reason:?}: {error}"
+            );
+        };
+        // Each check alone: mode, owner, type, a symlink to a valid
+        // binding (only the no-follow open refuses it), missing.
+        std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o644)).unwrap();
+        refused_for("does not have mode 0600");
         std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(issue_as(&args, &command, uid).unwrap().is_some());
+        let dir = open_root(&root, uid).unwrap();
+        let error =
+            read_owned_at(&dir, plan_binding::BINDING_FILE_NAME, uid + 1).expect_err("foreign");
+        assert!(
+            error.to_string().contains("not owned by this account"),
+            "{error}"
+        );
+        let valid = root.join("valid-binding.json");
+        std::fs::rename(&binding, &valid).unwrap();
+        std::os::unix::fs::symlink(&valid, &binding).unwrap();
+        refused_for("plan binding");
         std::fs::remove_file(&binding).unwrap();
-        std::os::unix::fs::symlink(root.join(journal::JOURNAL_FILE_NAME), &binding).unwrap();
-        assert!(refused(issue_as(&args, &command, uid)), "symlink");
-        std::fs::remove_file(&binding).unwrap();
-        assert!(refused(issue_as(&args, &command, uid)), "missing");
+        std::fs::create_dir(&binding).unwrap();
+        refused_for("is not a regular file");
+        std::fs::remove_dir(&binding).unwrap();
+        refused_for("plan binding");
+        std::fs::rename(&valid, &binding).unwrap();
+        assert!(issue_as(&args, &command, uid).unwrap().is_some());
     }
 
     /// #2012 (B4): the binding must bind this journal's plan, transaction

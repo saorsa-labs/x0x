@@ -202,6 +202,35 @@ fn check_root(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Remove a leftover plan binding that the strict writer would refuse to
+/// replace: a symlink (removed as a link; its target is not touched), a
+/// file it cannot read as a binding (corrupt, a later schema, oversized).
+/// A valid one stays, for the atomic replace. Only `stage` calls this,
+/// under the host lock and after the journal there was found settled or
+/// absent, so no in-flight transaction owns the binding. Anything else at
+/// the path (a directory) is refused and left alone.
+fn clear_unusable_binding(path: &Path) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let usable = metadata.is_file()
+        && journal::read_auxiliary_record(path)
+            .and_then(|bytes| plan_binding::validate_binding(&bytes))
+            .is_ok();
+    if usable {
+        return Ok(());
+    }
+    if !metadata.is_file() && !metadata.file_type().is_symlink() {
+        return Err(refused(format!(
+            "{} is not a file; remove it by hand",
+            path.display()
+        )));
+    }
+    std::fs::remove_file(path)
+}
+
 fn sha256_of(path: &Path) -> io::Result<[u8; 32]> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -449,11 +478,9 @@ impl Prepared {
         let binding = anchor
             .bind(&record.transaction_id, record.generation, &record.plan)
             .map_err(|error| refused(error.to_string()))?;
-        journal::write_auxiliary_record(
-            &data_root.join(plan_binding::BINDING_FILE_NAME),
-            &binding,
-            plan_binding::validate_binding,
-        )?;
+        let binding_path = data_root.join(plan_binding::BINDING_FILE_NAME);
+        clear_unusable_binding(&binding_path)?;
+        journal::write_auxiliary_record(&binding_path, &binding, plan_binding::validate_binding)?;
         journal::write_record(&path, &record)?;
         Ok(Self { path, record })
     }
@@ -688,6 +715,50 @@ pub(crate) mod tests {
         let binding = plan_binding::parse_binding(&std::fs::read(&binding_path).unwrap()).unwrap();
         anchor.verify(&binding, prepared.record()).unwrap();
         assert!(foreign.verify(&binding, prepared.record()).is_err());
+    }
+
+    /// #2171 review: a leftover binding the strict writer would refuse to
+    /// replace (corrupt, a later schema, a symlink) is replaced by the next
+    /// stage; a symlink's target is not touched.
+    #[test]
+    fn staging_replaces_an_unusable_leftover_binding() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let path = root.join(plan_binding::BINDING_FILE_NAME);
+        let journal_path = root.join(journal::JOURNAL_FILE_NAME);
+        let anchor = plan_binding::test_anchored(&plan);
+        let target = root.join("elsewhere.json");
+        std::fs::write(&target, b"not mine").unwrap();
+        let leftovers: [&dyn Fn(); 3] = [
+            &|| std::fs::write(&path, b"{corrupt").unwrap(),
+            &|| {
+                std::fs::write(
+                    &path,
+                    br#"{"schema":2,"record_kind":"plan_binding","future":true}"#,
+                )
+                .unwrap()
+            },
+            &|| std::os::unix::fs::symlink(&target, &path).unwrap(),
+        ];
+        for (index, leftover) in leftovers.into_iter().enumerate() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&journal_path);
+            leftover();
+            let prepared = Prepared::stage(&lock, &root, "tx", plan.clone(), &anchor)
+                .unwrap_or_else(|error| panic!("leftover {index}: {error}"));
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.is_file(), "leftover {index}");
+            let binding = plan_binding::parse_binding(&std::fs::read(&path).unwrap()).unwrap();
+            anchor.verify(&binding, prepared.record()).unwrap();
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"not mine");
+        // A directory there is not removed.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&journal_path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(Prepared::stage(&lock, &root, "tx", plan, &anchor).is_err());
+        assert!(path.is_dir() && !journal_path.exists());
     }
 
     #[test]

@@ -510,6 +510,12 @@ exactly the anchor's, before it writes anything. It writes the binding,
 then the Staged journal. The binding stays the same for the whole
 transaction.
 
+A leftover binding that the strict writer would refuse to replace (corrupt,
+a later schema, or a symlink) is removed first, under the host lock and
+only after the journal there is found settled or absent; a symlink is
+removed as a link and its target is not touched. Anything else at that
+path, such as a directory, refuses the stage.
+
 The issuer checks both only where it would give a trial. Each failure is a
 typed refusal (78):
 
@@ -527,7 +533,12 @@ typed refusal (78):
   the plan names another install pair or other participants than the
   anchor.
 
-An I/O error while reading either file is a failed read (75). A
+A missing anchor, or one the launcher's account cannot read, is a typed
+refusal (78) too, not a failed read: root writes it in a root directory,
+so it does not appear by itself. Only another I/O error while reading
+either file is a failed read (75). The mode checks read permission bits
+only; an access control list is not read (only root can set one on a
+root-owned anchor or directory). A
 passthrough needs neither file, so a unit without `--plan-anchor` (one an
 older installer wrote) still starts, but can never own a trial.
 

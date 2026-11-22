@@ -26,6 +26,12 @@
 //!
 //! This file depends only on `journal`, so the launcher includes it by
 //! path, as it does `journal.rs`.
+//!
+//! `dead_code` is allowed for the whole file because each compiling target
+//! uses a different half: the library (the producer) uses `bind` and
+//! `validate_binding` but not yet the reader, which the apply path will
+//! use (PR 5 of the #2012 plan); the launcher uses the reader and `verify`
+//! but never `bind`. Per-item allows would cover about ten items.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -246,7 +252,7 @@ pub(crate) const ANCHOR_OWNER: u32 = 0;
 
 /// Read the plan anchor at `path`. `owner` is the account that must own
 /// the anchor and may own its ancestors besides root ([`ANCHOR_OWNER`] in
-/// production; a test passes its own uid).
+/// production, so both must be root; a test passes its own uid).
 ///
 /// - `path` must be absolute and canonical.
 /// - Every ancestor must be a directory owned by root or `owner` that no
@@ -256,11 +262,24 @@ pub(crate) const ANCHOR_OWNER: u32 = 0;
 ///   mode (no group or other write) and size are checked on that
 ///   descriptor, and it is read from it.
 ///
-/// A failed check is `InvalidData`; a missing file is `NotFound`.
+/// The mode check reads the permission bits only. An access control list
+/// (macOS, or POSIX ACLs on Linux) is not read: only root can set one on
+/// a root-owned anchor or directory, so it is a limit of the check, not a
+/// way round it for the daemon's account.
+///
+/// A failed check is `InvalidData`; a missing file is `NotFound`. Each
+/// check has its own reason, so a refusal names what failed.
 #[cfg(unix)]
 pub(crate) fn read_anchor(path: &Path, owner: u32) -> io::Result<Anchored> {
+    read_anchor_as(path, owner, owner)
+}
+
+/// `read_anchor` with the ancestors' and the file's expected owners apart,
+/// so a test can make only one of them foreign.
+#[cfg(unix)]
+fn read_anchor_as(path: &Path, ancestor_owner: u32, file_owner: u32) -> io::Result<Anchored> {
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
     if !path.is_absolute() || path.canonicalize()? != path {
         return Err(refused(format!(
             "plan anchor {} must be absolute and canonical",
@@ -268,19 +287,65 @@ pub(crate) fn read_anchor(path: &Path, owner: u32) -> io::Result<Anchored> {
         )));
     }
     for ancestor in path.ancestors().skip(1) {
-        let metadata = std::fs::symlink_metadata(ancestor)?;
-        let writable_by_others = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
-        if !metadata.is_dir()
-            || (metadata.uid() != 0 && metadata.uid() != owner)
-            || writable_by_others
-        {
-            return Err(refused(format!(
-                "plan anchor ancestor {} must be a directory that only root can change",
-                ancestor.display()
-            )));
-        }
+        check_ancestor(ancestor, ancestor_owner)?;
     }
-    let file = std::fs::OpenOptions::new()
+    let file = open_anchor(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(refused("plan anchor is not a regular file"));
+    }
+    if metadata.uid() != file_owner {
+        return Err(refused(format!(
+            "plan anchor is owned by uid {}, not root",
+            metadata.uid()
+        )));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(refused("plan anchor is writable by group or others"));
+    }
+    if metadata.len() > MAX_BYTES {
+        return Err(refused("plan anchor file is larger than 64 KiB"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    Anchored::parse(bytes)
+}
+
+/// One ancestor of the anchor: a directory (not a symlink; a canonical
+/// path has none, but the path can change after `canonicalize`), owned by
+/// root or `owner`, that no group or other account can write unless it is
+/// sticky.
+#[cfg(unix)]
+fn check_ancestor(ancestor: &Path, owner: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(ancestor)?;
+    if !metadata.is_dir() {
+        return Err(refused(format!(
+            "plan anchor ancestor {} is not a directory",
+            ancestor.display()
+        )));
+    }
+    if metadata.uid() != 0 && metadata.uid() != owner {
+        return Err(refused(format!(
+            "plan anchor ancestor {} is owned by uid {}, not root",
+            ancestor.display(),
+            metadata.uid()
+        )));
+    }
+    if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+        return Err(refused(format!(
+            "plan anchor ancestor {} is writable by group or others",
+            ancestor.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Open the anchor without following a symlink at its last component.
+#[cfg(unix)]
+fn open_anchor(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
@@ -290,20 +355,7 @@ pub(crate) fn read_anchor(path: &Path, owner: u32) -> io::Result<Anchored> {
             } else {
                 error
             }
-        })?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.mode() & 0o022 != 0
-        || metadata.len() > MAX_BYTES
-    {
-        return Err(refused(
-            "plan anchor must be a regular file of root that no other account can write",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    Anchored::parse(bytes)
+        })
 }
 
 /// Test support: the anchor bytes for `plan`'s own install.
@@ -493,50 +545,102 @@ mod tests {
         );
     }
 
+    /// The reason of a refused read: an `InvalidData` refusal naming
+    /// `reason`.
+    fn refused_for(result: io::Result<Anchored>, reason: &str) {
+        let error = result.expect_err("refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(
+            error.to_string().contains(reason),
+            "want {reason:?}: {error}"
+        );
+    }
+
+    /// Each check of `read_anchor` has a case that only it refuses, so the
+    /// removal of any one check fails a case (#2171 review).
     #[test]
     fn read_anchor_checks_owner_mode_type_and_ancestors() {
         let (dir, root) = root();
         let plan = plan_in(&root);
         let path = write_test_anchor(&root, &plan);
+        let me = uid();
         assert_eq!(
-            read_anchor(&path, uid()).unwrap().anchor(),
+            read_anchor(&path, me).unwrap().anchor(),
             test_anchored(&plan).anchor()
         );
 
-        let fixed = |result: io::Result<Anchored>| {
-            let error = result.expect_err("refused");
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
-        };
-        // Another owner (root in production).
-        fixed(read_anchor(&path, uid() + 1));
-        // Writable by group or others.
+        // Only the file's owner is foreign: the file owner check alone.
+        refused_for(
+            read_anchor_as(&path, me, me + 1),
+            "plan anchor is owned by uid",
+        );
+        // Only the ancestors' owner is foreign: the test's own directories
+        // are not root's, so the ancestor owner check alone.
+        refused_for(
+            read_anchor_as(&path, me + 1, me),
+            &format!("ancestor {} is owned by uid", root.display()),
+        );
+        // A group-writable file, in good directories.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
-        fixed(read_anchor(&path, uid()));
+        refused_for(read_anchor(&path, me), "plan anchor is writable by group");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o646)).unwrap();
+        refused_for(read_anchor(&path, me), "plan anchor is writable by group");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        // An ancestor others can write (not sticky).
+        // A non-sticky ancestor others can write; a sticky one is allowed.
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
-        fixed(read_anchor(&path, uid()));
+        refused_for(
+            read_anchor(&path, me),
+            &format!("ancestor {} is writable by group", root.display()),
+        );
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o1777)).unwrap();
         assert!(
-            read_anchor(&path, uid()).is_ok(),
+            read_anchor(&path, me).is_ok(),
             "a sticky ancestor is allowed"
         );
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        // A symlink, and a path through a symlink.
-        let link = root.join("link.json");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        fixed(read_anchor(&link, uid()));
+        // A symlinked directory component: the canonical check.
         let linked_dir = dir.path().canonicalize().unwrap().join("linked-dir");
         std::os::unix::fs::symlink(&root, &linked_dir).unwrap();
-        fixed(read_anchor(&linked_dir.join(TEST_ANCHOR_NAME), uid()));
-        // Not a regular file.
+        refused_for(
+            read_anchor(&linked_dir.join(TEST_ANCHOR_NAME), me),
+            "must be absolute and canonical",
+        );
+        // A directory at the anchor path: the regular-file check.
         let directory = root.join("directory.json");
         std::fs::create_dir(&directory).unwrap();
-        fixed(read_anchor(&directory, uid()));
+        refused_for(read_anchor(&directory, me), "not a regular file");
+        // An oversized file: the descriptor's size check, before parsing.
+        let large = root.join("large.json");
+        std::fs::write(&large, vec![b' '; MAX_BYTES as usize + 1]).unwrap();
+        std::fs::set_permissions(&large, std::fs::Permissions::from_mode(0o644)).unwrap();
+        refused_for(read_anchor(&large, me), "larger than 64 KiB");
         // Missing.
-        let missing = read_anchor(&root.join("missing.json"), uid())
-            .err()
-            .unwrap();
+        let missing = read_anchor(&root.join("missing.json"), me).err().unwrap();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// The opener alone refuses a symlink at the last component (the
+    /// canonical check before it would too, but the path can change in
+    /// between), and the ancestor check alone refuses a symlink or a file
+    /// where a directory should be.
+    #[test]
+    fn the_opener_and_the_ancestor_check_refuse_links() {
+        let (_dir, root) = root();
+        let plan = plan_in(&root);
+        let path = write_test_anchor(&root, &plan);
+        let link = root.join("link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let error = open_anchor(&link).expect_err("refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(open_anchor(&path).is_ok());
+
+        let linked_dir = root.join("linked-dir");
+        std::os::unix::fs::symlink(&root, &linked_dir).unwrap();
+        let error = check_ancestor(&linked_dir, uid()).expect_err("refused");
+        assert!(error.to_string().contains("is not a directory"), "{error}");
+        let error = check_ancestor(&path, uid()).expect_err("refused");
+        assert!(error.to_string().contains("is not a directory"), "{error}");
+        check_ancestor(&root, uid()).unwrap();
     }
 }
