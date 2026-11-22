@@ -1361,7 +1361,9 @@ pipe, clock, record-barrier and foreground exit-status tests
 (`cargo test --lib windows_exec_regressions`,
 `cargo test --test upgrade_journal`). It then runs the flush-owner
 acceptance (#1764, `scripts/ci/windows-flush-acceptance.ps1`): the real
-`x0xd` under a wrapper made by `x0x autostart`, isolated from the network.
+`x0xd` under a wrapper made by `x0x autostart`, with no peers and with
+self-update on but its release sources off. The flush owner starts only
+when self-update is on (`[update] enabled = true`).
 It checks the owner start and pipe name, the token checks, a refusal for a
 second non-admin local user, the wrapper restart rule with a stub child,
 and the directory barrier on NTFS (see [`cicd.md`](cicd.md)).

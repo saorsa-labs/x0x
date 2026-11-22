@@ -99,8 +99,19 @@ class WindowsFlushAcceptanceControls(unittest.TestCase):
         config = self.script[start:self.script.index('"@', start)]
         for line in ('bootstrap_peers = []', 'mdns_enabled = false', 'port_mapping_enabled = false',
                      'rendezvous_enabled = false', 'bind_address = "127.0.0.1:0"',
-                     'api_address = "127.0.0.1:0"', '[update]\nenabled = false'):
+                     'api_address = "127.0.0.1:0"', '[update]\nenabled = true\n',
+                     'gossip_updates = false', 'fallback_check_interval_minutes = 0',
+                     'repo = "saorsa-labs/x0x-issue1764-no-such-repo"'):
             self.assertIn(line, config)
+        self.assertNotIn('repo = "saorsa-labs/x0x"\n', config)
+        # Run 45037951104: `[update] enabled = false` turned the owner off.
+        x0xd = read('src/bin/x0xd.rs')
+        self.assertIn('let self_update_enabled = config.update_enabled();', x0xd)
+        server = read('src/server/mod.rs')
+        self.assertIn('let upgrade_flush = if self_update_enabled {', server)
+        self.assertIn('&& (config.update.gossip_updates || config.update.fallback_check_interval_minutes > 0)', server)
+        self.assertIn('"Startup check: new version available"', read('src/server/routes/upgrade.rs'))
+        self.assertIn("'new version available'", self.script)
 
     def test_peer_never_sends_the_token(self):
         peer = PEER.read_text(encoding='utf-8')

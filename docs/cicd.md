@@ -73,8 +73,11 @@ compiler or test error.
   fails on exit 0xC00000FD (`STATUS_STACK_OVERFLOW`); the first acceptance run found that overflow in
   the debug CLI (A11, 22 Nov 2026). The job builds `x0xd` and `x0x`; the acceptance script makes the wrapper with the real
   `x0x autostart --name accept1764` (then deletes the logon task it registers), and runs the real `x0xd`
-  under that wrapper with an isolated loopback config: no seeds, no mDNS, no port mapping, no update
-  check. It checks that the flush owner starts and serves its named pipe at the derived name, that the
+  under that wrapper with an isolated loopback config: no seeds, no mDNS, no port mapping. Self-update
+  stays on, because `x0xd` starts the flush owner only then (`[update] enabled = false` turned the owner
+  off in run 45037951104). Both release sources are off (`gossip_updates = false`,
+  `fallback_check_interval_minutes = 0`), and the startup check asks GitHub for a repository that does
+  not exist, so it gets a 404 and cannot apply a real release. It checks that the flush owner starts and serves its named pipe at the derived name, that the
   pipe server is `x0xd`, that the API token is checked, that a second non-admin local user (made with
   `net user` for the run) is refused by the pipe DACL while it can open an Everyone pipe, that an ordinary
   stop ends `x0xd` and the wrapper with exit 0, that the wrapper restarts a stub child after exit 100 and

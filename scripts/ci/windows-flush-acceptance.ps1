@@ -3,8 +3,8 @@
 #
 # Runs on a GitHub-hosted windows-latest runner (Windows Server, admin
 # rights). It starts the real x0xd under the real `x0x autostart` v2 wrapper
-# with an isolated config (no seeds, no mDNS, no port mapping, no update
-# check, loopback only), then checks the flush owner from outside the
+# with an isolated config (no seeds, no mDNS, no port mapping, loopback
+# only), then checks the flush owner from outside the
 # process. It does NOT run a supervised apply: there is no signed test
 # release for it to download, so #1764 items 2 and 3 stay open beyond the
 # wrapper restart rule checked here with a stub child.
@@ -168,6 +168,12 @@ $wrapperOk = $wrapperText.Contains('$x0xWrapperVersion = 2') -and
 Add-Check '1' 'wrapper is template v2 for this x0xd and instance' $wrapperOk 'version, executable, arguments, restart flags'
 
 # ---- Isolated instance config ----------------------------------------------
+# x0xd starts the flush owner only when self-update is on
+# (`self_update_enabled = config.update_enabled()`); `[update] enabled =
+# false` disabled it silently in run 45037951104. Self-update stays on with
+# both release sources off (no gossip listener, no fallback poll). The one
+# startup check that remains asks GitHub for a repository that does not
+# exist, so it gets a 404 and cannot apply a real release on this runner.
 $root = Join-Path $Work 'instance'
 $dataDir = Join-Path $root 'data'
 New-Item -ItemType Directory -Force -Path $dataDir, (Join-Path $root 'identity') | Out-Null
@@ -186,7 +192,10 @@ rendezvous_enabled = false
 log_level = "info"
 
 [update]
-enabled = false
+enabled = true
+gossip_updates = false
+fallback_check_interval_minutes = 0
+repo = "saorsa-labs/x0x-issue1764-no-such-repo"
 
 [history]
 enabled = false
@@ -224,8 +233,22 @@ $facts.x0xd_command_line = $daemon.CommandLine
 $canonical = ('\\?\' + (Get-Item $dataDir).FullName).ToLowerInvariant()
 $hash = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($canonical))
 $expectedPipe = $PipePrefix + (($hash[0..15] | ForEach-Object { $_.ToString('x2') }) -join '')
+$facts.pipe_hash_input = $canonical
+$facts.pipe_expected = $expectedPipe
+# The owner starts before api.port is written, so the pipe should already
+# exist. Retry for 30 s anyway, so a slow start reads as slow, not absent.
+[void](Wait-Until { @(Get-PipeNames | Where-Object { $_.StartsWith($PipePrefix) }).Count -gt 0 } 30)
 $flushPipes = @(Get-PipeNames | Where-Object { $_.StartsWith($PipePrefix) })
 $facts.flush_pipes = $flushPipes
+$facts.x0x_pipes = @(Get-PipeNames | Where-Object { $_ -like '*x0x*' })
+$facts.x0x_pipes | Set-Content (Join-Path $Evidence 'x0x-pipes.txt')
+Write-Host "pipe hash input: $canonical"
+Write-Host "derived pipe:    $expectedPipe"
+Write-Host "pipes with x0x:  $($facts.x0x_pipes -join ', ')"
+$ownerLines = @(Get-Content $stdout, $stderr -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match 'flush|upgrade|update check|supervis' })
+$facts.owner_log = $ownerLines
+$ownerLines | ForEach-Object { Write-Host "x0xd: $_" }
 Add-Check '1' 'the flush owner serves its named pipe at the derived name' `
     ($flushPipes.Count -eq 1 -and $flushPipes[0] -eq $expectedPipe) "expected $expectedPipe, found $($flushPipes -join ',')"
 
@@ -324,6 +347,8 @@ Get-Process -Name x0xd -ErrorAction SilentlyContinue | Stop-Process -Force -Erro
 $logText = "$(Get-Content -Raw $stdout -ErrorAction SilentlyContinue)$(Get-Content -Raw $stderr -ErrorAction SilentlyContinue)"
 Add-Check '1' 'no "Acknowledged flush unavailable" warning in the x0xd log' `
     (-not $logText.Contains('Acknowledged flush unavailable')) "$($logText.Length) log characters"
+Add-Check '1' 'the startup update check found no release to apply' `
+    (-not $logText.Contains('new version available')) 'no "new version available" line'
 
 # ---- Items 2/3, wrapper half: restart on 100 and 75 only ----------------------
 # The generated wrapper with ONLY its executable line pointed at a stub that

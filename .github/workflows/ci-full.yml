@@ -1327,7 +1327,8 @@ jobs:
       # #1764: process-level acceptance of the flush owner on this hosted
       # Windows Server runner. The real x0xd runs under the real
       # `x0x autostart` v2 wrapper with an isolated loopback config (no seeds,
-      # no mDNS, no port mapping, no update check). The script checks the
+      # no mDNS, no port mapping; self-update on with its release sources off,
+      # because the flush owner needs it). The script checks the
       # owner start, the pipe name and server, the token checks, a refusal for
       # a second non-admin local user, the wrapper restart rule (stub child)
       # and the directory barrier on NTFS. It runs no supervised apply.
