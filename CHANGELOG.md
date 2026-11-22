@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- **`url` bumped to 2.5.9** (RUSTSEC-2026-0592): fixes a stack overflow in
+  `Url::origin()` when called on deeply nested `blob:` URLs. The flaw is in an
+  indirect dependency (`url` via `reqwest` / `tower-http`); x0x does not call
+  `origin()` directly, so the attack surface is limited to any caller that
+  processes attacker-supplied URLs. Lock change: `url` 2.5.8 → 2.5.9,
+  `form_urlencoded` 1.2.2 → 1.2.3.
+
 ### Upgrade notes
 
 - **Commit-bound removal binding (#2135).** New capability bit 22,
