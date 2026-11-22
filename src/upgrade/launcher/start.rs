@@ -502,6 +502,7 @@ mod tests {
             trial: Some(issuer::TrialArgs {
                 host_root: "/nonexistent".into(),
                 instance: "alice".into(),
+                plan_anchor: None,
             }),
             command: command(),
         };

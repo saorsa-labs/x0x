@@ -29,6 +29,8 @@ pub mod manifest;
 pub mod monitor;
 pub(crate) mod pair;
 #[cfg(unix)]
+pub(crate) mod plan_binding;
+#[cfg(unix)]
 pub(crate) mod prepare;
 #[cfg(unix)]
 pub(crate) mod prepare_live;

@@ -1600,8 +1600,9 @@ mod prepare_round_trip {
         })
         .expect("freeze");
         let lock = HostLock::acquire(&plan).expect("host lock");
+        let anchor = crate::upgrade::plan_binding::test_anchored(&plan);
         let mut prepared_journal =
-            Prepared::stage(&lock, &root, "tx-round-trip", plan).expect("stage");
+            Prepared::stage(&lock, &root, "tx-round-trip", plan, &anchor).expect("stage");
         for phase in [
             journal::Phase::Prepared,
             journal::Phase::SwappedDaemon,
@@ -1728,7 +1729,7 @@ mod prepare_round_trip {
         let Ok(lock) = HostLock::adopt(&plan, cli, daemon) else {
             panic!("the apply path's own locks were refused");
         };
-        Prepared::stage(&lock, &root, "tx", plan.clone()).expect("stage");
+        crate::upgrade::prepare::tests::stage(&lock, &root, "tx", plan.clone()).expect("stage");
         assert_eq!(
             HostLock::acquire_within(&plan, Duration::from_millis(100))
                 .err()
