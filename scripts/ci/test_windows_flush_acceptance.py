@@ -112,6 +112,18 @@ class WindowsFlushAcceptanceControls(unittest.TestCase):
         self.assertIn('&& (config.update.gossip_updates || config.update.fallback_check_interval_minutes > 0)', server)
         self.assertIn('"Startup check: new version available"', read('src/server/routes/upgrade.rs'))
         self.assertIn("'new version available'", self.script)
+        # The check must prove the updater ran: its 404 line is required.
+        self.assertIn('"Startup update check failed: {e}"', server)
+        for needle in ("'Startup update check failed'", "'404 Not Found'", "'x0x-issue1764-no-such-repo'"):
+            self.assertIn(f'$logText.Contains({needle})', self.script)
+
+    def test_cleanup_runs_in_finally(self):
+        tail = self.script[self.script.index('\n} finally {\n'):]
+        tail = tail[:tail.index('\n}\n')]
+        self.assertIn('net user $PeerUser /delete', tail)
+        self.assertIn('Stop-Process -Id $wrapperProcess.Id', tail)
+        self.assertIn('Get-Process -Name x0xd', tail)
+        self.assertEqual(self.script.count('net user $PeerUser /delete'), 1)
 
     def test_peer_never_sends_the_token(self):
         peer = PEER.read_text(encoding='utf-8')

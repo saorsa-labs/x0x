@@ -38,11 +38,13 @@ pub const DAEMON_MAIN_THREAD_NAME: &str = "x0xd-main";
 pub const CLI_MAIN_THREAD_NAME: &str = "x0x-main";
 
 /// Spawn `thread_name` with a [`DAEMON_THREAD_STACK_BYTES`] stack. On it,
-/// build a multi-thread Tokio runtime whose workers have the same stack, and
-/// block on the future that `make` returns.
+/// run `on_start`, then build a multi-thread Tokio runtime whose workers have
+/// the same stack (and inherit the thread's signal mask), and block on the
+/// future that `make` returns.
 fn spawn_runtime_thread<F, Fut>(
     thread_name: &str,
     role: &'static str,
+    on_start: fn(),
     make: F,
 ) -> anyhow::Result<std::thread::JoinHandle<anyhow::Result<Fut::Output>>>
 where
@@ -54,6 +56,7 @@ where
         .name(thread_name.to_string())
         .stack_size(DAEMON_THREAD_STACK_BYTES)
         .spawn(move || {
+            on_start();
             Ok(tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(DAEMON_THREAD_STACK_BYTES)
@@ -83,7 +86,7 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
     T: Send + 'static,
 {
-    spawn_runtime_thread(DAEMON_MAIN_THREAD_NAME, "daemon", make)?
+    spawn_runtime_thread(DAEMON_MAIN_THREAD_NAME, "daemon", || {}, make)?
         .join()
         .map_err(|_| anyhow::anyhow!("the daemon main thread panicked"))??
 }
@@ -93,8 +96,17 @@ where
 ///
 /// A panic on the CLI thread is re-raised on the caller with
 /// [`std::panic::resume_unwind`]. The panic hook has already printed the
-/// message once on the CLI thread, so the process exits with the same status
-/// (101) and prints the same message as a panic on the main thread did.
+/// message once, on the CLI thread, so the process exits with status 101 as
+/// a main-thread panic did; the message now names `thread 'x0x-main'`
+/// instead of `thread 'main'`.
+///
+/// On Unix, SIGPIPE is blocked on the calling thread before the CLI thread
+/// starts, and unblocked on the CLI thread before its runtime starts, so the
+/// runtime's workers inherit it unblocked. A write into a closed pipe then
+/// ends the process through SIGPIPE on a thread that writes, silently, under
+/// the default disposition the CLI sets (#478). Without this, macOS can
+/// deliver SIGPIPE to the waiting caller thread, and the writing thread
+/// first sees `EPIPE` and panics in `println!`.
 ///
 /// # Errors
 ///
@@ -106,9 +118,30 @@ where
     Fut: Future,
     Fut::Output: Send + 'static,
 {
-    match spawn_runtime_thread(CLI_MAIN_THREAD_NAME, "CLI", make)?.join() {
+    #[cfg(unix)]
+    set_sigpipe_mask(libc::SIG_BLOCK);
+    #[cfg(unix)]
+    let on_start: fn() = || set_sigpipe_mask(libc::SIG_UNBLOCK);
+    #[cfg(not(unix))]
+    let on_start: fn() = || {};
+    match spawn_runtime_thread(CLI_MAIN_THREAD_NAME, "CLI", on_start, make)?.join() {
         Ok(result) => result,
         Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Block or unblock SIGPIPE on the calling thread only. A failure leaves the
+/// mask as it was, which is the behaviour before #1764.
+#[cfg(unix)]
+fn set_sigpipe_mask(how: libc::c_int) {
+    // SAFETY: `set` is a local, initialised by `sigemptyset` before use;
+    // `pthread_sigmask` reads it and changes only this thread's mask. The
+    // old mask is not requested (null pointer is allowed).
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
     }
 }
 
@@ -275,6 +308,37 @@ mod tests {
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Whether SIGPIPE is blocked on the calling thread.
+    #[cfg(unix)]
+    fn sigpipe_blocked() -> bool {
+        // SAFETY: a null `set` only reads the current mask into `old`.
+        unsafe {
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut old);
+            libc::sigismember(&old, libc::SIGPIPE) == 1
+        }
+    }
+
+    /// #1764 review: SIGPIPE is unblocked on the CLI thread and its workers,
+    /// and blocked on the waiting caller, so a broken-pipe write ends the
+    /// process on a writing thread (#478).
+    #[cfg(unix)]
+    #[test]
+    fn cli_threads_take_sigpipe_and_the_caller_does_not() {
+        let (main, worker) = std::thread::spawn(|| {
+            let threads = run_cli_runtime(|| async {
+                let worker = tokio::spawn(async { sigpipe_blocked() }).await;
+                (sigpipe_blocked(), worker.ok())
+            })
+            .expect("CLI runtime");
+            assert!(sigpipe_blocked(), "the caller must block SIGPIPE");
+            threads
+        })
+        .join()
+        .expect("caller thread");
+        assert_eq!((main, worker), (false, Some(false)));
     }
 
     /// #1764: a CLI-thread panic is re-raised on the caller with its own
