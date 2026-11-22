@@ -204,6 +204,19 @@ impl CapabilityRegistry {
     /// when the data-write route is registered.
     pub const DATA_WRITE_V1: u64 = 1 << 21;
 
+    /// Issue #2135 (David's ruling, 22 Nov 2026: bind the commit identity
+    /// into the state hash): verifies the commit-bound binding
+    /// `treekem:epoch=<n>:commit=<blake3>` on an admin's TreeKEM
+    /// `MemberRemoved` and `MemberBanned`. Bit 22, the next free bit. An
+    /// admin seals that binding only while the target and every other
+    /// Active or Pending member is ready: its current verified advert
+    /// carries this bit, or a verified advert showed it while it was a
+    /// member of one of the admin's groups and no newer advert dropped it
+    /// ([`crate::dm_capability::CapabilityStore::registry_bit_ready`]).
+    /// Otherwise it seals the legacy `treekem:epoch=<n>`. A released
+    /// receiver recomputes the legacy binding for a ban and refuses it.
+    pub const REMOVAL_COMMIT_BINDING_V1: u64 = 1 << 22;
+
     /// The routes supported by every receiver of this release.
     /// Route-gated bits (`grant_revocation_push_v1`,
     /// `join_request_outcome_v1`, `join_request_head_v1`, `data_read_v1`,
@@ -228,7 +241,8 @@ impl CapabilityRegistry {
                 | Self::KEY_REPUBLISH_V1
                 | Self::TREEKEM_CATCHUP_REFUSAL_V1
                 | Self::SHARE_GRANT_NAMES_V1
-                | Self::ROSTER_ONLY_BAN_V1,
+                | Self::ROSTER_ONLY_BAN_V1
+                | Self::REMOVAL_COMMIT_BINDING_V1,
         }
     }
 

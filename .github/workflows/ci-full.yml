@@ -1148,7 +1148,7 @@ jobs:
           --require w3h_1581c_red_restart_stale_head_no_sync_past_wait
           --expect w3h_1581c_red_restart_stale_head_no_sync_past_wait=GREEN
           --require w3h_1581e_red_crash_commit_fork_contained
-          --expect w3h_1581e_red_crash_commit_fork_contained=RED
+          --expect w3h_1581e_red_crash_commit_fork_contained=GREEN
           --require w3h_1581e_control_crash_commit_same_chain_resume
           --expect w3h_1581e_control_crash_commit_same_chain_resume=GREEN
           --require w3h_1581f_control_local_authority_exit_revoked_committer

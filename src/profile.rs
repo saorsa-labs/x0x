@@ -429,6 +429,20 @@ impl IssuedCertRecord {
         })
     }
 
+    /// Whether this line states the agent's hosting mode and label (#2158).
+    ///
+    /// Only an owner-directed issuance ([`Self::from_cert_with_mode`],
+    /// written by `POST /owner/agents/issue`, which keeps the certificate
+    /// bytes) states them; a rider line or a labelled line always does. A
+    /// line written for the daemon's own issuance, on first sight of a live
+    /// certificate, or by owner sync has the default `Acp`, no label and no
+    /// certificate bytes: it records a certificate, not a mode, so it must
+    /// not reset a rider to `Acp`.
+    #[must_use]
+    pub fn states_mode(&self) -> bool {
+        self.mode == CertMode::Rider || self.label.is_some() || self.cert_b64.is_some()
+    }
+
     /// Append one record as a JSONL line (creates the file on first write;
     /// append-only — renewals add lines, history is never rewritten).
     ///
