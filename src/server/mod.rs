@@ -34,6 +34,7 @@ mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+mod sticky_capabilities;
 mod system_events;
 mod update_check;
 #[cfg(any(unix, windows))]
@@ -2499,6 +2500,9 @@ async fn serve_with_options_inner(
         }));
     }
 
+    // #2135: the removal-binding gate reads the sticky record, so it is
+    // loaded before the workers that seal removals start.
+    bg_tasks.push(sticky_capabilities::start(&state).await);
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
     ));

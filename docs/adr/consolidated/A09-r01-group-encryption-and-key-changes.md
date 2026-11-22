@@ -496,6 +496,143 @@ the receiver's leaf rule. `issue2133_treekem_leaf_known_limit` shows that
 a creator one commit behind is refused with `InvalidEpoch`. These tests
 show the gap; they do not accept it. No wire format changes.
 
+Amendment of 22 Nov 2026 ([#2135](https://github.com/saorsa-labs/x0x/issues/2135)
+item 2). **Decision by David, 22 Nov 2026: bind the commit identity into the
+state hash**, and accept the wire change, handled by versioning. The rollout
+rule, the sticky capability record, the target rule and the S4 row rule below
+were set by the orchestrator session under A15 on 22 Nov 2026. ADR 0110 stays
+Accepted and unchanged; this change builds what its §3 requires. #2135 stays
+open for GSS (below).
+- **The fault.** An admin's TreeKEM removal or ban sealed only
+  `treekem:epoch=<n>`. Two admins that remove the same member from the same
+  parent therefore made the same roster state hash, while their TreeKEM
+  commits, and so their epoch keys, differ. A node that held one took the
+  other for a duplicate, and a survivor that reported that head counted as
+  converged. The fork was silent (W3-H 1581e).
+- **Commit identity.** The BLAKE3-256 digest of the exact TreeKEM commit
+  bytes that the event carries, in the signed binding
+  `treekem:epoch=<n>:commit=<hex>`. This is the form that the self-leave
+  rekey (#1337) and the crypto-only exclusion already seal. The state hash
+  function is unchanged; only its binding input changes. The commit bytes
+  carry the committer's leaf signature and fresh path secrets, so two
+  admins' commits (or two attempts by one admin) differ. A replay of one
+  commit has the same bytes and the same state hash, so it stays a
+  duplicate. Each receiver checks the digest against the carried bytes
+  before it applies the commit; a binding over other bytes is refused.
+- **Rollout rule (mixed versions).** New capability bit 22,
+  `removal_commit_binding_v1`. An admin seals the commit-bound form on its
+  TreeKEM `MemberRemoved` or `MemberBanned` only while the target and every
+  other Active or Pending member is ready. The target counts because it
+  receives its own removal or ban and must apply it to tear down. A member
+  is ready when its current verified advert sets the bit, or when the
+  **sticky record** holds the bit for it. So a member that is offline,
+  partitioned, past the 900 s advert TTL or withholding its advert stays
+  ready once a verified advert has shown the bit while it was a member, and
+  a member never seen with it is not ready. Only a verified advert signed
+  later than the one that set the record, and without the bit (a downgrade
+  that advertises), clears it and means not ready; a replayed older advert
+  changes nothing. Otherwise the admin seals the legacy form. Receivers of
+  this release accept both forms.
+- **The sticky record.** It is kept per agent, because the bit is a
+  property of the agent's binary and the advert is per agent, and only for
+  agents that are Active or Pending members of a group this node is in (its
+  scope). Adverts from other agents on the mesh create no record and cannot
+  push one out, so the record has no other size limit than the local
+  membership. The daemon refreshes the scope every 5 s from its groups. A
+  record is dropped when its agent is a member of none of this node's groups
+  any more, which for a removal target happens after its removal committed,
+  when the gate no longer needs it. An agent that enters the scope with a
+  current verified advert showing the bit is recorded at once, so an advert
+  seen before the agent joined counts. Each entry keeps the bit and the
+  signed `created_at` of the advert that set it. It lives in the capability
+  store and in `<data_dir>/sticky-capabilities.json` (JSON, version 1, mode
+  0600, at most 8 MiB read), loaded at startup after the scope is set and
+  written (new temp file, fsync, rename) only when it changes. An
+  unreadable file is ignored and a bad entry is logged and skipped, so the
+  gate falls back to current adverts. Old binaries ignore the file.
+- **Old nodes.** Released nodes from 0.48.1 verify and apply a commit-bound
+  `MemberRemoved`. A released node rebuilds the legacy binding for a
+  `MemberBanned`, and 0.47 and older do that for both kinds, so the
+  state-hash check fails and the commit is refused (fail closed: it is not
+  applied, and the node stays behind at the frontier). A 0.49.0 node shows
+  this only as a debug trace (`treekem.trace`, stage `member_banned_apply`,
+  outcome `REJECTED`) and a stale head, so
+  the visible sign is on upgraded members, which see that node's head lag.
+  Such a node meets the new form only when it advertised the bit and then
+  downgraded without a new advert (the sticky record still says ready). A
+  mixed group with a member never seen with the bit keeps the legacy form,
+  and its known limit, until that member upgrades: two legacy-form removals
+  of one member still look the same. A legacy-form removal and a
+  commit-bound removal of the same member have different hashes, so that
+  fork is found.
+- **Detection.** A competing commit with a different hash takes the existing
+  fork-evidence path of ADR 0064: the node keeps its own head and installs
+  the `fork_quarantine` marker (`no_anchor` in an ordinary group). This also
+  covers an honest race: two admins that remove the same target at about the
+  same time now fork, and each node that took the marker waits for the
+  manual clear and the re-seat. ADR 0110 §3 intends this; before, the same
+  race forked silently.
+- **S4 rows (ADR 0110 §3).** While a group holds the marker, an open row
+  that holds a saved removal event or crypto-only frame stops its delivery,
+  keeps the saved event and never sends it, and waits as
+  `waiting_for_fork_resolution`. When the marker competes with the saved transition (the rule in
+  the Exit bullet), the stored wait names the competing commit's
+  signer: the saved event is fork evidence. The completion pass completes
+  no row of that group, because this node's chain may be the branch the
+  group did not take. The `.evs` is written only when the wait changes, not
+  on each worker pass. The persisted evidence is the marker in the group
+  record (the two commit headers, a fixed size) and the saved event and
+  wait in the frozen `.evs` v1 row. No new field.
+- **Exit.** ADR 0110 §2 says that S4 adds no fork choice, and §3 names
+  manual admin resolution under ADR 0088 §2 item 7. So this change adds no
+  branch choice and no new route, and the orchestrator's A15 ruling (resolve
+  to the lowest admin's commit by D74 and re-key) is not built, as that
+  ruling allowed when ADR 0110 says otherwise. The exit is the existing
+  manual clear (`POST /groups/:id/quarantine/clear`) or an owner-anchored
+  clear. When the marker is gone the row is classified against this node's
+  chain. The marker competed with the saved transition unless the marker's
+  competing commit chains on the transition's own result or on a later
+  commit of this node's retained chain above it (then the transition is
+  common ancestry); a deeper commit of a competing branch competes too,
+  and so does a marker whose competing commit's parent this node does not
+  retain: its saved event is dropped unsent, and a survivor that still
+  lacks the transition gets it by chain catch-up. If
+  the stored wait names a competing signer, or the chain holds a competing
+  child of the parent, the saved event is dropped unpublished and the row
+  completes from this node's chain. Otherwise a saved removal resumes as at
+  a restart (delivery after the head sync), and a crypto-only frame on the
+  current head resumes its delivery; any other frame stays as catch-up
+  evidence. A saved event that cannot be decoded is released once. The
+  stored wait keeps this rule across a restart after the clear. This node's
+  keys still differ from the other branch's; the exit for that is the
+  existing manual re-seat (A08, ADR 0109 §3).
+- **Failed rollback.** The routes now make the TreeKEM commit before the
+  seal. If the seal fails, the tree is restored from its snapshot. If that
+  restore fails, the daemon unloads the in-memory tree and then answers 500
+  `treekem_rollback_failed`, so no later operation uses the advanced tree:
+  they answer "TreeKEM group not loaded" until the durable tree, which
+  never held the commit, is reloaded (a restart or the next rebind). Only that reply and an error log name
+  the failure; group status does not show it.
+- **Known limits.** (1) An admin on the other branch keeps resending its
+  removal to the forked node every 5 s until the manual exit, because that
+  node never reports the result head; there is no backoff cap. (2) A GSS
+  removal still binds only `gss:epoch=<n>`, so two admins' GSS rotations for
+  one member's removal still look the same. #2135 stays open for it. (3) A
+  node downgraded to 0.49.x has no fork release rule: a row whose marker was
+  cleared before the downgrade may resume its delivery there. (4) An agent
+  on two machines with different binaries has one sticky record; a newer
+  advert from the older machine drops it. (5) A group with a member or
+  target never seen with the bit (every mixed-version group right after the
+  release) keeps the legacy binding and can still fork silently.
+- **#2139.** The new owner-recovery body version planned there is a
+  separate marker: its own body prefix and capability bit, on another commit
+  kind. Bit 22 governs only the binding of `MemberRemoved` and
+  `MemberBanned`. A receiver checks each marker by itself; neither implies
+  the other.
+
+Wire: capability bit 22 and the commit-bound binding on two event kinds
+behind it. Storage: the new `sticky-capabilities.json`. No route change.
+
 ## Security claims
 
 State the exact properties of each released path. Post-quantum signatures and key encapsulation do not alone prove forward secrecy or recovery after key compromise.
