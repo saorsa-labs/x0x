@@ -2908,10 +2908,12 @@ pub struct OwnerIssuedCert {
     /// journal (survives restarts); `false` when it came from live
     /// discovery only.
     pub from_journal: bool,
-    /// ADR-0039 hosting mode of the latest journal issuance (`Acp` for
-    /// live-discovery-only entries and legacy lines).
+    /// ADR-0039 hosting mode of the latest owner issuance in the journal
+    /// (#2158: a renewal or live sighting does not change it; `Acp` when
+    /// no journal line states a mode, as for legacy lines and the
+    /// daemon's own certificate).
     pub mode: profile::CertMode,
-    /// ADR-0039 operator label of the latest journal issuance.
+    /// ADR-0039 operator label of that same owner issuance.
     pub label: Option<String>,
 }
 
@@ -20826,6 +20828,15 @@ impl Agent {
     /// Every live certificate binds to the owner's `UserId` (verified at
     /// announce time), so foreign certs cannot enter the roster.
     ///
+    /// Hosting mode and label (#2158) come from the last journal line, in
+    /// file order, that states them (an owner issuance, see
+    /// [`profile::IssuedCertRecord::states_mode`]), whichever certificate
+    /// wins: a renewal or a live sighting keeps a rider a rider; a later
+    /// owner issuance in another mode changes it. File order, not
+    /// `issued_at`: only this daemon's issue route writes such lines and it
+    /// appends them in order, so a local clock step back cannot reorder
+    /// them.
+    ///
     /// Empty when no user identity is configured.
     pub async fn owner_issued_certificates(&self) -> Vec<OwnerIssuedCert> {
         let Some(owner) = self.identity.user_id() else {
@@ -20838,6 +20849,9 @@ impl Agent {
         let mut journal_digests: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let owner_hex = hex::encode(owner.as_bytes());
+        // agent_id hex → (mode, label) of the last line that states a mode.
+        let mut stated: std::collections::HashMap<String, (profile::CertMode, Option<String>)> =
+            std::collections::HashMap::new();
         if let Some(ref jp) = journal_path {
             for record in profile::IssuedCertRecord::load(jp).await {
                 // R3: records are owner-scoped — lines from a PREVIOUS
@@ -20847,14 +20861,18 @@ impl Agent {
                     continue;
                 }
                 journal_digests.insert(record.cert_digest.clone());
+                if record.states_mode() {
+                    stated.insert(record.agent_id.clone(), (record.mode, record.label.clone()));
+                }
                 let entry = OwnerIssuedCert {
                     agent_id: record.agent_id.clone(),
                     issued_at: record.issued_at,
                     not_after: record.not_after,
                     digest: record.cert_digest,
                     from_journal: true,
-                    mode: record.mode,
-                    label: record.label,
+                    // Set from `stated` once every source is merged.
+                    mode: profile::CertMode::Acp,
+                    label: None,
                 };
                 best.insert(record.agent_id, entry);
             }
@@ -20911,6 +20929,15 @@ impl Agent {
         }
 
         let mut out: Vec<OwnerIssuedCert> = best.into_values().collect();
+        for entry in &mut out {
+            let (mode, label) = stated
+                .get(&entry.agent_id)
+                .map_or((profile::CertMode::Acp, None), |(mode, label)| {
+                    (*mode, label.clone())
+                });
+            entry.mode = mode;
+            entry.label = label;
+        }
         out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
         out
     }
@@ -47559,6 +47586,8 @@ mod announce_rename_order_tests;
 #[cfg(test)]
 #[path = "identity_user_consent_persist_tests.rs"]
 mod identity_user_consent_persist_tests;
+#[cfg(test)]
+mod issue2158_rider_mode_tests;
 
 #[cfg(test)]
 mod wire_golden_tests;
