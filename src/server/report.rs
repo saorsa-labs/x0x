@@ -669,9 +669,10 @@ pub(crate) type RecipientRefusal = (StatusCode, &'static str, String);
 /// daemon's own agent, not a rider (a rider is hosted by this daemon, it
 /// is not a device), and with a certificate not expired at `now_secs`.
 /// `journal_riders` are the agents (hex) any journal line of this owner
-/// records in rider mode: the roster resets the mode of a renewed or
-/// live-announced certificate to ACP, so the roster mode alone is not
-/// enough to refuse a rider.
+/// records in rider mode: the roster shows the mode of the owner's latest
+/// issuance (#2158), so an agent re-issued as ACP after it was a rider is
+/// `acp` there, yet a rider token can still be minted from its rider line.
+/// Any rider line refuses it.
 pub(crate) fn check_owner_recipient(
     recipient_hex: &str,
     own_agent: &crate::identity::AgentId,

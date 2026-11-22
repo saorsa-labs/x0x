@@ -1195,7 +1195,10 @@ publishing explicit no-name X0A4 beats so peers erase it.
 restarts), `mode` (`"acp"` \| `"rider"`), `journal_label`, `revoked` (bool),
 `placement` (nullable enrichment: `"pinned"`/`"roaming"` + epoch — null when
 no owner-verified placement record is held; P enforcement fails open for such
-agents).
+agents). `mode` and `journal_label` come from the owner's latest
+`POST /owner/agents/issue` line for the agent, not from the certificate the
+row shows: a renewed or live-announced certificate keeps a rider `"rider"`
+with its label; a later issuance in the other mode changes it (#2158).
 
 ## Home (ADR-0038)
 

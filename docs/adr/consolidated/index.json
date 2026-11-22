@@ -33,7 +33,7 @@
       "revision": 1,
       "path": "A04-r01-agent-attachment-and-inbound-events.md",
       "title": "Agent Attachment and Inbound Events",
-      "sha256": "24be244632121de84e3c3a56af84e7aee540f7b4e1ec88fd8a154a4225cb0914"
+      "sha256": "6fee1c42104ef9e0edaef454007dc76152c9344c941cac89f0ed01e6939f0d27"
     },
     {
       "id": "A05",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "9e5ba4b9dece594233826a3499684c75f4bf20a9c9627428055d9db38de7c3bb"
+      "sha256": "9829388362440965dd78d372a40761b7acdb240c89a3b1b468f4f7de531eaca9"
     },
     {
       "id": "A15",

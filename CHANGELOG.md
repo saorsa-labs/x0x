@@ -16,6 +16,17 @@ All notable changes to this project will be documented in this file.
   closes the known limit left by #2110 item 1. Retained images, checkpoint
   adoption and legacy imports still copy the OR-Set for their rollback.
 
+### Fixed
+
+- **A renewed or live-announced certificate keeps a rider's roster mode
+  (#2158; A04 amendment of 22 Nov 2026).** `GET /owner/agents` (and
+  placement minting) showed a rider as `acp`, without its label, once a
+  newer certificate for it was seen live or journaled. The roster now takes
+  the mode and label from the owner's latest issuance in the journal
+  (`POST /owner/agents/issue`); a renewal or sighting changes only the
+  certificate. A later issuance in the other mode still changes the mode.
+  No journal format change; existing journals read correctly.
+
 ### Security
 
 - **`url` bumped to 2.5.9** (RUSTSEC-2026-0592): fixes a stack overflow in
