@@ -13,16 +13,54 @@ number its entry below cites; the entries hold the detail.
 
 - **Dependency pins:** `ant-quic =0.29.0` and all eleven `saorsa-gossip-*`
   crates `=0.5.95` (#2126, #2147; v0.48.1 shipped `=0.27.61` and
-  `=0.5.90`). ant-quic 0.29.0 changes packets on the wire (path-MTU probes
+  `=0.5.90`; the steps through 0.27.62, 0.28.0, 0.5.91 and 0.5.92 are
+  under Changed). ant-quic 0.29.0 changes packets on the wire (path-MTU probes
   to 1452 B, ECN, bounded relay queues of 256 packets); soak before a fleet
   rollout. The optional `voice` feature still pulls ant-quic 0.28.0 into
   `Cargo.lock`.
-- **Rust API:** `IdentityError::KeyNotFound` is a new variant and
-  `KvRemoveOutcome` has a new public field `held` (#2110 item 3, PR #2142); neither
-  type is `#[non_exhaustive]`, so an exhaustive `match` or a struct literal
-  must change. `NetworkConfig.relay_service_enabled` is a new field
-  (#1642). `DmError::RecipientMachineRevoked` is a new variant (#1597
-  item 4).
+- **Rust API:** these public types are not `#[non_exhaustive]` and gain
+  variants or public fields since v0.48.1, so an exhaustive `match` or a
+  struct literal must change:
+  - enum variants: `IdentityError::KeyNotFound` (#2110 item 3, PR #2142);
+    `KvError::StoreFull` (#1094 slice P1); `UpgradeError::ManifestTimestampInFuture`
+    (#1369, PR #1558); `DmError::RecipientCapabilityPending` and
+    `RecipientCapabilityUnavailable` (#1158, PR #1851),
+    `RecipientPairingDenied` (PR #1815) and `RecipientMachineRevoked`
+    (#1597 item 4);
+  - struct fields: `KvRemoveOutcome.held` (PR #2142);
+    `ReleaseManifest.channel` (required, see the manifest note below; PR
+    #1558); `NetworkConfig.relay_service_enabled` (#1642);
+    `GroupMember.kem_key_sequence` and `kem_key_revision` (#1663);
+    `SignedInvite.base_roster_root`, `InviteSignedViewV4.base_roster_root`
+    and `IssuedInviteRecord.base_roster_root` (#646);
+    `InviteLineage.base_roster` (#1797); `GroupInfo.displaced_certificates`
+    (#1650); `RosterMemberSnapshot.certificate` (#1023);
+    `ApplyContext.join_seat_marker_agents` and
+    `PublicIngestContext.join_seat_marker_agents` (#1578);
+    `GrantAccess.data` (#1094); `GrantDelivery.envelope` and
+    `PendingGrantDelivery.names` (ADR 0079 sender slice);
+    `DmDiagnosticsStats` gains seven `bus_fallback_publish_*`,
+    `bus_ack_publish_*` and `bus_ack_skipped_direct_sent` fields (#1964);
+    `x0x::server::DaemonConfig.gui_idle_timeout_minutes` (#2070),
+    `gui_show` (#1392) and `socks` (#1389);
+    `x0x::server::ServeOptions.daemon_config_path` and
+    `gui_show_write_path` (#1392).
+- **Release manifests:** a 0.49.0 daemon refuses a signed release manifest
+  without a `channel` field, so it refuses every manifest published for
+  v0.48.1 or earlier. It now also refuses a manifest with a zero timestamp
+  or one more than 5 minutes in the future (`ManifestTimestampInFuture`),
+  with the same rules on every ingestion and forwarding path (#1369, PR
+  #1558). Operator action (`docs/upgrade-system.md`): publish a
+  channel-bearing stable manifest before 0.49.0 daemons depend on it for
+  updates. A 0.48.1 daemon is not affected: its manifest struct does not
+  reject unknown fields and `schema_version` is still 1, so it reads a
+  0.49.0 manifest (`tests/upgrade_manifest_eligibility.rs` pins this with a
+  test-key-signed fixture).
+- **ant-quic 0.27.61 (v0.48.1) to 0.29.0:** no mixed-version run was done.
+  ant-quic's changelog says its 0.28.0 relay-service change is "no wire
+  change", and that 0.28.0 peers ignore 0.29.0's Hybrid relay bits. It
+  makes no claim about 0.27.61 peers. Run one canary 0.49.0 node against
+  the 0.48.1 seeds before promoting.
 - **Exit code:** a panic on the daemon thread makes `x0xd` exit with code 1,
   not 101; the thread is now `x0xd-main` (#2083).
 - **CLI:** `x0xd --check-updates` only reports; it no longer installs
@@ -35,6 +73,8 @@ number its entry below cites; the entries hold the detail.
   admin is eligible times out with `reason` `no_eligible_admin`, not
   `no_admission_result` (#2135 item 1). `POST /groups/:id/send` returns
   `fallback_topic: null` when no global copy was sent (#1964).
+  `POST /direct/send` can answer 409 `recipient_capability_pending` or
+  `recipient_capability_unavailable` (#1158, PR #1851).
   `GET /groups/:id/messages` can answer `429` `public_listener_cap` (#2124).
   A group store refuses a local put that would take its image past the
   12 MiB soft limit `SOFT_IMAGE_LIMIT_BYTES` (HTTP 507), and refuses a
@@ -84,6 +124,14 @@ number its entry below cites; the entries hold the detail.
 
 ### Fixed
 
+- **Obligation-carrying direct sends wait for the recipient's capability
+  advert (#1158, PR #1851).** A share grant, predecessor relay or requester
+  offer to a recipient with no current verified capability advert is not
+  sent; the obligation is kept and a targeted advert refresh is requested.
+  `POST /direct/send` answers 409 `recipient_capability_pending` while one
+  advert period runs and 409 `recipient_capability_unavailable` after it
+  (Rust: `DmError::RecipientCapabilityPending` /
+  `RecipientCapabilityUnavailable`); a later advert releases it.
 - **Launcher host root and `install.sh --launcher` hardening (#1378 review
   carry-overs; A14 amendment of 21 Nov 2026).** Once the launcher is
   turned on, its issuer refuses (exit 78) a `--host-root` that is not the
@@ -480,6 +528,9 @@ number its entry below cites; the entries hold the detail.
 
 ### Added
 
+- **`GET /onboard` and `x0x onboard` (#894, PR #1830).** An
+  install-and-join recipe that teaches another agent to install x0x and DM
+  this agent, with the signed card link.
 - **Launcher-bound systemd unit (#1378; A14 amendment of 20 Nov 2026).**
   The systemd restart readback accepts a unit that runs x0xd through the
   stable launcher installed next to x0xd: the daemon is read from the
@@ -886,6 +937,17 @@ number its entry below cites; the entries hold the detail.
 
 ### Changed
 
+- **A signed release manifest must carry its channel (#1369, PR #1558).**
+  `ReleaseManifest` has a new required `channel` field (`stable` or
+  `prerelease`) with no serde default; a manifest without it, or with an
+  empty, unknown or mismatched channel, is refused, with the same rules on
+  every ingestion and forwarding path. A zero timestamp, or one more than
+  5 minutes in the future (`UpgradeError::ManifestTimestampInFuture`), is
+  refused too. A 0.49.0 daemon therefore refuses every manifest published
+  for v0.48.1 or earlier. Operator action (`docs/upgrade-system.md`):
+  publish a channel-bearing stable manifest before new daemons enforce
+  this. A 0.48.1 daemon still reads a 0.49.0 manifest: its manifest struct
+  does not reject unknown fields and `schema_version` stays 1.
 - **ant-quic 0.29.0 and saorsa-gossip 0.5.95 (#2126, #2147; A06 amendment
   of 20 Nov 2026).** This release ships `ant-quic =0.29.0` and all eleven
   `saorsa-gossip-*` crates at `=0.5.95`. #2126 moved `ant-quic` from
@@ -925,6 +987,24 @@ number its entry below cites; the entries hold the detail.
   `saorsa-webrtc-core` 0.6.1, which needs ant-quic 0.28, so `Cargo.lock`
   now holds ant-quic 0.28.0 (voice only) beside 0.29.0; x0x passes no
   ant-quic type to saorsa-webrtc.
+
+- **ant-quic `=0.28.0`** (was `=0.27.62`) and **saorsa-gossip `=0.5.92`** for
+  all eleven `saorsa-gossip-*` crates (was `=0.5.91`; #1642). ant-quic 0.28.0
+  honours `relay_service_enabled` (ADR-019). The optional `voice` feature
+  moves to `saorsa-webrtc-core` and `saorsa-webrtc-codecs` `0.6.1` (was
+  `0.6.0`); `saorsa-webrtc-core` uses the same ant-quic and the codecs crate
+  does not depend on ant-quic. The `saorsa-gossip-pubsub` 0.5.92 sources are
+  byte-identical to 0.5.91, so the #501 controlled-load producer allowlist
+  moves to the crates.io 0.5.92 package (checksum `63b4b434…`).
+- **ant-quic `=0.27.62`** (was `=0.27.61`). It adds
+  `SendStream`/`RecvStream::connection_generation()` only (ant-quic#327).
+- **saorsa-gossip `=0.5.91`** for all eleven `saorsa-gossip-*` crates (was
+  `=0.5.90`; A06 amendment of 15 Nov 2026). Critical Data sends are no
+  longer held back by peer cooling at claim time; V3 control retries keep
+  one recovery intent; per-kind verify counters and `msg_id` subscriptions
+  are added. The #501 controlled-load producer allowlist now accepts only the
+  crates.io saorsa-gossip-pubsub 0.5.91 package (checksum `f69989fc…`);
+  0.5.90 is refused as superseded.
 
 - **The listeners a restart starts for stored groups follow one written
   rule (#1366 first slice, A08 amendment of 16 Nov 2026).** Only a
@@ -1254,23 +1334,6 @@ pub/sub constructors now take `Arc<SigningContext>` instead of
 
 ### Dependencies
 
-- **ant-quic `=0.28.0`** (was `=0.27.62`) and **saorsa-gossip `=0.5.92`** for
-  all eleven `saorsa-gossip-*` crates (was `=0.5.91`; #1642). ant-quic 0.28.0
-  honours `relay_service_enabled` (ADR-019). The optional `voice` feature
-  moves to `saorsa-webrtc-core` and `saorsa-webrtc-codecs` `0.6.1` (was
-  `0.6.0`); `saorsa-webrtc-core` uses the same ant-quic and the codecs crate
-  does not depend on ant-quic. The `saorsa-gossip-pubsub` 0.5.92 sources are
-  byte-identical to 0.5.91, so the #501 controlled-load producer allowlist
-  moves to the crates.io 0.5.92 package (checksum `63b4b434…`).
-- **ant-quic `=0.27.62`** (was `=0.27.61`). It adds
-  `SendStream`/`RecvStream::connection_generation()` only (ant-quic#327).
-- **saorsa-gossip `=0.5.91`** for all eleven `saorsa-gossip-*` crates (was
-  `=0.5.90`; A06 amendment of 15 Nov 2026). Critical Data sends are no
-  longer held back by peer cooling at claim time; V3 control retries keep
-  one recovery intent; per-kind verify counters and `msg_id` subscriptions
-  are added. The #501 controlled-load producer allowlist now accepts only the
-  crates.io saorsa-gossip-pubsub 0.5.91 package (checksum `f69989fc…`);
-  0.5.90 is refused as superseded.
 - **ant-quic `=0.27.61`** (was `=0.27.60`).
 - **saorsa-gossip `=0.5.90`** for all eleven `saorsa-gossip-*` crates (was
   `=0.5.89`). saorsa-gossip 0.5.90 changes only its ant-quic pin to
