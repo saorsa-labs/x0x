@@ -53,6 +53,7 @@ env:
 jobs:
   typecheck-lint:
     name: Python Example Typecheck & Lint
+    if: ${{ !startsWith(github.head_ref, 'train/') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -69,6 +70,7 @@ jobs:
 
   demo-e2e:
     name: Python Example Demo (two-daemon DM)
+    if: ${{ !startsWith(github.head_ref, 'train/') }}
     runs-on: ubuntu-latest
     needs: typecheck-lint
     # One debug build of x0xd plus a demo of about 3 minutes.

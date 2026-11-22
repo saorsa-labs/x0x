@@ -19,6 +19,7 @@ env:
 jobs:
   audit:
     name: Cargo Audit
+    if: ${{ !startsWith(github.head_ref, 'train/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -51,6 +52,7 @@ jobs:
 
   panic-check:
     name: Panic Scanner
+    if: ${{ !startsWith(github.head_ref, 'train/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

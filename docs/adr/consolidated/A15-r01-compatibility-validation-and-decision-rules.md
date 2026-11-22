@@ -95,6 +95,8 @@ ADR 0087 remains in force, including these rules:
 - An after-the-fact record of shipped behavior uses `Accepted (record)` and
   names the accepting ruling. It does not waive the ADR-before-code rule.
 
+Hosted jobs on bundle PRs and PR builds (amendment of 22 Nov 2026). David approved this change on 22 Nov 2026 to cut hosted GitHub Actions load; it is recorded under the delegation of 10 Nov 2026. ADR 0087 rule 1 stays: `ci.yml`, `build.yml`, `integration.yml` and `security.yml` still trigger on pull requests to any base. On a PR whose head branch is `train/*` every job in those workflows, and in `release-custody-check.yml`, `python-client-example.yml` and `adr-governance.yml`, is skipped by a job-level `if:` and reports "skipped". The orchestrator merges a bundle PR on the studio1 train result, each member PR had its own hosted run, and the push of the merge commit to `main` runs the full hosted set. A job skipped by `if:` satisfies a required check, so the rule 2 required list does not change. On other PRs `build.yml` builds only `Build linux-x64-gnu`; the other five platforms build on pushes to `main` and on `workflow_dispatch`. `docs/cicd.md` describes the workflows.
+
 ## Validation
 
 Each architectural guarantee has an owning test or evidence path. Important tests exercise the real dispatch and failure boundaries, including meaningful negative controls.
