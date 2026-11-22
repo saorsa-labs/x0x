@@ -1698,7 +1698,9 @@ const JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN: &str = "no_eligible_admin";
 /// slice lands. Real joiners never send `attempt_evidence` in this slice, so
 /// the evidence-bound staging arm is reachable only by a sender that mints
 /// its own `MemberJoined`; the rotation slice re-enables it bound to a real
-/// invite or attempt.
+/// invite or attempt. This gate covers only the poll-path (member-signed)
+/// staging: the authority stages the cause for a withheld admission it
+/// received itself (#2135, [`stage_no_eligible_admin_notice_for_withheld_join`]).
 const D154_STAGING_ENABLED: bool = false;
 
 /// ADR 0108 §8: a cause name must be 1 to 64 bytes of `[a-z0-9_]`. A name
@@ -1939,6 +1941,102 @@ async fn stage_join_pending_notice(
     );
 }
 
+/// The joiner-signed facts of a withheld `MemberJoined` that decide
+/// whether its attempt could be admitted once an admin is eligible again.
+struct WithheldJoinFacts<'a> {
+    invite_secret: &'a str,
+    role: x0x::groups::GroupRole,
+    ts_ms: u64,
+    certificate_b64: Option<&'a str>,
+    treekem_key_package_b64: Option<&'a str>,
+}
+
+/// #2135 (ADR 0108 §8 authority staging, D154; ADR 0110 §4): the local
+/// inviter withheld a verified, self-delivered `MemberJoined` because
+/// verified revocations cover every admin seat. It stages the typed cause
+/// `no_eligible_admin` (no detail) for that attempt, signed by its own key
+/// — the joiner's pinned authority — and serves it on the joiner's existing
+/// join-result poll under §8's serving rule.
+///
+/// The notice is staged only for an attempt the withhold alone stops: the
+/// joiner is not banned and not already Active, the invite is unaddressed
+/// or addressed to the joiner, the invite secret probes as consumable (on a
+/// clone; nothing is consumed), the #1941 unpaired-invite hold does not
+/// apply, in an `OwnerCertified` group the joiner's admission certificate
+/// verifies, and in a TreeKEM group the event carries a decodable key
+/// package. Any other attempt gets today's refusal or silence, so an
+/// invalid invite never learns that the group has no eligible admin. The member-signed half of D154 (a joiner
+/// polling other members while its authority is unreachable) is not built:
+/// [`D154_STAGING_ENABLED`] stays off.
+async fn stage_no_eligible_admin_notice_for_withheld_join(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    member_agent_id: &str,
+    event: &NamedGroupMetadataEvent,
+    facts: WithheldJoinFacts<'_>,
+) {
+    let Some(attempt_id) = member_joined_event_attempt_id(event) else {
+        return;
+    };
+    if info.is_banned(member_agent_id) || info.has_active_member(member_agent_id) {
+        return;
+    }
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && !facts.treekem_key_package_b64.is_some_and(|kp| {
+            use base64::Engine as _;
+            BASE64.decode(kp).is_ok()
+        })
+    {
+        return;
+    }
+    if info
+        .issued_invite_intended_joiner(facts.invite_secret)
+        .is_some_and(|intended| !intended.eq_ignore_ascii_case(member_agent_id))
+    {
+        return;
+    }
+    let mut probe = info.clone();
+    if probe
+        .consume_issued_invite(
+            facts.invite_secret,
+            member_agent_id,
+            facts.role,
+            facts.ts_ms,
+            now_millis_u64(),
+        )
+        .is_err()
+    {
+        return;
+    }
+    if group_recovery::unpaired_join_held(state, info, facts.invite_secret).await {
+        return;
+    }
+    let inline_certificate = facts.certificate_b64.and_then(|b64| {
+        use base64::Engine as _;
+        BASE64
+            .decode(b64)
+            .ok()
+            .and_then(|bytes| bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes).ok())
+    });
+    if owner_certified_admission_check(state, info, member_agent_id, inline_certificate.as_ref())
+        .await
+        .is_err()
+    {
+        return;
+    }
+    stage_join_pending_notice(
+        state,
+        group_key,
+        member_agent_id,
+        &attempt_id,
+        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+        JoinPendingNoticeDetail::default(),
+        member_joined_event_inviter(event),
+    )
+    .await;
+}
+
 /// ADR 0108 §8: a staged notice is dropped the moment a Result or Refused
 /// is staged for the same `(group, member, attempt)` — either terminal
 /// answer replaces it — or when its cause clears at the next poll-time
@@ -2103,7 +2201,7 @@ async fn evaluate_polled_join_pending_notice(
                 tracing::debug!(
                     group_id = %LogHexId::group(group_id),
                     member = %LogHexId::agent(member_agent_id),
-                    "ADR 0108 §8: no_eligible_admin staging stays off until the D154 rotation slice"
+                    "ADR 0108 §8: poll-path no_eligible_admin staging stays off until the D154 rotation slice; a notice the authority staged at the withheld admission is kept"
                 );
             }
         }
@@ -21511,6 +21609,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     member = %LogHexId::agent(&member_agent_id),
                     "MemberJoined: admission withheld; no eligible admin remains (ADR 0110 §4)"
                 );
+                // #2135 (ADR 0108 §8, D154): the authority tells the joiner
+                // why, with the typed cause `no_eligible_admin`, for an
+                // attempt that would otherwise be admitted.
+                if self_delivered {
+                    stage_no_eligible_admin_notice_for_withheld_join(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &member_agent_id,
+                        &event_for_log,
+                        WithheldJoinFacts {
+                            invite_secret: &invite_secret,
+                            role,
+                            ts_ms,
+                            certificate_b64: certificate_b64.as_deref(),
+                            treekem_key_package_b64: treekem_key_package_b64.as_deref(),
+                        },
+                    )
+                    .await;
+                }
                 return ApplyMetadataResult::REJECTED;
             }
 
@@ -55646,6 +55764,7 @@ pub(in crate::server) mod tests {
     mod issue646_base_roster_fetch;
     mod issue821_read_auth;
     mod issue877_error_body_session;
+    mod join_pending_no_eligible_admin_2135;
     mod join_pending_notice_1575;
     mod join_pending_notice_limiter_1575;
     mod join_pending_notice_wire_1575;
