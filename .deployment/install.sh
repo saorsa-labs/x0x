@@ -215,7 +215,10 @@ fetch_launcher() {
         *) echo "error: no released x0x-launcher for $(uname -s) $(uname -m)" >&2; return 1 ;;
     esac
     archive="x0x-launcher-$platform.tar.gz"
-    tmp="$(mktemp -d)"
+    tmp="$(mktemp -d)" || { echo "error: mktemp failed" >&2; return 1; }
+    if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+        echo "error: mktemp gave no directory" >&2; return 1
+    fi
     LAUNCHER_TMP="$tmp"
     echo "[install] fetching $archive for v$version"
     for name in "$archive" "$archive.sha256" "$archive.asc" SAORSA_PUBLIC_KEY.asc; do
@@ -254,7 +257,11 @@ LAUNCHER_DROPIN="$(dirname "$UNIT_DST")/$svc_name.service.d/30-x0x-launcher.conf
 LAUNCHER_TMP=""
 trap 'if [ -n "$LAUNCHER_TMP" ]; then rm -rf "$LAUNCHER_TMP"; fi' EXIT
 if [ "$LAUNCHER_SRC" = "fetch" ]; then
-    fetch_launcher || { echo "error: the launcher is not installed; nothing changed for $svc_name" >&2; exit 1; }
+    if ! fetch_launcher; then
+        echo "error: the launcher was not fetched; the launcher, its drop-in and the plan anchor" >&2
+        echo "       are unchanged (the unit and config above, and any --binary, are installed)" >&2
+        exit 1
+    fi
 fi
 if [ -n "$LAUNCHER_SRC" ]; then
     # The helper installs the launcher, the plan anchor of the install and the
@@ -267,18 +274,22 @@ if [ -n "$LAUNCHER_SRC" ]; then
         --launcher-source "$LAUNCHER_SRC" --launcher "$LAUNCHER_DST" \
         --instance "$INST_ID" --dropin "$LAUNCHER_DROPIN" --anchor-dir "$ANCHOR_DIR" || status=$?
     if [ "$status" -eq 2 ]; then
-        echo "error: nothing changed for $svc_name" >&2
+        systemctl daemon-reload
+        echo "error: the launcher step changed nothing: the launcher, its drop-in and the plan" >&2
+        echo "       anchor are as they were (the unit and config above, and any --binary, are installed)" >&2
         exit 1
     elif [ "$status" -ne 0 ]; then
         systemctl daemon-reload
-        echo "error: the launcher drop-in is not installed; $svc_name runs x0xd directly" >&2
+        echo "error: the launcher drop-in is not installed and $INST_ID is out of the plan anchor;" >&2
+        echo "       $svc_name runs x0xd directly (the unit and config above, and any --binary, are installed)" >&2
         exit 1
     fi
 elif [ -f "$LAUNCHER_DROPIN" ]; then
     if ! python3 "$SCRIPT_DIR/launcher-dropin.py" --remove \
         --binary "$BINARY_DST" --instance "$INST_ID" \
         --dropin "$LAUNCHER_DROPIN" --anchor-dir "$ANCHOR_DIR"; then
-        echo "error: the launcher drop-in is kept; nothing changed for $svc_name" >&2
+        echo "error: the launcher drop-in and the plan anchor are kept (the unit and config" >&2
+        echo "       above, and any --binary, are installed)" >&2
         exit 1
     fi
 fi

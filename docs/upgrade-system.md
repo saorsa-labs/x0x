@@ -592,63 +592,89 @@ drop-in's `ExecStart`:
   that runs that install names the same file. Each unit's install adds or
   replaces its own participant (instance id, data root). A binding carries
   one anchor digest and a plan must name every participant of the
-  install, so units that share one install (the fleet's `x0xd` and
-  `x0xd-443`, both running `/opt/x0x/x0xd`) must name byte-identical
+  install, so units that share one install must name byte-identical
   anchors; one shared file makes that so. A file there for another daemon
   target is refused.
 - **Canonical form.** The file is written with sorted keys, participants
   sorted by instance id, a two-space indent and a final newline, so a rerun
   that changes nothing writes the same bytes. The CLI target is the `x0x`
   beside the daemon (resolved if it is a link); the daemon target is the
-  installed binary's canonical path.
+  installed binary's canonical path. `tests/fixtures/plan-anchor-installer.json`
+  is checked against both this writer and the launcher's reader.
 - **Owner and place.** Root writes it (`install.sh` runs as root), mode
   0644, through a 0700 temporary file, fsync, rename and a directory fsync.
-  The directory is created 0755 if missing. It and every directory above it
-  must be root's and not writable by group or others (a sticky directory is
-  allowed), as the launcher checks. The path in the drop-in is canonical:
-  on macOS `/etc` is `/private/etc`.
-- **No change while a journal may be read.** A new anchor changes the
-  digest every binding of the install was made against, and the launcher
-  refuses (78) a trial whose binding does not match. So the installer
-  changes the anchor only when no data root it names, before or after,
-  holds a host journal other than an `idle` or `superseded` one (an
-  unreadable journal counts as one that may be read). Otherwise it exits
-  with "nothing changed": the anchor and the drop-in are as they were, and
-  the check runs before systemd is asked, so systemd never reloads the
-  unit without its drop-in. A rerun that leaves the same bytes is always
-  allowed.
-- **Launcher replacement.** A launcher binary that differs from the one
-  installed is written only when no data root of the install holds a
-  journal in an unsettled phase (anything but `host_committed`,
-  `restored`, `idle` and `superseded`); the old one is kept as
-  `x0x-launcher.previous` (ADR 0094 §5). Otherwise the install exits with
-  "nothing changed".
-- **Limit.** The installer does not take the data root's stage lock. An
-  anchor change and a stage that read the old anchor at the same moment can
-  still leave a binding for the old anchor, which the launcher refuses
-  (78) at the next trial start. The producer must read the anchor under
-  the stage lock once the apply path calls it (the next step of the plan).
-- **Removal.** `install.sh` without `--launcher` removes the drop-in and
-  this unit's participant from the anchor, and the file with its last
-  participant, under the same rule.
-- **A host where only some units are launcher-bound** has an anchor that
-  names only those units. A plan of that install names every running
-  participant, so it does not match and the producer refuses it: such a
-  host has no trial until every unit of the install is launcher-bound.
-- **A failure** before the drop-in is written leaves no new anchor; a
-  drop-in that cannot be written restores the anchor it replaced.
+  The directory is created 0755 whatever the umask. It and every directory
+  above it must be root's and not writable by group or others (a sticky
+  directory is allowed), as the launcher checks. The path in the drop-in is
+  canonical: on macOS `/etc` is `/private/etc`.
+- **Checks before changes.** Every check runs before the first change,
+  including the final check against the data root found after systemd is
+  asked. The launcher, its drop-in and the anchor change only when no data
+  root the anchor names, before or after, and no data root of this unit
+  holds a host journal other than an `idle` or `superseded` one. A
+  HostCommitted or Restored journal holds them too, since its launcher may
+  still run a trial and reads the anchor on every start. A journal that is
+  unreadable, a symlink or not a regular file counts as a journal; it is
+  opened without following a symlink or blocking on a FIFO. A refusal
+  exits with "the launcher step changed nothing": the launcher, the drop-in
+  and the anchor are as they were. A refusal found after systemd was asked
+  restores the drop-in and the anchor and reloads systemd, and `install.sh`
+  reloads systemd again. The unit file, the config and any `--binary` that
+  `install.sh` wrote before the launcher step stay installed; the message
+  says so.
+- **The anchor names a unit only while its drop-in is in place.** The unit
+  leaves the anchor first, then the launcher and the drop-in are written,
+  and the unit enters the anchor last. A power loss at any step therefore
+  never leaves the anchor naming a unit without its drop-in (a test crashes
+  after each change). A failed install that removes the drop-in also takes
+  the unit out of the anchor, whatever the journals say: a launcher that
+  then refuses a binding fails closed. The drop-in's header says to remove
+  it with `install.sh` without `--launcher`; a drop-in deleted by hand
+  still leaves the anchor naming that unit.
+- **One run at a time.** A run holds an exclusive lock on
+  `<anchor dir>/.install.lock`, so two runs for units of one install never
+  rewrite the shared anchor at once. A run that waits longer than 120 s
+  (`X0X_INSTALL_LOCK_WAIT`) changes nothing.
+- **Launcher replacement.** The installed launcher must be a regular file
+  (a symlink there is refused, not followed). A different launcher is
+  installed under the journal rule above; the old one is kept as
+  `x0x-launcher.previous`.
+- **Removal.** `install.sh` without `--launcher` takes this unit out of the
+  anchor (the file goes with its last participant), then removes the
+  drop-in, under the same rule.
+- **Fleet hosts have no trial today.** A plan names every running
+  participant of an install, and the anchor names only launcher-bound
+  units. The fleet's `x0xd-443` unit has a generated config
+  (`deploy-443.sh`), and `install.sh` refuses such an instance, so no
+  shipped tool can bind it: the producer refuses those plans.
+- **Limits.** Anchor membership alone does not prove a unit is bound now:
+  before the launcher is enabled, the producer must check that every
+  anchored unit is launcher-bound and that its launcher reads the journal
+  format (the `--capabilities` gate). The installer does not take the data
+  root's stage lock, so an anchor change at the same moment as a stage
+  that read the old anchor can leave a binding the launcher refuses (78);
+  the producer must read the anchor under the stage lock. The fleet units
+  run as root, so there the root-owned anchor is the daemon's own account:
+  tamper-evidence only, as on macOS.
 
 `install.sh --launcher` with no path fetches the release asset
 `x0x-launcher-<platform>.tar.gz` for the installed x0xd's own version
 (`x0xd --version`; Linux x86_64 and aarch64), its `.sha256`, its GPG
 signature (`.asc`) and `SAORSA_PUBLIC_KEY.asc`. It needs curl and gpg. The
-key must have the pinned fingerprint and the signature must be a `VALIDSIG`
-of it, checked in a throwaway GnuPG home; a failure changes nothing. The
-release workflow builds `x0x-launcher` (`--features m2-launcher`) for
-linux-x64-gnu, linux-arm64-gnu, macos-x64 and macos-arm64 and ships it as
-that archive, signed with ML-DSA-65 (`.sig`) and GPG (`.asc`). It is not in
-the signed release manifest or the release custody set: self-update never
-replaces the launcher.
+`.sha256` must hold 64 hex digits that match, the key must have the pinned
+fingerprint and the signature must be a `VALIDSIG` of it, checked in a
+throwaway GnuPG home. A failure leaves the launcher, its drop-in and the
+anchor as they were. The release workflow builds `x0x-launcher`
+(`--features m2-launcher`) for linux-x64-gnu, linux-arm64-gnu, macos-x64 and
+macos-arm64 and ships it as that archive, signed with ML-DSA-65 (`.sig`,
+context `x0x-launcher-v1`) and GPG (`.asc`). It is not in the signed release
+manifest or the release custody set: self-update never replaces the
+launcher. Not yet done (open before the launcher is enabled):
+`--launcher PATH` verifies nothing about the given file; a signature covers
+the archive's bytes only, so an older validly signed launcher is accepted
+(no version binding, no rollback protection); the launcher binary has no
+build-provenance record; and the release does not run the packaged
+launcher before shipping it.
 
 #### Moving a data root to another install (#2012)
 
@@ -662,10 +688,12 @@ the daemon down, shows it as its own state (`refusal_kind:
 targets, and gives the remedy:
 
 - **Settled journal** (`host_committed`, `restored`, `idle`,
-  `superseded`): it is history for the new install. Stop the unit (every
-  unit of the old install that uses this data root), move
-  `upgrade-journal.json` and every `upgrade-plan-binding.*.json` in the
-  data root aside, then start the unit.
+  `superseded`) of an install that no longer runs on this data root: stop
+  the unit, move `upgrade-journal.json` and every
+  `upgrade-plan-binding.*.json` in the data root aside, then start the
+  unit. If the other install still runs on this data root, do not move the
+  journal (its launcher may still need it for a trial): give each install
+  its own data root.
 - **Any other phase:** an update of the other install is still in
   progress. Do not remove the journal. Run the other install until its
   update settles (or its launcher restores it), then move the settled

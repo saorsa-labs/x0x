@@ -323,8 +323,11 @@ fn launcher_refusal_check(dir: &std::path::Path) -> Option<DoctorCheck> {
 /// the data directory moved to another install, or two installs share it.
 /// The remedy depends on the journal's phase, which this reads (read only).
 /// A settled journal (`host_committed`, `restored`, `idle`, `superseded`)
-/// is history for the new install: stop the job, move the journal and its
-/// plan bindings aside, start the job. Any other phase is an update of the
+/// of an install that no longer runs on this data directory is history:
+/// stop the job, move the journal and its plan bindings aside, start the
+/// job. If the other install still runs on it, the journal stays (its
+/// launcher may still need it for a trial) and each install needs its own
+/// data directory. Any other phase is an update of the
 /// other install still in progress: leave it, run that install again, or
 /// restore it, until its journal is settled (docs/upgrade-system.md,
 /// "Moving a data root to another install").
@@ -355,8 +358,11 @@ fn other_install_check(
     };
     let remedy = if settled {
         format!(
-            "the host journal is settled, so it is history for this install: stop the job, \
-             move {} and every upgrade-plan-binding.*.json in {} aside, then start the job",
+            "the host journal is settled. If this data directory moved to this install and \
+             the other install no longer runs on it, stop the job, move {} and every \
+             upgrade-plan-binding.*.json in {} aside, then start the job. If the other install \
+             still runs on this data directory, do not move the journal (its launcher may still \
+             need it for a trial); give each install its own data directory",
             journal::JOURNAL_FILE_NAME,
             dir.display()
         )
@@ -4468,6 +4474,11 @@ mod tests {
         producer::settle(&root, Phase::HostCommitted);
         let check = down_upgrade_check(Some(&root));
         assert!(check.detail.contains("is settled"), "{}", check.detail);
+        assert!(
+            check.detail.contains("its own data directory"),
+            "{}",
+            check.detail
+        );
         assert!(
             check.detail.contains("upgrade-plan-binding.*.json"),
             "{}",

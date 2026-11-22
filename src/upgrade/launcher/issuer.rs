@@ -423,7 +423,7 @@ fn plan_daemon_lock(
             held.metadata().map_err(retry)?,
             lock.metadata().map_err(retry)?,
         );
-        if a.dev() == b.dev() && a.ino() == b.ino() {
+        if same_file((a.dev(), a.ino()), (b.dev(), b.ino())) {
             return Ok(None);
         }
     }
@@ -440,6 +440,12 @@ fn plan_daemon_lock(
             Err(std::fs::TryLockError::Error(error)) => return Err(retry(error)),
         }
     }
+}
+
+/// Two files are one file only when both the device and the inode are
+/// equal: inode numbers repeat across file systems.
+fn same_file(a: (u64, u64), b: (u64, u64)) -> bool {
+    a == b
 }
 
 /// Before a passthrough `exec` of a trial-form start that holds no lock
@@ -1079,6 +1085,15 @@ mod tests {
             "the start waited on its own lock"
         );
         assert!(refused(result));
+    }
+
+    /// #2186 review: the same-file check needs both halves; the same inode
+    /// on another device is another file.
+    #[test]
+    fn same_file_compares_device_and_inode() {
+        assert!(same_file((1, 5), (1, 5)));
+        assert!(!same_file((1, 5), (2, 5)));
+        assert!(!same_file((1, 5), (1, 6)));
     }
 
     /// #2171 review 3 (b): a plan lock that cannot be taken (its directory

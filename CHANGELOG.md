@@ -17,11 +17,15 @@ All notable changes to this project will be documented in this file.
   install with the typed reason `other-install-journal`, which `x0x doctor`
   shows with its remedy. `.deployment/install.sh --launcher` now writes one
   root-owned plan anchor per install (`/etc/x0x/launcher/install-<key>.anchor.json`,
-  shared by every unit of that install) and adds `--plan-anchor` to the
-  drop-in; it refuses to change the anchor while a host journal there can
-  still be read, and with no path it fetches and GPG-verifies the new
+  shared by every unit of that install that it binds) and adds
+  `--plan-anchor` to the drop-in. It changes the launcher, the drop-in and
+  the anchor only when no data root of the install holds a journal other
+  than an idle or superseded one, runs one install at a time per anchor
+  directory, and never leaves the anchor naming a unit without its drop-in.
+  With no path it fetches and GPG-verifies the new
   `x0x-launcher-<platform>.tar.gz` release asset (Linux x64 and ARM64; the
-  release also builds macOS). The launcher is still dormant (`ENABLED` is
+  release also builds macOS). The fleet's `x0xd-443` units cannot be bound
+  yet, so fleet hosts have no trial. The launcher is still dormant (`ENABLED` is
   false) and no apply path calls the producer, so no install changes
   behaviour.
 - **Launcher journal integrity binding (#2012, design B4; A14 amendment of

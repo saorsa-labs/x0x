@@ -10,6 +10,7 @@ import os
 import pwd
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -87,7 +88,7 @@ class RenderTests(unittest.TestCase):
 
     def test_renders_the_trial_form_from_the_unit_and_the_daemon(self) -> None:
         self.assertEqual(
-            self.render().splitlines()[2:],
+            self.render().splitlines()[3:],
             [
                 "[Service]",
                 "ExecStart=",
@@ -386,7 +387,7 @@ class ReplaceFileTests(unittest.TestCase):
             try:
                 with mock.patch.object(dropin.os, "open", side_effect=record_open):
                     with mock.patch.object(dropin.os, "fsync", wraps=os.fsync) as fsync:
-                        dropin.install_launcher(self.source, self.target)
+                        dropin.install_launcher(self.source.read_bytes(), self.target)
             finally:
                 os.umask(previous)
             self.assertEqual(self.target.read_bytes(), b"launcher bytes")
@@ -576,6 +577,8 @@ class InstallShTests(unittest.TestCase):
         self.assertFalse(self.dropin.exists())
         # The anchor pre-check runs the daemon's check before systemd is asked.
         self.assertEqual(self.systemctl_calls(), ["daemon-reload"])
+        # The drop-in is gone, so the unit is out of the anchor too.
+        self.assertFalse(self.anchor.exists())
 
     def test_an_unsplittable_exec_start_is_a_typed_refusal(self) -> None:
         self.write_unit(f"User={ME.pw_name}", exec_args='--name "testnet')
@@ -617,12 +620,15 @@ class InstallShTests(unittest.TestCase):
             json.dumps({"phase": phase}), "utf-8"
         )
 
-    def test_a_rerun_keeps_the_same_anchor_bytes_even_over_a_journal(self) -> None:
+    def test_a_rerun_keeps_the_same_anchor_bytes(self) -> None:
         self.assert_installed(self.install())
         before = self.anchor.read_bytes()
-        self.write_journal("host_committed")
+        inode = self.anchor.stat().st_ino
+        self.write_journal("idle")
         self.assert_installed(self.install())
         self.assertEqual(self.anchor.read_bytes(), before)
+        # Written by rename, never in place: a reader of the old file keeps it.
+        self.assertNotEqual(self.anchor.stat().st_ino, inode)
 
     def test_the_anchor_does_not_change_while_a_journal_is_in_flight(self) -> None:
         self.assert_installed(self.install())
@@ -634,9 +640,31 @@ class InstallShTests(unittest.TestCase):
             result = self.install(launcher=False)
             self.assertEqual(result.returncode, 1, phase)
             self.assertIn(f"is {phase}", result.stderr)
-            self.assertIn("nothing changed", result.stderr)
+            self.assertIn("are kept", result.stderr)
             self.assertEqual(self.dropin.read_bytes(), dropin_before, phase)
             self.assertEqual(self.anchor.read_bytes(), before, phase)
+            # A rerun is refused too, before anything is touched.
+            result = self.install()
+            self.assertEqual(result.returncode, 1, phase)
+            self.assertIn("changed nothing", result.stderr)
+            self.assertEqual(self.dropin.read_bytes(), dropin_before, phase)
+            self.assertEqual(self.anchor.read_bytes(), before, phase)
+        # A FIFO or a symlink at the journal path counts as a journal, and
+        # does not hang the installer.
+        journal = self.data_root / "upgrade-journal.json"
+        journal.unlink()
+        os.mkfifo(journal)
+        result = self.install(launcher=False)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("not a regular file", result.stderr)
+        journal.unlink()
+        target = self.tmp / "elsewhere.json"
+        target.write_text('{"phase": "idle"}', "utf-8")
+        journal.symlink_to(target)
+        result = self.install(launcher=False)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("unreadable", result.stderr)
+        journal.unlink()
         for phase in ("idle", "superseded"):
             self.write_journal(phase)
             self.assert_installed(self.install())
@@ -655,11 +683,16 @@ class InstallShTests(unittest.TestCase):
         self.write_journal("booting")
         result = self.install()
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn("launcher cannot be replaced", result.stderr)
-        self.assertIn("nothing changed", result.stderr)
+        self.assertIn("the launcher, its drop-in and the plan anchor cannot change", result.stderr)
+        self.assertIn("changed nothing", result.stderr)
         self.assertEqual(launcher.read_bytes(), old)
         self.assertEqual(self.dropin.read_bytes(), dropin_before)
-        self.write_journal("host_committed")
+        # HostCommitted and Restored still give a trial: not replaced either.
+        for phase in ("host_committed", "restored"):
+            self.write_journal(phase)
+            self.assertEqual(self.install().returncode, 1, phase)
+            self.assertEqual(launcher.read_bytes(), old, phase)
+        self.write_journal("idle")
         self.assert_installed(self.install())
         self.assertEqual(launcher.read_bytes(), self.launcher_src.read_bytes())
         self.assertEqual(launcher.with_name("x0x-launcher.previous").read_bytes(), old)
@@ -675,12 +708,13 @@ class InstallShTests(unittest.TestCase):
         fake_daemon(self.binary, self.log, f'    data_dir: "{moved}",')
         result = self.install()
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn("nothing changed", result.stderr)
+        self.assertIn("changed nothing", result.stderr)
         self.assertEqual(self.dropin.read_bytes(), dropin_before)
         self.assertEqual(self.anchor.read_bytes(), before)
-        # Refused before systemd was asked, so systemd never reloaded the
+        # Refused before systemd was asked by the helper (install.sh then
+        # reloads once, with the drop-in in place), so systemd never reloaded the
         # unit without its launcher drop-in.
-        self.assertEqual(self.systemctl_calls(), [])
+        self.assertEqual(self.systemctl_calls(), ["daemon-reload"])
 
     def test_a_failed_first_install_leaves_no_anchor_and_no_drop_in(self) -> None:
         self.write_daemon(1)
@@ -716,6 +750,151 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("writable by group or others", result.stderr)
         self.assertFalse(self.dropin.exists())
+
+    def test_a_journal_that_appears_before_the_late_check_restores_everything(self) -> None:
+        self.assert_installed(self.install())
+        launcher = self.binary.with_name("x0x-launcher")
+        old_launcher = launcher.read_bytes()
+        before = self.anchor.read_bytes()
+        dropin_before = self.dropin.read_bytes()
+        self.launcher_src.write_text("#!/bin/sh\nexit 4\n", encoding="utf-8")
+        # The daemon's second `--check` (after systemd was asked) leaves an
+        # in-flight journal, as a stage starting at that moment would.
+        count = self.tmp / "checks"
+        text = self.binary.read_text("utf-8").replace(
+            "#!/bin/sh\n",
+            "#!/bin/sh\n"
+            f'n=$(cat "{count}" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "{count}"\n'
+            f'[ $n -eq 2 ] && echo \'{{"phase": "booting"}}\' > "{self.data_root}/upgrade-journal.json"\n',
+            1,
+        )
+        self.binary.write_text(text, "utf-8")
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("is booting", result.stderr)
+        self.assertIn("changed nothing", result.stderr)
+        self.assertEqual(self.dropin.read_bytes(), dropin_before)
+        self.assertEqual(self.anchor.read_bytes(), before)
+        self.assertEqual(launcher.read_bytes(), old_launcher)
+        # systemd was asked without the drop-in, so it is reloaded with it
+        # back: by the helper, then by install.sh.
+        self.assertEqual(
+            self.systemctl_calls(), [*HELPER_CALLS, "daemon-reload", "daemon-reload"]
+        )
+
+    def test_another_participants_journal_holds_the_launcher_and_the_anchor(self) -> None:
+        self.assert_installed(self.install())
+        other = self.tmp / "data" / "x0x-443"
+        other.mkdir(mode=0o700)
+        old, new = dropin.anchor_change(
+            self.anchor, str(self.binary), str(self.binary.with_name("x0x")), "443", str(other)
+        )
+        dropin.write_anchor(self.anchor, new)
+        before = self.anchor.read_bytes()
+        launcher = self.binary.with_name("x0x-launcher")
+        old_launcher = launcher.read_bytes()
+        (other / "upgrade-journal.json").write_text('{"phase": "booting"}', "utf-8")
+        self.launcher_src.write_text("#!/bin/sh\nexit 5\n", encoding="utf-8")
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(f"{other} is booting", result.stderr)
+        self.assertEqual(launcher.read_bytes(), old_launcher)
+        self.assertEqual(self.anchor.read_bytes(), before)
+        # Refused by the first check: the helper never asked systemd.
+        self.assertEqual(self.systemctl_calls(), ["daemon-reload"])
+
+    def test_a_symlink_at_the_launcher_path_is_refused_not_followed(self) -> None:
+        self.assert_installed(self.install())
+        launcher = self.binary.with_name("x0x-launcher")
+        target = self.tmp / "elsewhere-launcher"
+        target.write_text("#!/bin/sh\nexit 9\n", encoding="utf-8")
+        launcher.unlink()
+        launcher.symlink_to(target)
+        self.launcher_src.write_text("#!/bin/sh\nexit 8\n", encoding="utf-8")
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("installed launcher", result.stderr)
+        self.assertTrue(launcher.is_symlink())
+        self.assertFalse(launcher.with_name("x0x-launcher.previous").exists())
+
+    def test_two_runs_for_one_install_take_turns(self) -> None:
+        self.assert_installed(self.install())
+        before = self.anchor.read_bytes()
+        dropin_before = self.dropin.read_bytes()
+        lock = os.open(self.anchor_dir / ".install.lock", os.O_RDWR)
+        self.addCleanup(os.close, lock)
+        import fcntl
+
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.env = {"X0X_INSTALL_LOCK_WAIT": "0.5"}
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("another launcher install holds", result.stderr)
+        self.assertEqual(self.anchor.read_bytes(), before)
+        self.assertEqual(self.dropin.read_bytes(), dropin_before)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assert_installed(self.install())
+
+    def test_a_crash_at_any_step_never_leaves_the_anchor_naming_an_unbound_unit(self) -> None:
+        """Power loss after each change of a rerun with a new launcher: the
+        anchor names this unit only while its drop-in is in place."""
+        self.assert_installed(self.install())
+        self.launcher_src.write_text("#!/bin/sh\nexit 6\n", encoding="utf-8")
+        argv = [
+            "launcher-dropin.py", "--unit", str(self.unit), "--binary", str(self.binary),
+            "--launcher-source", str(self.launcher_src),
+            "--launcher", str(self.binary.with_name("x0x-launcher")),
+            "--instance", "testnet", "--dropin", str(self.dropin),
+            "--anchor-dir", str(self.anchor_dir),
+        ]
+        env = {"PATH": f"{self.stubs}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+        crashed_at = 0
+        for crash in range(1, 20):
+            self.assert_installed(self.install())
+            self.launcher_src.write_text(f"#!/bin/sh\nexit {crash}\n", encoding="utf-8")
+            calls = {"n": 0}
+
+            def crashing(real):
+                def step(*args, **kwargs):
+                    result = real(*args, **kwargs)
+                    calls["n"] += 1
+                    if calls["n"] == crash:
+                        raise KeyboardInterrupt("power loss")
+                    return result
+                return step
+
+            patches = [
+                mock.patch.object(dropin, name, crashing(getattr(dropin, name)))
+                for name in ("write_anchor", "write_dropin", "install_launcher")
+            ]
+            real_unlink = Path.unlink
+
+            def unlink(path, *args, **kwargs):
+                real_unlink(path, *args, **kwargs)
+                if path == self.dropin:
+                    calls["n"] += 1
+                    if calls["n"] == crash:
+                        raise KeyboardInterrupt("power loss")
+
+            patches.append(mock.patch.object(Path, "unlink", unlink))
+            with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, env):
+                for patch in patches:
+                    patch.start()
+                try:
+                    dropin.main()
+                    finished = True
+                except KeyboardInterrupt:
+                    finished = False
+                finally:
+                    for patch in patches:
+                        patch.stop()
+            named = self.anchor.exists() and "testnet" in self.anchor.read_text("utf-8")
+            if named:
+                self.assertTrue(self.dropin.exists(), f"crash after change {crash}")
+            if finished:
+                crashed_at = crash
+                break
+        self.assertGreater(crashed_at, 3, "every change was crashed once")
 
     def fetch_stubs(self, signature: str = "good", sha_ok: bool = True, key: str = "key") -> None:
         """A release directory served by a curl stub, a gpg stub that reports
@@ -773,15 +952,22 @@ class InstallShTests(unittest.TestCase):
             ("other", True, "not signed by the pinned release key"),
             ("good", False, ".sha256"),
             ("key:wrong", True, "not the pinned release key"),
+            ("empty-sha", True, ".sha256"),
         ):
             if signature.startswith("key:"):
                 self.fetch_stubs(key=signature[4:])
+            elif signature == "empty-sha":
+                # An empty .sha256 and a sha256sum that prints nothing.
+                self.fetch_stubs()
+                release = self.tmp / "release" / "v0.49.1"
+                (release / "x0x-launcher-linux-x64-gnu.tar.gz.sha256").write_text("", "utf-8")
+                self.stub("sha256sum", "exit 0\n")
             else:
                 self.fetch_stubs(signature=signature, sha_ok=sha_ok)
             result = self.install(fetch=True)
             self.assertEqual(result.returncode, 1, result.stdout)
             self.assertIn(why, result.stderr)
-            self.assertIn("nothing changed", result.stderr)
+            self.assertIn("the launcher was not fetched", result.stderr)
             self.assertFalse(self.dropin.exists())
             self.assertFalse(self.binary.with_name("x0x-launcher").exists())
             shutil.rmtree(self.tmp / "release")
@@ -804,6 +990,8 @@ class AnchorTests(unittest.TestCase):
             self.path, "/opt/x0x/x0xd", "/opt/x0x/x0x", instance, None if root is None else str(root)
         )
         if new != old:
+            roots = dropin.anchored_roots(self.path, "/opt/x0x/x0xd")
+            dropin.check_no_journal(roots | ({str(root)} if root else set()))
             dropin.write_anchor(self.path, new)
 
     def test_two_units_of_one_install_share_one_canonical_anchor(self) -> None:
@@ -843,6 +1031,39 @@ class AnchorTests(unittest.TestCase):
                 os.umask(old)
             for directory in (made, made.parent, base):
                 self.assertEqual(directory.stat().st_mode & 0o777, 0o755, f"{umask:o} {directory}")
+
+    def test_the_anchor_is_replaced_by_rename_never_in_place(self) -> None:
+        self.change("x0xd", self.roots["x0xd"])
+        with open(self.path, "rb") as reader:
+            first = reader.read()
+            self.change("x0xd-443", self.roots["x0xd-443"])
+            reader.seek(0)
+            # A reader of the old file still sees the old bytes whole.
+            self.assertEqual(reader.read(), first)
+        self.assertNotEqual(self.path.read_bytes(), first)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o644)
+
+    def test_a_symlinked_anchor_is_not_followed(self) -> None:
+        self.change("x0xd", self.roots["x0xd"])
+        real = self.tmp / "real.anchor.json"
+        self.path.rename(real)
+        self.path.symlink_to(real)
+        with self.assertRaises(dropin.Refused) as caught:
+            dropin.read_anchor(self.path)
+        self.assertIn("cannot read", str(caught.exception))
+
+    def test_the_installer_anchor_is_the_shared_fixture(self) -> None:
+        # The Rust reader parses the same bytes
+        # (plan_binding::tests::the_installer_anchor_fixture_parses).
+        fixture = ROOT / "tests" / "fixtures" / "plan-anchor-installer.json"
+        self.assertEqual(
+            dropin.render_anchor(
+                "/opt/x0x/x0xd",
+                "/opt/x0x/x0x",
+                {"x0xd-443": "/var/lib/x0x-443", "x0xd": "/root/.local/share/x0x"},
+            ),
+            fixture.read_bytes(),
+        )
 
     def test_an_anchor_of_another_install_or_a_loose_file_is_refused(self) -> None:
         self.change("x0xd", self.roots["x0xd"])

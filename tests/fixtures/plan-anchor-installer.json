@@ -1,0 +1,16 @@
+{
+  "cli_target": "/opt/x0x/x0x",
+  "daemon_target": "/opt/x0x/x0xd",
+  "participants": [
+    {
+      "data_root": "/root/.local/share/x0x",
+      "instance_id": "x0xd"
+    },
+    {
+      "data_root": "/var/lib/x0x-443",
+      "instance_id": "x0xd-443"
+    }
+  ],
+  "record_kind": "plan_anchor",
+  "schema": 1
+}
