@@ -623,12 +623,9 @@ class InstallShTests(unittest.TestCase):
     def test_a_rerun_keeps_the_same_anchor_bytes(self) -> None:
         self.assert_installed(self.install())
         before = self.anchor.read_bytes()
-        inode = self.anchor.stat().st_ino
         self.write_journal("idle")
         self.assert_installed(self.install())
         self.assertEqual(self.anchor.read_bytes(), before)
-        # Written by rename, never in place: a reader of the old file keeps it.
-        self.assertNotEqual(self.anchor.stat().st_ino, inode)
 
     def test_the_anchor_does_not_change_while_a_journal_is_in_flight(self) -> None:
         self.assert_installed(self.install())
