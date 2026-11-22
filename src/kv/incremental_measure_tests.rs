@@ -26,6 +26,10 @@ fn snapshots() -> u64 {
     SNAPSHOTS.with(std::cell::Cell::get)
 }
 
+fn undo_saves() -> u64 {
+    DELTA_UNDO_SAVES.with(std::cell::Cell::get)
+}
+
 /// The pre-check's lower bound on the admission image after `delta`.
 fn lowest_image(s: &mut KvStore, delta: &KvStoreDelta) -> i128 {
     let touched: BTreeSet<String> = delta
@@ -220,18 +224,20 @@ fn the_lower_bound_admits_an_exact_fit_and_refuses_one_byte_over() {
 
     let over = put_delta("new", fit as usize + 1, b'n', (peer(2), 1), s.version);
     let version = (s.version, s.keys.version());
-    let before = snapshots();
+    let (before, saves) = (snapshots(), undo_saves());
     match s.merge_delta(&over, peer(2), Some(&agent(2))) {
         Err(KvError::StoreFull { image, .. }) => assert_eq!(image, hard + 1),
         other => panic!("one byte over: {other:?}"),
     }
     assert_eq!(snapshots(), before, "refused before the set is copied");
+    assert_eq!(undo_saves(), saves, "refused before an undo log is started");
     assert_eq!((s.version, s.keys.version()), version, "nothing applied");
     assert!(s.get("new").is_none());
 }
 
 /// A delta whose lower bound fits but whose result does not goes through
-/// the apply-and-roll-back path, which copies the OR-Set once.
+/// the apply-and-roll-back path, which saves its one touched key in an
+/// OR-Set undo log and copies no OR-Set (#2146).
 #[test]
 fn a_delta_over_only_after_apply_is_rolled_back() {
     let room = 300_000;
@@ -245,19 +251,21 @@ fn a_delta_over_only_after_apply_is_rolled_back() {
     }
     assert!(lowest_image(&mut s, &delta) <= i128::from(HARD_IMAGE_LIMIT_BYTES as u64));
     let version = (s.version, s.keys.version());
-    let before = snapshots();
+    let (before, saves) = (snapshots(), undo_saves());
     assert!(matches!(
         s.merge_delta(&delta, peer(2), Some(&agent(2))),
         Err(KvError::StoreFull { .. })
     ));
-    assert_eq!(snapshots(), before + 1);
+    assert_eq!(snapshots(), before, "no OR-Set copy");
+    assert_eq!(undo_saves(), saves + 1, "one touched key saved");
     assert_eq!((s.version, s.keys.version()), version);
     assert_cached_is_exact(&s);
 }
 
 /// The largest delta one frame can carry takes the slow path (its cheap
 /// bound is over the limit, its result fits) and is measured from its own
-/// keys: one rollback copy and no whole-store measure, for 150 000+ keys.
+/// keys: an undo log of its own keys, no OR-Set copy and no whole-store
+/// measure, for 150 000+ keys.
 #[test]
 fn a_largest_frame_delta_is_measured_from_its_keys() {
     let hard = HARD_IMAGE_LIMIT_BYTES as u64;
@@ -298,10 +306,12 @@ fn a_largest_frame_delta_is_measured_from_its_keys() {
         "{} removals",
         delta.removed.len()
     );
-    let (measures, copies) = (full_measures(), snapshots());
+    let (measures, copies, saves) = (full_measures(), snapshots(), undo_saves());
+    let touched = delta.removed.len() as u64 + 1;
     s.merge_delta(&delta, peer(2), Some(&agent(2)))
         .expect("the result fits");
-    assert_eq!(snapshots(), copies + 1, "the slow path ran");
+    assert_eq!(undo_saves(), saves + touched, "the slow path ran");
+    assert_eq!(snapshots(), copies, "no OR-Set copy");
     assert_eq!(full_measures(), measures, "no whole-store measure");
     assert_eq!(s.admission_image_len().expect("image"), hard - 1);
     assert_cached_is_exact(&s);

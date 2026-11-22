@@ -20,6 +20,15 @@ All notable changes to this project will be documented in this file.
   authenticate the hashes inside the plan. The launcher is still dormant
   (`ENABLED` is false), no apply path calls the producer and no installer
   writes an anchor yet, so no install changes behaviour.
+- **A refused delta into a group store rolls back in O(keys in the delta)
+  (#2146; A10 and A06 amendments of 22 Nov 2026).** All eleven
+  `saorsa-gossip-*` crates move to `=0.5.96`, which adds an OR-Set undo log.
+  A delta that passes the lower-bound check and is then refused (or fails
+  while it applies) no longer copies the whole OR-Set: x0x saves only the
+  OR-Set slots of the keys the delta touches and puts them back on a
+  refusal. The store, its tags and tombstones are exactly as before. This
+  closes the known limit left by #2110 item 1. Retained images, checkpoint
+  adoption and legacy imports still copy the OR-Set for their rollback.
 
 ### Security
 
