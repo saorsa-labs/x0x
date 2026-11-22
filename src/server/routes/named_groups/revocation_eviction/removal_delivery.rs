@@ -461,6 +461,80 @@ pub(super) fn resume_after_load(
     }
 }
 
+/// #2135 (ADR 0110 §3): every open row that holds a saved removal event or
+/// crypto-only frame, measured against its group's fork-quarantine marker.
+///
+/// - **Marker set.** The row's delivery stops and it waits in the fork set
+///   as `waiting_for_fork_resolution`. The saved event stays in the row as
+///   fork evidence and is never sent. The waiting cause is stored in the
+///   row, and the store changes only on the first pass that sets it.
+/// - **Marker gone** (the manual clear of ADR 0066, or an owner-anchored
+///   clear), for a row in the fork set or whose stored cause is
+///   `waiting_for_fork_resolution`: the saved event is dropped, never
+///   published, and the row leaves the fork set. A competing exclusion of
+///   the same target landed on another branch, so the completion pass then
+///   completes the row from this node's verified chain; a survivor that
+///   still lacks a transition gets it by chain catch-up. The stored cause
+///   makes this hold across a restart that follows the clear.
+///
+/// Fork-set entries of rows with no saved event in an unmarked group are
+/// dropped. Returns whether the store changed.
+pub(super) fn settle_forked_saves(
+    groups: &[(String, GroupInfo)],
+    store: &mut ObligationStore,
+    removals: &mut HashMap<EvictionKey, RemovalDelivery>,
+    ce_state: &mut crypto_exclusion::CeState,
+) -> bool {
+    let marked: HashMap<&str, bool> = groups
+        .iter()
+        .filter(|(_, info)| !info.withdrawn)
+        .map(|(_, info)| (info.stable_group_id(), info.fork_quarantine.is_some()))
+        .collect();
+    let saved: Vec<(EvictionKey, bool)> = store
+        .rows()
+        .filter(|row| row.phase.is_open() && row.outgoing_event.is_some())
+        .map(|row| {
+            let fork_waiting = row
+                .waiting
+                .as_ref()
+                .is_some_and(|waiting| waiting.cause == WaitingCause::WaitingForForkResolution);
+            (row.key(), fork_waiting)
+        })
+        .collect();
+    let mut changed = false;
+    for (key, fork_waiting) in saved {
+        let Some(&quarantined) = marked.get(key.stable_group_id.as_str()) else {
+            continue;
+        };
+        if quarantined {
+            removals.remove(&key);
+            ce_state.drop_delivery(&key);
+            ce_state.fork.insert(key.clone());
+            changed |= store.set_waiting(
+                &key,
+                Some(WaitingState::cause(WaitingCause::WaitingForForkResolution)),
+            );
+        } else if ce_state.fork.remove(&key) || fork_waiting {
+            removals.remove(&key);
+            ce_state.drop_delivery(&key);
+            if let Some(row) = store.get_mut(&key) {
+                row.outgoing_event = None;
+                row.waiting = None;
+                changed = true;
+            }
+            tracing::info!(
+                group_id = %super::super::LogHexId::group(&key.stable_group_id),
+                target = %super::super::LogHexId::agent(&hex::encode(key.target)),
+                "ADR 0110 S4: the fork marker is cleared; the saved exclusion is dropped unpublished"
+            );
+        }
+    }
+    ce_state
+        .fork
+        .retain(|key| marked.get(key.stable_group_id.as_str()) == Some(&true));
+    changed
+}
+
 // ─── Delivery ──────────────────────────────────────────────────────────────
 
 /// One delivery round for every due saved removal: per recipient,
@@ -1060,11 +1134,24 @@ mod tests {
     /// Restart over `info` with one open row whose saved removal of
     /// `0xbb` went from head `p` to `r`.
     fn resume_one(
+        info: GroupInfo,
+    ) -> (
+        HashMap<EvictionKey, RemovalDelivery>,
+        ObligationStore,
+        EvictionKey,
+    ) {
+        let (removals, store, key, _) = resume_one_with_forks(info);
+        (removals, store, key)
+    }
+
+    /// [`resume_one`], with the fork set the restart left.
+    fn resume_one_with_forks(
         mut info: GroupInfo,
     ) -> (
         HashMap<EvictionKey, RemovalDelivery>,
         ObligationStore,
         EvictionKey,
+        crypto_exclusion::CeState,
     ) {
         // The creator in `info_with_log` is this node.
         let local = [1; 32];
@@ -1094,7 +1181,149 @@ mod tests {
         let mut ce_state = crypto_exclusion::CeState::default();
         let groups = vec![("g".to_string(), info)];
         resume_after_load(&groups, &local, &mut store, &mut removals, &mut ce_state);
-        (removals, store, key)
+        (removals, store, key, ce_state)
+    }
+
+    /// A fork-quarantine marker naming `other`, the competing child of `p`.
+    fn marked(mut info: GroupInfo) -> GroupInfo {
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 4,
+            state_hash: "other".to_string(),
+            committed_by: "dd".repeat(32),
+            observed_at_ms: 1,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: commit("p", "other"),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        info
+    }
+
+    fn fork_waiting(store: &ObligationStore, key: &EvictionKey) -> bool {
+        store
+            .get(key)
+            .and_then(|row| row.waiting.as_ref())
+            .is_some_and(|waiting| waiting.cause == WaitingCause::WaitingForForkResolution)
+    }
+
+    /// #2135 (ADR 0110 §3, the 1581e shape): this node's own removal
+    /// (`p` → `r`) is its head and its delivery runs; then D's competing
+    /// removal installs the marker. The delivery stops, the saved event
+    /// stays as fork evidence and the row waits as
+    /// `waiting_for_fork_resolution`. The store changes on the first pass
+    /// only, so a waiting row is not rewritten on every pass.
+    #[test]
+    fn a_fork_marker_stops_the_delivery_and_keeps_the_saved_removal() {
+        let info = info_with_log("r", &[("p", "r")]);
+        let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
+        assert!(removals.contains_key(&key), "the delivery resumed");
+        let groups = vec![("g".to_string(), marked(info))];
+        assert!(settle_forked_saves(
+            &groups,
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+        assert!(removals.is_empty(), "nothing is sent across the fork");
+        assert!(ce_state.fork.contains(&key));
+        assert!(fork_waiting(&store, &key), "the stored typed cause");
+        let row = store.get(&key).expect("row");
+        assert!(row.phase.is_open());
+        assert!(row.outgoing_event.is_some(), "kept as fork evidence");
+        assert!(
+            !settle_forked_saves(&groups, &mut store, &mut removals, &mut ce_state),
+            "a second pass changes nothing, so nothing is written again"
+        );
+    }
+
+    /// #2135: the manual clear releases the row. The saved event is dropped
+    /// unpublished, the row leaves the fork set, and nothing changes on the
+    /// next pass (the #2163 review found a row that met the fork again on
+    /// every pass and was rewritten each second).
+    #[test]
+    fn the_manual_clear_drops_the_saved_removal_and_releases_the_row() {
+        let info = info_with_log("r", &[("p", "r")]);
+        let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
+        let held = vec![("g".to_string(), marked(info.clone()))];
+        settle_forked_saves(&held, &mut store, &mut removals, &mut ce_state);
+        let cleared = vec![("g".to_string(), info)];
+        assert!(settle_forked_saves(
+            &cleared,
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+        let row = store.get(&key).expect("row");
+        assert!(row.outgoing_event.is_none(), "never published");
+        assert!(!fork_waiting(&store, &key));
+        assert!(!ce_state.fork.contains(&key));
+        assert!(removals.is_empty(), "no delivery restarts");
+        assert!(!settle_forked_saves(
+            &cleared,
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+    }
+
+    /// #2135: the clear lands, then the node restarts before the row was
+    /// released. The stored cause still marks the saved event as one that
+    /// met a fork, so the load drops it before any resume can deliver it.
+    #[test]
+    fn a_restart_after_the_clear_never_delivers_the_saved_removal() {
+        let info = info_with_log("r", &[("p", "r")]);
+        let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
+        let held = vec![("g".to_string(), marked(info.clone()))];
+        settle_forked_saves(&held, &mut store, &mut removals, &mut ce_state);
+        // The restart: the rows through the frozen `.evs` v1 encoding, no
+        // runtime state, no marker.
+        let bytes = x0x::groups::eviction::encode_evs(&x0x::groups::eviction::EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: store.to_rows(),
+        })
+        .expect("encode");
+        let body = x0x::groups::eviction::decode_evs(&bytes).expect("decode");
+        let mut store = ObligationStore::from_rows(body.rows);
+        let mut removals = HashMap::new();
+        let mut ce_state = crypto_exclusion::CeState::default();
+        let cleared = vec![("g".to_string(), info)];
+        assert!(settle_forked_saves(
+            &cleared,
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+        resume_after_load(&cleared, &[1; 32], &mut store, &mut removals, &mut ce_state);
+        assert!(removals.is_empty(), "no delivery of the saved event");
+        assert!(store.get(&key).expect("row").outgoing_event.is_none());
+    }
+
+    /// #2163 review blocker: the competing child is on this node's chain
+    /// and no marker stands. The restart classifies the saved removal as a
+    /// fork; the next pass drops it and releases the row instead of holding
+    /// it in the fork set for ever.
+    #[test]
+    fn a_competing_child_on_the_chain_without_a_marker_releases_the_row() {
+        let info = info_with_log("other", &[("p", "other")]);
+        let (mut removals, mut store, key, mut ce_state) = resume_one_with_forks(info.clone());
+        assert!(ce_state.fork.contains(&key), "the restart found the fork");
+        let groups = vec![("g".to_string(), info)];
+        assert!(settle_forked_saves(
+            &groups,
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+        assert!(!ce_state.fork.contains(&key));
+        assert!(store.get(&key).expect("row").outgoing_event.is_none());
+        assert!(!settle_forked_saves(
+            &groups,
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
     }
 }
 

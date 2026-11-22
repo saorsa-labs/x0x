@@ -496,6 +496,81 @@ the receiver's leaf rule. `issue2133_treekem_leaf_known_limit` shows that
 a creator one commit behind is refused with `InvalidEpoch`. These tests
 show the gap; they do not accept it. No wire format changes.
 
+Amendment of 22 Nov 2026 ([#2135](https://github.com/saorsa-labs/x0x/issues/2135)
+item 2). **Decision by David, 22 Nov 2026: bind the commit identity into the
+state hash**, and accept the wire change, handled by versioning. The rollout
+rule and the S4 row rule below were set by the orchestrator session under
+A15 on 22 Nov 2026. ADR 0110 stays Accepted and unchanged; this change builds
+what its §3 requires.
+- **The fault.** An admin's TreeKEM removal or ban sealed only
+  `treekem:epoch=<n>`. Two admins that remove the same member from the same
+  parent therefore made the same roster state hash, while their TreeKEM
+  commits, and so their epoch keys, differ. A node that held one took the
+  other for a duplicate, and a survivor that reported that head counted as
+  converged. The fork was silent (W3-H 1581e).
+- **Commit identity.** The BLAKE3-256 digest of the exact TreeKEM commit
+  bytes that the event carries, in the signed binding
+  `treekem:epoch=<n>:commit=<hex>`. This is the form that the self-leave
+  rekey (#1337) and the crypto-only exclusion already seal. The state hash
+  function is unchanged; only its binding input changes. The commit bytes
+  carry the committer's leaf signature and fresh path secrets, so two
+  admins' commits (or two attempts by one admin) differ. A replay of one
+  commit has the same bytes and the same state hash, so it stays a
+  duplicate. Each receiver checks the digest against the carried bytes
+  before it applies the commit; a binding over other bytes is refused.
+- **Rollout rule (mixed versions).** New capability bit 22,
+  `removal_commit_binding_v1`. An admin seals the commit-bound form on its
+  TreeKEM `MemberRemoved` or `MemberBanned` only while every other Active or
+  Pending member's current verified advert sets the bit. Otherwise it seals
+  the legacy form; an unknown or expired advert counts as not set. Receivers
+  of this release accept both forms. Released receivers from 0.48.1 already
+  verify and apply a commit-bound `MemberRemoved`. A released receiver
+  rebuilds the legacy binding for a `MemberBanned`, and 0.47 and older do
+  that for both kinds, so the state-hash check fails and the commit is
+  refused: it fails closed and is never applied. The gate keeps such peers
+  from getting the new form; only a peer that downgrades while its advert is
+  still current can meet it. A mixed group keeps the legacy form, and its
+  known limit, until every member advertises the bit: two legacy-form
+  removals of one member still look the same. A legacy-form removal and a
+  commit-bound removal of the same member have different hashes, so that
+  fork is found.
+- **Detection.** A competing commit with a different hash takes the existing
+  fork-evidence path of ADR 0064: the node keeps its own head and
+  installs the `fork_quarantine` marker (`no_anchor` in an ordinary group).
+- **S4 rows (ADR 0110 §3).** While a group holds the marker, an open row
+  that holds a saved removal event or crypto-only frame stops its delivery.
+  It keeps the saved event as fork evidence and never sends it, and it waits
+  as `waiting_for_fork_resolution`. The completion pass completes no row of
+  that group, because this node's chain may be the branch the group did not
+  take. The cause is stored in the row, and the `.evs` is written only when
+  it changes, not on each worker pass. The persisted evidence is the marker
+  in the group record (the two commit headers, a fixed size) and the saved
+  event in the frozen `.evs` v1 row. No new field and no new file.
+- **Exit.** ADR 0110 §2 says that S4 adds no fork choice, and §3 names
+  manual admin resolution under ADR 0088 §2 item 7. So this change adds no
+  branch choice and no new route, and the orchestrator's A15 ruling (resolve
+  to the lowest admin's commit by D74 and re-key) is not built, as that
+  ruling allowed when ADR 0110 says otherwise. The exit is the existing
+  manual clear (`POST /groups/:id/quarantine/clear`) or an owner-anchored
+  clear. When the marker is gone, the saved event is dropped unpublished,
+  because a competing exclusion of the same target is on the other branch.
+  The row leaves the fork set and completes from this node's chain. The
+  stored cause keeps this rule across a restart that follows the clear.
+  This node's keys still differ from the other branch's; the exit for that
+  is the existing manual re-seat (A08, ADR 0109 §3).
+- **Known limits.** An admin on the other branch keeps delivering its
+  removal to the forked node until the manual exit, because that node never
+  reports the result head. A GSS removal still binds only `gss:epoch=<n>`,
+  so two admins' GSS rotations for one member's removal still look the same.
+- **#2139.** The new owner-recovery body version planned there is a
+  separate marker: its own body prefix and capability bit, on another commit
+  kind. Bit 22 governs only the binding of `MemberRemoved` and
+  `MemberBanned`. A receiver checks each marker by itself; neither implies
+  the other.
+
+Wire: capability bit 22 and the commit-bound binding on two event kinds
+behind it. No route or storage format changes.
+
 ## Security claims
 
 State the exact properties of each released path. Post-quantum signatures and key encapsulation do not alone prove forward secrecy or recovery after key compromise.

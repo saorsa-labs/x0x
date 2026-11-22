@@ -20206,6 +20206,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             let roster_only = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
                 && treekem_payload.is_none();
+            // #2135: the signed binding is the legacy form or the
+            // commit-bound form of these exact TreeKEM bytes.
+            if let Some((commit_b64, epoch)) = treekem_payload.as_ref() {
+                let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+                    return banned_reject("treekem_commit_b64_decode", &resolved_group_key);
+                };
+                if !treekem_removal_binding_covers_commit(&commit, *epoch, &commit_bytes) {
+                    return banned_reject("binding_does_not_cover_commit", &resolved_group_key);
+                }
+            }
+            let signed_binding = commit.security_binding.clone();
             let current = info.clone();
             let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
@@ -20234,7 +20245,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
-                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                        next.security_binding = signed_binding.clone();
                     } else if let Some(secret_epoch) = secret_epoch {
                         let old_epoch = next.secret_epoch;
                         next.secret_epoch = secret_epoch;
@@ -31781,8 +31792,63 @@ fn treekem_commit_binding(epoch: u64, commit: &[u8]) -> String {
     format!("treekem:epoch={epoch}:commit={digest}")
 }
 
-/// `treekem:epoch=<n>` is the shipped admin removal. It does not name the
-/// TreeKEM bytes. A self-leave rekey seals [`treekem_commit_binding`].
+/// #2135 (David, 22 Nov 2026): whether every other Active or Pending member
+/// of `info` (all but `actor_hex` and `target_hex`) has a current verified
+/// advert, per `supports`, that carries `removal_commit_binding_v1`.
+fn removal_commit_binding_peers_ready(
+    info: &x0x::groups::GroupInfo,
+    actor_hex: &str,
+    target_hex: &str,
+    supports: impl Fn(&AgentId) -> Option<bool>,
+) -> bool {
+    info.members_v2
+        .values()
+        .filter(|member| {
+            matches!(
+                member.state,
+                x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Pending
+            )
+        })
+        .filter(|member| {
+            !member.agent_id.eq_ignore_ascii_case(actor_hex)
+                && !member.agent_id.eq_ignore_ascii_case(target_hex)
+        })
+        .all(|member| {
+            parse_agent_id_hex(&member.agent_id).is_ok_and(|agent| supports(&agent) == Some(true))
+        })
+}
+
+/// #2135 (David, 22 Nov 2026): the signed binding of an admin's TreeKEM
+/// removal or ban. The commit-bound form names the exact TreeKEM commit, so
+/// two admins' removals of one member from one parent have different state
+/// hashes and the later one is fork evidence, not a duplicate. A replay of
+/// the same commit has the same bytes and the same hash. The legacy form is
+/// sealed while a member's advert lacks `removal_commit_binding_v1`.
+fn treekem_removal_security_binding(
+    state: &AppState,
+    next: &x0x::groups::GroupInfo,
+    actor_hex: &str,
+    target_hex: &str,
+    epoch: u64,
+    commit: &[u8],
+) -> String {
+    let capabilities = state.agent.capability_store();
+    let ready = removal_commit_binding_peers_ready(next, actor_hex, target_hex, |agent| {
+        capabilities.verified_registry_supports(
+            agent,
+            x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1,
+        )
+    });
+    if ready {
+        treekem_commit_binding(epoch, commit)
+    } else {
+        format!("treekem:epoch={epoch}")
+    }
+}
+
+/// `treekem:epoch=<n>` is the legacy admin removal. It does not name the
+/// TreeKEM bytes. A self-leave rekey, and since #2135 an admin removal or
+/// ban whose group is ready, seals [`treekem_commit_binding`].
 fn treekem_removal_binding_covers_commit(
     signed: &x0x::groups::state_commit::GroupStateCommit,
     epoch: u64,
@@ -33450,20 +33516,6 @@ async fn remove_treekem_named_group_member(
     };
     let mut guard = group.lock().await;
     let treekem_epoch = guard.epoch().saturating_add(1);
-    next.roster_revision = next.roster_revision.saturating_add(1);
-    let revision = next.roster_revision;
-    next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
-    next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
-            );
-        }
-    };
     // #1187: capture the pre-removal snapshot so a failed seal can roll the
     // in-memory group back to the state a restart loads. Fail the request
     // BEFORE the mutation if the snapshot cannot be taken.
@@ -33480,6 +33532,8 @@ async fn remove_treekem_named_group_member(
             );
         }
     };
+    // #2135: the TreeKEM commit exists before the seal, so the signed
+    // binding can name it.
     let treekem_commit = match guard.remove_member_verified(target_agent, &target_kp_bytes) {
         Ok(commit) => commit,
         Err(e) => {
@@ -33493,6 +33547,14 @@ async fn remove_treekem_named_group_member(
         }
     };
     if guard.epoch() != treekem_epoch {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "member_remove_epoch_mismatch",
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -33501,6 +33563,35 @@ async fn remove_treekem_named_group_member(
             })),
         );
     }
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(treekem_removal_security_binding(
+        &state,
+        &next,
+        &local_agent_hex,
+        &agent_id_hex,
+        treekem_epoch,
+        &treekem_commit,
+    ));
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
+        Ok(c) => c,
+        Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "member_remove_seal_failed",
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
     let event = NamedGroupMetadataEvent::MemberRemoved {
         group_id: event_group_id,
         revision,
@@ -34116,25 +34207,6 @@ async fn owner_certified_seal_with_eviction(
                 };
                 let mut next = info.clone();
                 next.set_member_treekem_key_package(&evict_hex, target_kp_b64.clone());
-                next.roster_revision = next.roster_revision.saturating_add(1);
-                let revision = next.roster_revision;
-                next.remove_member(&evict_hex, Some(local_hex.to_string()));
-                next.secret_epoch = treekem_epoch;
-                next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-                // No-prune seal: the remaining failing members (if any) get
-                // their OWN transitions on the next loop iteration.
-                let commit = match next.seal_commit_evicting(signing_kp, now_ms) {
-                    Ok(commit) => commit,
-                    Err(e) => {
-                        return Some(Err(api_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("seal failed: {e}"),
-                        )))
-                    }
-                };
-                if !group_recovery::local_seal_admitted(state, info, &commit).await {
-                    return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
-                }
                 // #1187: capture the pre-eviction snapshot so a failed seal
                 // can roll the in-memory group back to what a restart loads.
                 // Fail the request BEFORE the mutation if it cannot be taken.
@@ -34148,6 +34220,8 @@ async fn owner_certified_seal_with_eviction(
                         )));
                     }
                 };
+                // #2135: the TreeKEM commit exists before the seal, so the
+                // signed binding can name it.
                 let treekem_commit =
                     match guard.remove_member_verified(target_agent, &target_kp_bytes) {
                         Ok(commit) => commit,
@@ -34158,11 +34232,50 @@ async fn owner_certified_seal_with_eviction(
                             )))
                         }
                     };
+                let roll_back = |reason: &str, guard: &mut x0x::mls::TreeKemMlsGroup| {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        id,
+                        info,
+                        &rollback_snapshot,
+                        guard,
+                        reason,
+                    );
+                };
                 if guard.epoch() != treekem_epoch {
+                    roll_back("member_evict_epoch_mismatch", &mut guard);
                     return Some(Err(api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "TreeKEM epoch did not advance as expected",
                     )));
+                }
+                next.roster_revision = next.roster_revision.saturating_add(1);
+                let revision = next.roster_revision;
+                next.remove_member(&evict_hex, Some(local_hex.to_string()));
+                next.secret_epoch = treekem_epoch;
+                next.security_binding = Some(treekem_removal_security_binding(
+                    state,
+                    &next,
+                    local_hex,
+                    &evict_hex,
+                    treekem_epoch,
+                    &treekem_commit,
+                ));
+                // No-prune seal: the remaining failing members (if any) get
+                // their OWN transitions on the next loop iteration.
+                let commit = match next.seal_commit_evicting(signing_kp, now_ms) {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        roll_back("member_evict_seal_failed", &mut guard);
+                        return Some(Err(api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("seal failed: {e}"),
+                        )));
+                    }
+                };
+                if !group_recovery::local_seal_admitted(state, info, &commit).await {
+                    roll_back("member_evict_seal_contained", &mut guard);
+                    return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
                 }
                 let event = NamedGroupMetadataEvent::MemberRemoved {
                     group_id: next.stable_group_id().to_string(),
@@ -37116,20 +37229,6 @@ async fn ban_treekem_group_member(
     };
     let mut guard = group.lock().await;
     let treekem_epoch = guard.epoch().saturating_add(1);
-    next.roster_revision = next.roster_revision.saturating_add(1);
-    let revision = next.roster_revision;
-    next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
-    next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
-            );
-        }
-    };
     // #1187: capture the pre-ban snapshot so a failed seal can roll the
     // in-memory group back to the state a restart loads. Fail the request
     // BEFORE the mutation if the snapshot cannot be taken.
@@ -37145,6 +37244,8 @@ async fn ban_treekem_group_member(
             );
         }
     };
+    // #2135: the TreeKEM commit exists before the seal, so the signed
+    // binding can name it.
     let treekem_commit = match guard.remove_member_verified(target_agent, &target_kp_bytes) {
         Ok(commit) => commit,
         Err(e) => {
@@ -37157,6 +37258,14 @@ async fn ban_treekem_group_member(
         }
     };
     if guard.epoch() != treekem_epoch {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "member_ban_epoch_mismatch",
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(
@@ -37164,6 +37273,35 @@ async fn ban_treekem_group_member(
             ),
         );
     }
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(treekem_removal_security_binding(
+        &state,
+        &next,
+        &caller_hex,
+        &agent_id_hex,
+        treekem_epoch,
+        &treekem_commit,
+    ));
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
+        Ok(c) => c,
+        Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "member_ban_seal_failed",
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
     let event = NamedGroupMetadataEvent::MemberBanned {
         group_id: event_group_id,
         revision,
@@ -55759,6 +55897,7 @@ pub(in crate::server) mod tests {
     mod issue1840_join_request_outcome;
     mod issue1840_sequence;
     mod issue2004_expired_catchup;
+    mod issue2135_removal_commit_binding;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue646_base_roster_fetch;

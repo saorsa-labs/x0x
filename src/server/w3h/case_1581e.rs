@@ -40,10 +40,12 @@
 //!   exactly that cause), but the typed half is RED: A's row silently
 //!   completes across the real fork, no fork evidence is persisted and
 //!   no `waiting_for_fork_resolution` is shown, which ADR 0110 §3 L225
-//!   forbids. The arm is wired as an expected RED with
-//!   `CAUSE_NO_TYPED_FORK` — the only cause this arm accepts as its RED
-//!   (the test checks the cause, not only the verdict) — and it turns
-//!   GREEN with that fix. The gap is recorded on #1581 by name. A
+//!   forbids. The arm was wired as an expected RED with
+//!   `CAUSE_NO_TYPED_FORK`. The cause (#2135): both admins' removals of B
+//!   from one parent had one state hash. Since #2135 each removal binds
+//!   its TreeKEM commit, D's commit is fork evidence on A, and the arm is
+//!   expected GREEN; D's row may stay `committed_delivery_pending`,
+//!   because A, on its own sibling, never reports D's head. A
 //!   sibling that a receiver keeps fails the end-state evidence
 //!   (INFRA); a sibling A sends — kept or refused — names
 //!   `CAUSE_SIBLING_PUBLISHED`, which also fails the arm's cause
@@ -1653,9 +1655,17 @@ async fn scenario(
             format!("{}; {}; {}", c_after.2, b_after.2, a_after.2),
             at(sim),
         );
+        // #2135: D's exclusion is committed. D's delivery to A cannot
+        // converge, because A sits on its own sibling, so D's row stays
+        // `committed_delivery_pending` at the exclusion epoch until the
+        // manual exit; before #2135 A reported D's head (one state hash
+        // for both removals) and D's row completed on a false convergence.
         let d_row_complete = d_row.as_ref().is_ok_and(|row| {
-            row.as_ref()
-                .is_some_and(|row| row["phase"].as_str() == Some("complete"))
+            row.as_ref().is_some_and(|row| {
+                row["phase"].as_str() == Some("complete")
+                    || (row["phase"].as_str() == Some("committed_delivery_pending")
+                        && row["result_epoch"].as_u64() == Some(e0 + 1))
+            })
         });
         receipt.evidence(
             "d_completes_the_competing_exclusion",
@@ -1960,10 +1970,11 @@ fn w3h_1581e_red_crash_commit_fork_contained() -> Result<()> {
                 0x1581_0007,
                 LABELS,
                 true,
-                // RED on main: CAUSE_NO_TYPED_FORK — the saved delivery
-                // completes across the real fork with no fork evidence and
+                // GREEN since #2135. RED before it with CAUSE_NO_TYPED_FORK:
+                // both removals had one state hash, so the saved delivery
+                // completed across the real fork with no fork evidence and
                 // no typed waiting_for_fork_resolution (ADR 0110 §3 L225).
-                Verdict::Red,
+                Verdict::Green,
             )
             .await
         })

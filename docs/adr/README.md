@@ -73,7 +73,8 @@ This table is the live allocation table for capability bits. Allocate the next b
 | 19 | `join_request_head_v1` | Reads the optional `head` (signed head commit, roster projection, public metadata) of a `stale` join-request outcome and signs the same request again over it; an authority puts a head on an outcome only for a requester whose current verified advert sets this bit; route-gated with bit 16 | #1840 (A08 amendment of 15 Nov 2026, Claude under David's 10 Nov delegation and A15; next free bit) |
 | 20 | `data_read_v1` | Answers a grantee's read of a store it holds a `ShareCap::Data` grant for (`x0x-data-read-v1`) and takes the reply (`x0x-data-reply-v1`); a grantee sends a read only to an agent whose current verified advert sets this bit; route-gated | #1094 slice D1 (A03 amendment of 15 Nov 2026, Claude under David's 10 Nov delegation and A15; next free bit) |
 | 21 | `data_write_v1` | Applies an `rw` grantee's write to a store it holds a `ShareCap::Data` grant for (`x0x-data-write-v1`) as the granted agent's own write; the reply uses `x0x-data-reply-v1`; a grantee sends a write only to an agent whose current verified advert sets this bit; route-gated | #1094 slice D2 (A03 amendment of 16 Nov 2026, Claude under David's 10 Nov delegation and A15; next free bit) |
-| 22–63 | unallocated | Must not be advertised until allocated | — |
+| 22 | `removal_commit_binding_v1` | Verifies the commit-bound binding `treekem:epoch=<n>:commit=<blake3>` on an admin's TreeKEM `MemberRemoved` and `MemberBanned`; an admin seals that binding only while every other Active or Pending member's current verified advert sets this bit | #2135 (David's ruling of 22 Nov 2026, bind the commit identity into the state hash; A09 amendment of 22 Nov 2026; next free bit) |
+| 23–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Checks
 

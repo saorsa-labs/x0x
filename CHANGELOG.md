@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Commit-bound removal binding (#2135).** New capability bit 22,
+  `removal_commit_binding_v1`. An admin's TreeKEM removal or ban now names
+  its TreeKEM commit in the signed binding (`treekem:epoch=<n>:commit=<blake3>`),
+  but only while every other Active or Pending member advertises bit 22.
+  Until every member of a group runs this release, the group keeps the
+  legacy binding and today's limit (two admins' removals of one member still
+  look the same). A downgrade to 0.49.0 or older while its advert is still
+  current refuses a commit-bound ban (fail closed).
+
+### Fixed
+
+- **Two admins removing the same member no longer fork silently (#2135,
+  David's ruling of 22 Nov 2026).** Their removals now have different state
+  hashes, so the second one is fork evidence: the node keeps its head and sets
+  the `fork_quarantine` marker. A replay of one commit is still a duplicate.
+  Receivers verify a commit-bound `MemberBanned` against its TreeKEM bytes and
+  keep its signed binding.
+- **S4 rows across a fork (#2135, ADR 0110 §3).** While a group holds the fork
+  marker, a saved S4 removal or crypto-only exclusion is not sent, its row
+  waits as `waiting_for_fork_resolution`, and no row of the group completes.
+  The `.evs` is written when the state changes, not on each worker pass. After
+  the manual `POST /groups/:id/quarantine/clear`, the saved event is dropped
+  unpublished and the row completes from the local chain, also after a
+  restart. No new route.
+
 ## [v0.49.0] - 2026-11-22
 
 ### Upgrade notes

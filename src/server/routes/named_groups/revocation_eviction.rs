@@ -1404,6 +1404,17 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .budgets
             .insert(key, RowBudget::resume(Duration::ZERO, now));
     }
+    {
+        let inner = &mut *inner;
+        if removal_delivery::settle_forked_saves(
+            &groups,
+            &mut inner.store,
+            &mut inner.removals,
+            &mut inner.ce,
+        ) {
+            inner.dirty = true;
+        }
+    }
     let mut delivering = inner.ce.delivering();
     delivering.extend(inner.removals.keys().cloned());
     let memory_only = !inner.sidecar.state.writable();
@@ -2346,6 +2357,11 @@ fn reconcile_completion(
         if delivering.contains(&key) {
             // §3: a committed crypto-only exclusion stays
             // `committed_delivery_pending` while its delivery runs.
+            continue;
+        }
+        if info.fork_quarantine.is_some() {
+            // #2135 (§3): this node's chain may be the branch the group
+            // did not take, so it proves nothing until the marker clears.
             continue;
         }
         // A GSS group completes only on proof that a rotation excluded the
@@ -5268,10 +5284,18 @@ async fn load_persisted_obligations(state: &AppState) {
         }
     }
     let mut ce_state = crypto_exclusion::CeState::default();
-    resume_crypto_exclusions(state, &mut store, &journals, &mut ce_state).await;
-    removal_journal::adopt_journal_removals(&mut store, &journals);
     let mut removals = HashMap::new();
     let loaded_groups = snapshot_groups(state).await;
+    // #2135 (§3): a saved event that met a fork marker cleared before this
+    // restart is dropped before any resume can deliver it.
+    let fork_settled = removal_delivery::settle_forked_saves(
+        &loaded_groups,
+        &mut store,
+        &mut removals,
+        &mut ce_state,
+    );
+    resume_crypto_exclusions(state, &mut store, &journals, &mut ce_state).await;
+    removal_journal::adopt_journal_removals(&mut store, &journals);
     removal_delivery::resume_after_load(
         &loaded_groups,
         state.agent.agent_id().as_bytes(),
@@ -5310,7 +5334,7 @@ async fn load_persisted_obligations(state: &AppState) {
     inner.ce = ce_state;
     inner.removals = removals;
     inner.queued_bans = queued_bans;
-    inner.dirty = !journals.is_empty();
+    inner.dirty = !journals.is_empty() || fork_settled;
     inner.trial_load = !gate_open;
     drop(inner);
     // §5 (#1508 review P1): a journal is the only durable copy of its
@@ -6410,6 +6434,62 @@ pub(super) mod tests {
         assert!(reconcile_completion(
             &mut store,
             &removed,
+            &leaves,
+            &BTreeSet::new(),
+            2,
+            true
+        ));
+        assert_eq!(store.get(&key).expect("row").phase, Phase::Complete);
+    }
+
+    /// #2135 (ADR 0110 §3): while the group holds a fork-quarantine marker,
+    /// the exclusion on this node's chain may be on the branch the group did
+    /// not take, so the row stays open (`waiting_for_fork_resolution`).
+    /// Once the marker is cleared the same chain completes it.
+    #[test]
+    fn a_fork_quarantined_group_completes_no_row_until_the_marker_clears() {
+        let admin_kp = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let (admin, member) = (*admin_kp.agent_id().as_bytes(), [2; 32]);
+        let mut info = group_with(admin, member);
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.seal_commit(&admin_kp, 1).expect("seat");
+        let leaves = RetainedLeaves::default();
+        let groups = vec![("k".to_string(), info.clone())];
+        let triggers = derive_triggers(&groups, &leaves, &[revocation_of(member, 7)], 0);
+        let (key, trigger, _) = triggers.into_iter().next().expect("trigger");
+        let mut store = ObligationStore::new();
+        store.intake(&key, trigger, None, 0, [0; 16]);
+        info.remove_member(&hex::encode(member), Some(hex::encode(admin)));
+        let _ = info.rotate_shared_secret();
+        info.seal_commit(&admin_kp, 2).expect("remove");
+        let mut marked = info.clone();
+        let head = marked.terminal_commit_header();
+        marked.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: head.revision,
+            state_hash: "sibling".to_string(),
+            committed_by: hex::encode([3; 32]),
+            observed_at_ms: 1,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: head.clone(),
+                conflicting_commit: head,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        let quarantined = vec![("k".to_string(), marked)];
+        assert!(!reconcile_completion(
+            &mut store,
+            &quarantined,
+            &leaves,
+            &BTreeSet::new(),
+            2,
+            true
+        ));
+        assert_eq!(store.get(&key).expect("row").phase, Phase::Pending);
+        let cleared = vec![("k".to_string(), info)];
+        assert!(reconcile_completion(
+            &mut store,
+            &cleared,
             &leaves,
             &BTreeSet::new(),
             2,
