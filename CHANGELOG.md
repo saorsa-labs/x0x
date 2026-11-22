@@ -20,6 +20,25 @@ All notable changes to this project will be documented in this file.
   (`ENABLED` is false), no apply path calls the producer and no installer
   writes an anchor yet, so no install changes behaviour.
 
+### Security
+
+- **`url` bumped to 2.5.9** (RUSTSEC-2026-0592): fixes a stack overflow in
+  `Url::origin()` when called on deeply nested `blob:` URLs. The flaw is in an
+  indirect dependency (`url` via `reqwest` / `tower-http`); x0x does not call
+  `origin()` directly, so the attack surface is limited to any caller that
+  processes attacker-supplied URLs. Lock change: `url` 2.5.8 → 2.5.9,
+  `form_urlencoded` 1.2.2 → 1.2.3.
+
+## [v0.49.1] - 2026-11-22
+
+### Fixed
+
+- **Package size:** the v0.49.0 crate was 12.4 MiB compressed and crates.io
+  rejected it (413, 10 MiB limit). The `exclude` list now drops `tests/` (except
+  the two `[[test]]` targets), `docs/`, `issues/`, `scripts/`, `.github/`,
+  `.claude/`, `agent/` and backup files. The crate is 7.5 MiB. No code changes;
+  binaries are rebuilt from the same sources as v0.49.0 plus #2170's CI profile.
+
 ## [v0.49.0] - 2026-11-22
 
 ### Upgrade notes
