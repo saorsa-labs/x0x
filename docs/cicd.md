@@ -75,12 +75,19 @@ compiler or test error.
   `workflow_dispatch`. `Build linux-x64-gnu` is its own job, not a matrix entry, so it keeps its name when
   it is skipped.
 - `train/*` bundle PRs start no hosted jobs. The orchestrator merges a bundle PR with admin rights on the
-  studio1 train result, and each member PR already had its own hosted run. Every job in `ci.yml`,
-  `build.yml`, `integration.yml`, `security.yml`, `release-custody-check.yml`, `python-client-example.yml`
-  and `adr-governance.yml` has `if: ${{ !startsWith(github.head_ref, 'train/') }}`. The workflows still
-  trigger on the PR (ADR 0087 rule 1), and each job reports "skipped". GitHub counts a job skipped by `if:`
+  studio1 train result, and each member PR already had its own hosted run. A job skips a PR only when all
+  three hold: the head branch starts with `train/`, the head repository is this repository (not a fork), and
+  the PR author is in the bundle-author list (`["dirvine"]`). Any other `train/*` PR runs full CI. Every job in
+  `ci.yml`, `build.yml`, `integration.yml`, `security.yml`, `release-custody-check.yml`,
+  `python-client-example.yml` and `adr-governance.yml` carries this condition. Each workflow defines it once
+  as the YAML anchor `&run-unless-train-bundle`, and its other jobs use `*run-unless-train-bundle`; a
+  workflow with one job writes the condition in place. Push,
+  schedule and dispatch runs have no pull-request context, so every job runs. The workflows still trigger
+  on the PR (ADR 0087 rule 1), and each skipped job reports "skipped". GitHub counts a job skipped by `if:`
   as passing a required check; a workflow that does not trigger would leave the check pending. The push of
   the merge commit to `main` runs the full hosted set, and the release gate reads that push run.
+  `scripts/ci/test_train_bundle_skip.py` (in `Inert CI script controls`) fails if a job lacks the condition
+  or carries a different one. To change the author list, edit that test and the seven anchors together.
 - Every PR workflow cancels an older run for the same PR. Push runs on `main` are never cancelled, so each
   merge commit keeps a terminal `ci.yml` result for the release gate. `ci-full.yml` cancels only an older
   run of the same event on the same ref, so a dispatch never cancels a nightly run.

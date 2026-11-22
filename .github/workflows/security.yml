@@ -19,7 +19,7 @@ env:
 jobs:
   audit:
     name: Cargo Audit
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: &run-unless-train-bundle ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'train/') && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["dirvine"]'), github.event.pull_request.user.login)) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -52,7 +52,7 @@ jobs:
 
   panic-check:
     name: Panic Scanner
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

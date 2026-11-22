@@ -33,7 +33,7 @@ jobs:
   # ── Guardian: API coverage enforcement (every PR, ~30s) ────────────────
   api-coverage:
     name: API Coverage Guard
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: &run-unless-train-bundle ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'train/') && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["dirvine"]'), github.event.pull_request.user.login)) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -62,7 +62,7 @@ jobs:
   # ── Property tests (every PR, ~2min) ──────────────────────────────────
   proptest:
     name: Property Tests
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -134,7 +134,7 @@ jobs:
   # Core: daemon API + D4 signed-commit suites (light load).
   integration-core:
     name: Integration (core)
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     # Cold all-feature compilation consumed the former 20-minute job budget
     # before the final selector ran; inner runtime bounds remain unchanged.
@@ -175,7 +175,7 @@ jobs:
   # no-daemon half (doc-surface check) also runs in the ordinary Test Suite.
   agent-usability:
     name: Agent usability eval (#1174)
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -210,7 +210,7 @@ jobs:
   # build without --all-features), inside the loopback-only namespace.
   onboarding-recipe:
     name: Onboarding recipe (quickstart-two-agents)
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -246,7 +246,7 @@ jobs:
   # --no-start and install.ps1 simply omits -Start.
   installer-smoke:
     name: Installer smoke (${{ matrix.os }})
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -292,7 +292,7 @@ jobs:
   # instead of a silent early-return pass (tests/common/network_gate.rs).
   tailnet:
     name: Integration (tailnet)
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -333,7 +333,7 @@ jobs:
   # the same job as the release build on a cold rust-cache.
   integration-groups:
     name: Integration (groups)
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     # Preserve headroom for cold compilation and artifact finalization while
     # retaining each test harness's existing runtime deadline.
@@ -550,7 +550,7 @@ jobs:
   # scheduling stall into a false counter mismatch.
   integration-voice-datagram:
     name: 'Integration (voice datagram, #277)'
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -656,7 +656,7 @@ jobs:
   #    published-registry validation.
   typed-server-shutdown:
     name: Typed server shutdown (${{ matrix.case }})
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -720,7 +720,7 @@ jobs:
   # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
   integration-net:
     name: Integration (net)
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -793,7 +793,7 @@ jobs:
   # rekey, restart, and application-payload capture after QUIC/gossip delivery.
   encrypted-kv-transport:
     name: Encrypted KV transport proof
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -857,7 +857,7 @@ jobs:
   # Full -> Ref counters and exact remote delivery before and after restart.
   gossip-key-cache-transport:
     name: Gossip key-cache transport proof
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:

@@ -31,7 +31,7 @@ concurrency:
 jobs:
   fmt:
     name: Format Check
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: &run-unless-train-bundle ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'train/') && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["dirvine"]'), github.event.pull_request.user.login)) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -66,7 +66,7 @@ jobs:
 
   clippy:
     name: Clippy Lint
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -128,7 +128,7 @@ jobs:
   # limit leave at least 2x that.
   test:
     name: Test Suite
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 75
     env:
@@ -254,7 +254,7 @@ jobs:
   # copies of these steps.
   script-controls:
     name: Inert CI script controls
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -279,9 +279,12 @@ jobs:
       - name: Coverage Gate step controls
         run: bash scripts/ci/test_coverage_gate.sh
 
+      - name: Train bundle skip condition
+        run: python3 -B scripts/ci/test_train_bundle_skip.py -v
+
   doc:
     name: Documentation
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -341,7 +344,7 @@ jobs:
     #   tests/gui_named_group_parity.rs::DEFERRED with a reason
     # - docs/design/api-manifest.json is regenerated
     name: API + GUI Parity Gate
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -409,7 +412,7 @@ jobs:
     # locally, then exercises every disclosed control via the self-test so the
     # refusal is witnessed in CI, not just written.
     name: Deployment Authority Gate
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

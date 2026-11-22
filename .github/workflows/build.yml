@@ -23,7 +23,7 @@ env:
 jobs:
   validate-release-metadata:
     name: Validate release metadata
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: &run-unless-train-bundle ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'train/') && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["dirvine"]'), github.event.pull_request.user.login)) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -59,7 +59,7 @@ jobs:
   # fips204, so no leg pays for a host debug build of the x0x graph.
   prepare-m2-signing-controls:
     name: Prepare M2 signing controls
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     needs: validate-release-metadata
     runs-on: ubuntu-latest
     outputs:
@@ -96,7 +96,7 @@ jobs:
   # is a separate job that keeps its literal name when a train/* PR skips it.
   build-linux-x64-gnu:
     name: Build linux-x64-gnu
-    if: ${{ !startsWith(github.head_ref, 'train/') }}
+    if: *run-unless-train-bundle
     needs: [validate-release-metadata, prepare-m2-signing-controls]
     runs-on: ubuntu-latest
     env:
