@@ -114,8 +114,11 @@ pub(super) fn local_member_scope<'a>(
         .collect()
 }
 
-async fn refresh_scope(state: &AppState) {
+pub(super) async fn refresh_scope(state: &AppState) {
+    // Under the persistence lock the map holds committed state only: a
+    // candidate that a failed persist rolls back never narrows the scope.
     let scope = {
+        let _committed = state.named_groups_persistence_lock.lock().await;
         let groups = state.named_groups.read().await;
         local_member_scope(groups.values(), &state.agent.agent_id())
     };

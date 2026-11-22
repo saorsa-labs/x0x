@@ -683,6 +683,71 @@ async fn the_sticky_record_survives_a_restart_through_startup() -> Result<()> {
     Ok(())
 }
 
+/// #2173 review round 4: a roster candidate that a failed persist rolls
+/// back is never read as the scope. The refresh waits for the persistence
+/// lock, so L, whose removal candidate was shown and then restored, keeps
+/// its record. Red on e327afc2: the refresh read the candidate and dropped
+/// L's record for good.
+#[tokio::test]
+async fn a_rolled_back_candidate_never_narrows_the_sticky_scope() -> Result<()> {
+    let f = fixture(Advert::StickyOnly, ready()).await?;
+    let l_id = f.l.agent.agent_id();
+    let bit = x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
+    let store = f.a.agent.capability_store();
+    assert!(store.registry_bit_ready(&l_id, bit));
+    let committed = f.head(&f.a).await;
+    let persisting = f.a.named_groups_persistence_lock.lock().await;
+    {
+        let mut candidate = committed.clone();
+        candidate.remove_member(&Fixture::hex(&l_id), None);
+        f.a.named_groups
+            .write()
+            .await
+            .insert(GROUP.to_string(), candidate);
+    }
+    let refresh = {
+        let state = Arc::clone(&f.a);
+        tokio::spawn(async move { crate::server::sticky_capabilities::refresh_scope(&state).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    f.a.named_groups
+        .write()
+        .await
+        .insert(GROUP.to_string(), committed);
+    drop(persisting);
+    refresh.await?;
+    assert!(
+        store.registry_bit_ready(&l_id, bit),
+        "the rolled-back candidate did not drop L's record"
+    );
+    Ok(())
+}
+
+/// #2173 review round 4: the production entry point `start` (what the
+/// daemon's startup calls) loads the file into the store.
+#[tokio::test]
+async fn the_daemon_startup_entry_loads_the_record() -> Result<()> {
+    let f = fixture(Advert::Never, ready()).await?;
+    let l_id = f.l.agent.agent_id();
+    let bit = x0x::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
+    crate::server::sticky_capabilities::write(
+        &f.a.data_dir,
+        &[(
+            l_id,
+            x0x::dm_capability::StickySeen {
+                bits: bit,
+                advert_created_at_unix_ms: 1,
+            },
+        )],
+    )
+    .await?;
+    assert!(!f.a.agent.capability_store().registry_bit_ready(&l_id, bit));
+    let writer = crate::server::sticky_capabilities::start(&f.a).await;
+    assert!(f.a.agent.capability_store().registry_bit_ready(&l_id, bit));
+    writer.abort();
+    Ok(())
+}
+
 /// #2173 review (item 5): the seal fails and the restore fails too. The
 /// route answers `treekem_rollback_failed` and the tree is already unloaded
 /// when the reply arrives, so no request can use the advanced tree.

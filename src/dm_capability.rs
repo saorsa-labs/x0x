@@ -666,29 +666,29 @@ impl CapabilityStore {
     pub fn set_sticky_scope(&self, scope: impl IntoIterator<Item = AgentId>) {
         let scope: std::collections::HashSet<[u8; 32]> =
             scope.into_iter().map(|agent| agent.0).collect();
-        let current: Vec<([u8; 32], crate::dm::CapabilityRegistry, u64)> = {
-            let Ok(inner) = self.inner.lock() else {
-                return;
-            };
-            let now = Instant::now();
-            inner
-                .adverts
-                .iter()
-                .filter(|(id, entry)| {
-                    scope.contains(*id)
-                        && entry.verified_advert
-                        && entry.machine_id != [0; 32]
-                        && now <= entry.expires_at
-                })
-                .map(|(id, entry)| {
-                    (
-                        *id,
-                        entry.capabilities.application_registry,
-                        entry.created_at_unix_ms,
-                    )
-                })
-                .collect()
+        // Lock order inner → sticky, as in `insert`: no advert can land
+        // between the cache read and the record update.
+        let Ok(inner) = self.inner.lock() else {
+            return;
         };
+        let now = Instant::now();
+        let current: Vec<([u8; 32], crate::dm::CapabilityRegistry, u64)> = inner
+            .adverts
+            .iter()
+            .filter(|(id, entry)| {
+                scope.contains(*id)
+                    && entry.verified_advert
+                    && entry.machine_id != [0; 32]
+                    && now <= entry.expires_at
+            })
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    entry.capabilities.application_registry,
+                    entry.created_at_unix_ms,
+                )
+            })
+            .collect();
         let Ok(mut sticky) = self.sticky.lock() else {
             return;
         };
@@ -723,6 +723,10 @@ impl CapabilityStore {
     /// [`Self::set_sticky_scope`]. Entries outside the scope are not kept;
     /// an entry the store already holds keeps the one with the later advert.
     pub fn seed_sticky(&self, entries: impl IntoIterator<Item = (AgentId, StickySeen)>) {
+        // Lock order inner → sticky, as in `insert`.
+        let Ok(_inner) = self.inner.lock() else {
+            return;
+        };
         let Ok(mut sticky) = self.sticky.lock() else {
             return;
         };
@@ -1326,6 +1330,27 @@ mod tests {
         assert!(store.sticky_snapshot().1.is_empty(), "not a member yet");
         store.set_sticky_scope([member]);
         assert_eq!(store.sticky_snapshot().1.len(), 1);
+    }
+
+    /// An advert with the same signed `created_at` as the one that set the
+    /// record (a replay of it, or an advert without the bit stamped the same
+    /// millisecond) does not clear the record.
+    #[test]
+    fn an_advert_with_an_equal_timestamp_does_not_clear_the_record() {
+        let member = AgentId([6; 32]);
+        let at = now_unix_ms() - 1_000;
+        let store = CapabilityStore::new();
+        store.set_sticky_scope([member]);
+        store.seed_sticky([(
+            member,
+            StickySeen {
+                bits: STICKY_BIT,
+                advert_created_at_unix_ms: at,
+            },
+        )]);
+        assert!(store.insert(member, MachineId([4; 32]), registry_caps(0), at));
+        assert_eq!(store.sticky_snapshot().1.len(), 1);
+        assert!(store.registry_bit_ready(&member, STICKY_BIT));
     }
 
     /// #2173 review (item 4): after a restart, a replayed advert older than

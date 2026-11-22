@@ -532,9 +532,9 @@ fn stored_fork_wait(row: &x0x::groups::eviction::ObligationRow) -> Option<bool> 
 ///
 /// - **Marker set.** The row's delivery stops and it waits in the fork set
 ///   as `waiting_for_fork_resolution`. The saved event stays in the row and
-///   is never sent. When the marker's competing commit is a child of the
-///   saved event's parent, the stored wait names that commit's signer: the
-///   saved event is fork evidence. The store changes only on the pass that
+///   is never sent. When the marker competes with the saved transition
+///   ([`marker_competes`]), the stored wait names the competing commit's
+///   signer: the saved event is fork evidence. The store changes only on the pass that
 ///   first sets the wait.
 /// - **Marker gone** (the manual clear of ADR 0066, or an owner-anchored
 ///   clear). The row leaves the fork set and is classified against this

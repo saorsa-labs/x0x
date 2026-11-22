@@ -9188,8 +9188,9 @@ const TREEKEM_ROLLBACK_FAILED: &str = "treekem_rollback_failed";
 /// #2135: a removal or ban made its TreeKEM commit before the seal, the
 /// seal failed, and the tree could not be restored. The in-memory tree is
 /// then ahead of the roster, so it is unloaded before the reply: later
-/// operations answer "TreeKEM group not loaded" until a restart reloads the
-/// durable tree, which never held the failed commit. The reply and an error
+/// operations answer "TreeKEM group not loaded" until the durable tree,
+/// which never held the failed commit, is reloaded (a restart or the next
+/// rebind). The reply and an error
 /// log are the only places that name the failure.
 async fn treekem_rollback_failed(
     state: &Arc<AppState>,

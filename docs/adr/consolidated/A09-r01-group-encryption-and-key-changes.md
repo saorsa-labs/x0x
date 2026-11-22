@@ -575,8 +575,8 @@ open for GSS (below).
 - **S4 rows (ADR 0110 §3).** While a group holds the marker, an open row
   that holds a saved removal event or crypto-only frame stops its delivery,
   keeps the saved event and never sends it, and waits as
-  `waiting_for_fork_resolution`. When the marker's competing commit is a
-  child of the saved event's parent, the stored wait names that commit's
+  `waiting_for_fork_resolution`. When the marker competes with the saved transition (the rule in
+  the Exit bullet), the stored wait names the competing commit's
   signer: the saved event is fork evidence. The completion pass completes
   no row of that group, because this node's chain may be the branch the
   group did not take. The `.evs` is written only when the wait changes, not
@@ -593,7 +593,10 @@ open for GSS (below).
   chain. The marker competed with the saved transition unless the marker's
   competing commit chains on the transition's own result or on a later
   commit of this node's retained chain above it (then the transition is
-  common ancestry); a deeper commit of a competing branch competes too. If
+  common ancestry); a deeper commit of a competing branch competes too,
+  and so does a marker whose competing commit's parent this node does not
+  retain: its saved event is dropped unsent, and a survivor that still
+  lacks the transition gets it by chain catch-up. If
   the stored wait names a competing signer, or the chain holds a competing
   child of the parent, the saved event is dropped unpublished and the row
   completes from this node's chain. Otherwise a saved removal resumes as at
@@ -607,8 +610,8 @@ open for GSS (below).
   seal. If the seal fails, the tree is restored from its snapshot. If that
   restore fails, the daemon unloads the in-memory tree and then answers 500
   `treekem_rollback_failed`, so no later operation uses the advanced tree:
-  they answer "TreeKEM group not loaded" until a restart reloads the durable
-  tree, which never held the commit. Only that reply and an error log name
+  they answer "TreeKEM group not loaded" until the durable tree, which
+  never held the commit, is reloaded (a restart or the next rebind). Only that reply and an error log name
   the failure; group status does not show it.
 - **Known limits.** (1) An admin on the other branch keeps resending its
   removal to the forked node every 5 s until the manual exit, because that
