@@ -43,7 +43,14 @@
 //!   forbids. The arm is wired as an expected RED with
 //!   `CAUSE_NO_TYPED_FORK` — the only cause this arm accepts as its RED
 //!   (the test checks the cause, not only the verdict) — and it turns
-//!   GREEN with that fix. The gap is recorded on #1581 by name. A
+//!   GREEN with that fix. The gap is recorded on #1581 by name. #2135
+//!   measured why (21 Nov 2026): A's and D's removals of B from the same
+//!   parent carry the same roster state hash, since an ordinary TreeKEM
+//!   removal binds only the epoch, so A treats D's commit as a duplicate
+//!   of its own and counts C's and D's head reports as convergence. The
+//!   #2135 fork containment (a competing child with a different hash)
+//!   does not reach this shape; it needs an ADR ruling on binding the
+//!   removal's commit identity. A
 //!   sibling that a receiver keeps fails the end-state evidence
 //!   (INFRA); a sibling A sends — kept or refused — names
 //!   `CAUSE_SIBLING_PUBLISHED`, which also fails the arm's cause

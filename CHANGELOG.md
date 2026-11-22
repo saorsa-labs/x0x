@@ -28,8 +28,9 @@ All notable changes to this project will be documented in this file.
   dropped as superseded and then completing. The row stays open across a
   restart while the marker stands; `POST /groups/:id/quarantine/clear` is
   the exit, after which the row is classified again. No new stored field.
-  Known limit: a node that keeps its own removal as its head sees the
-  competing commit only through the ordinary apply path.
+  Known limit: two admins' removals of the same target from the same
+  parent can share a state hash (the TreeKEM commit is not in it), and
+  that fork is still not detected (W3-H 1581e stays expected-red).
 - **A delta into a group store is measured in O(keys in the delta) (#2110
   item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
   length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta

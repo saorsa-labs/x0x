@@ -457,13 +457,19 @@ classified as a fork while the marker stands. The exit is the existing
 manual clear (`POST /groups/:id/quarantine/clear`). After it, the next
 worker pass classifies the row again, as a restart would: a resumed
 delivery still waits for the group's head sync, and a competing child still
-on the chain keeps the row in the fork set. Known limit: this detects a
-competing commit only when it is on this node's chain, or when the group
-already carries a marker. A node that keeps its own removal as its head
-(the W3-H 1581e fork arm) learns of the competing commit only if that
-commit reaches the ordinary apply path, which records it as fork evidence
-(ADR-0066). This change does not alter how a relayed commit is
-authenticated. No wire or API change.
+on the chain keeps the row in the fork set. Known limit, measured in the
+W3-H 1581e fork arm on 21 Nov 2026: two admins' removals of the same target
+from the same parent can carry the same roster state hash, because an
+ordinary TreeKEM removal binds only `treekem:epoch=<n>` in its security
+binding, not its TreeKEM commit. Their TreeKEM commits, and so their epoch
+keys, still differ. A node that keeps its own removal as its head then
+treats the other admin's commit as a duplicate of its own (same revision,
+same state hash, so not fork evidence), and a survivor that reports that
+head counts as converged on this node's delivery, so the row completes with
+no typed state. Detecting this fork needs the removal's commit identity in
+what nodes compare (for example in the security binding, as the self-leave
+rekey binding already does), which changes the state hash and needs an ADR
+ruling. This change does not alter it. No wire or API change.
 
 ## Security claims
 
