@@ -1,8 +1,12 @@
 # CI/CD
 
-Eight workflows in `.github/workflows/`:
+The main workflows in `.github/workflows/`:
 
-- **ci.yml**: fmt, clippy, nextest, line coverage, doc, API/GUI parity, skill token budget
+- **ci.yml**: the slim hosted set on pushes to `main` and on PRs: fmt, clippy, the library unit tests
+  (`Test Suite`), doc, API/GUI parity, deployment authority, skill token budget
+- **ci-full.yml** (`CI (full)`): the heavy suites, nightly on `main` and on `workflow_dispatch`: the full
+  workspace Test Suite, the W3-H shards and determinism gate, the released-binary rows, the Linux systemd and
+  100k signing acceptances, Windows, and the Coverage Gate
 - **security.yml**: `cargo audit` (daily schedule + PRs)
 - **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io. Also generates `release-manifest.json` and signature for the self-update system (see [`upgrade-system.md`](upgrade-system.md)).
 - **build.yml**: PR validation
@@ -13,7 +17,7 @@ Eight workflows in `.github/workflows/`:
 
 ## PR CI and main protection (ADR 0087, charter D15)
 
-Recorded in [ADR 0087](adr/0087-repository-and-release-governance.md) (Proposed);
+Recorded in [ADR 0087](adr/0087-repository-and-release-governance.md) (Accepted);
 the rulings D04, D05, D15 and D36 are summarised in
 [`design/x0x-direction.md`](design/x0x-direction.md).
 
@@ -30,6 +34,25 @@ the rulings D04, D05, D15 and D36 are summarised in
 - `v*` tags can be created, moved or deleted only by repository admins (tag ruleset). Every agent currently acts
   as the `dirvine` admin account, so this and the `release` environment reviewer are procedural gates, not
   technical separation between agents and David (a separate bot identity was declined, D15).
+
+## Hosted CI is the slim set
+
+GitHub-hosted runners have 4 vCPUs and 16 GB of RAM. From 13 Nov 2026 the full set in `ci.yml` did not go
+green there. The `Test Suite` job stopped with exit 143 ("The runner has received a shutdown signal") while
+rustc built the workspace test graph, before any test ran (#1789, run 44976569803). The W3-H shards, the
+H-S3-rm rows and the Coverage Gate lost their runners ("lost communication with the server"). The same tree
+was green on studio1. The likely cause is memory exhaustion on the runner; the logs end without a
+compiler or test error.
+
+- `ci.yml` runs only what fits a hosted runner with a wide margin. Its `Test Suite` job runs the x0x library
+  unit tests (`--all-features --lib`) in the isolated namespace. It builds them with the `ci-hosted` Cargo
+  profile (no debuginfo, x0x at `opt-level = 0` with 256 codegen units) and adds 12 GB of swap.
+- The studio1 trains run the full suite and are the merge gate.
+- `ci-full.yml` runs the heavy jobs nightly on `main` and on `workflow_dispatch` for any branch. A
+  harness-first PR gets its 20 W3-H CI reruns (A08, D196) by dispatching `CI (full)` on its branch.
+- `integration.yml`, `build.yml` and `security.yml` still run on every PR (ADR 0087 rule 1).
+- Every PR workflow cancels an older run for the same PR. Push runs on `main` are never cancelled, so each
+  merge commit keeps a terminal `ci.yml` result for the release gate.
 
 ## Release CI Gate (#128)
 
@@ -49,6 +72,8 @@ commit.
   than the old ceiling, which forced a manual rerun on the v0.41.0 tag.)
 - `ci.yml` is not triggered by the tag push itself (it gates on branch
   `main`), so the observed run is the one from when the commit was merged.
+- The gate reads `ci.yml` runs only. A `ci-full.yml` (`CI (full)`) run does
+  not gate a release.
 
 To exercise it locally, push a scratch `vX.Y.Z` tag on a commit with
 intentionally-red CI and confirm `require-green-ci` fails before any artifact
@@ -98,7 +123,8 @@ X0XD_LEGACY_BINARY=/path/to/authentic/x0xd-0.30.1 just convergence-release
 
 ## Coverage Gate
 
-The CI coverage job runs on Linux with `cargo-llvm-cov` and `cargo-nextest`.
+The coverage job (`ci-full.yml`, nightly and on dispatch) runs on Linux with
+`cargo-llvm-cov` and `cargo-nextest`.
 It emits `lcov.info`, uploads it as a workflow artifact, and enforces the
 active global floor from `coverage-thresholds.toml`.
 
