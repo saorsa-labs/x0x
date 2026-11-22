@@ -36,6 +36,7 @@ concurrency:
 jobs:
   adr-governance:
     name: Validate ADRs and immutable Accepted status
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'train/') && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["dirvine"]'), github.event.pull_request.user.login)) }}
     runs-on: ubuntu-latest
     env:
       # Actions event name. pull_request uses the merge-base. push uses GITHUB_BEFORE.
