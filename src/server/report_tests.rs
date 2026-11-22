@@ -968,10 +968,10 @@ async fn post_report_deliver_to_needs_an_owner_identity() {
     assert_eq!(body["error"], "no_owner_identity");
 }
 
-/// WHY (#2156 review): the roster resets the mode of a renewed or
-/// live-announced certificate to ACP, so a rider would pass on the roster
-/// mode alone. Any journal line of this owner in rider mode refuses it;
-/// another owner's rider lines do not count.
+/// WHY (#2156 review; #2158): a rider later re-issued as ACP shows `acp`
+/// on the roster, so it would pass on the roster mode alone. Any journal
+/// line of this owner in rider mode refuses it; another owner's rider
+/// lines do not count.
 #[test]
 fn a_rider_reset_to_acp_on_the_roster_is_still_refused() {
     use crate::identity::AgentId;

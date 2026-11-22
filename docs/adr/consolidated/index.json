@@ -33,7 +33,7 @@
       "revision": 1,
       "path": "A04-r01-agent-attachment-and-inbound-events.md",
       "title": "Agent Attachment and Inbound Events",
-      "sha256": "24be244632121de84e3c3a56af84e7aee540f7b4e1ec88fd8a154a4225cb0914"
+      "sha256": "ffbf3f092acbd6992e83db4add1208d2acfe27b5b84c0b5de3e927df1108033d"
     },
     {
       "id": "A05",
@@ -68,7 +68,7 @@
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "3c994325ebf86ad43e17b0d1d34bdad965b3913cbfb71e7f0f5ffb63716fc78f"
+      "sha256": "41b37ad5b3f15ec1ecb3d57203331def99e935016ae1350693c11677d40b342e"
     },
     {
       "id": "A10",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "56e28c9e143d569cebdb1336f0d35f23885c79d533fa08559b91a870db079dda"
+      "sha256": "45006f981fd9d6023a2918245423e444a1efc1b8100a8e73822e7272ac8d4026"
     },
     {
       "id": "A15",
