@@ -454,6 +454,32 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// #2186 review: the drop-in installer writes the anchor
+    /// (`.deployment/launcher-dropin.py` `render_anchor`) and this reader
+    /// reads it; both are checked against one fixture
+    /// (`tests/test_launcher_dropin.py`
+    /// `test_the_installer_anchor_is_the_shared_fixture`).
+    #[test]
+    fn the_installer_anchor_fixture_parses() {
+        let bytes = include_bytes!("../../tests/fixtures/plan-anchor-installer.json").to_vec();
+        let anchored = Anchored::parse(bytes).unwrap();
+        let anchor = anchored.anchor();
+        assert_eq!(anchor.daemon_target, Path::new("/opt/x0x/x0xd"));
+        assert_eq!(anchor.cli_target, Path::new("/opt/x0x/x0x"));
+        let ids: Vec<_> = anchor
+            .participants
+            .iter()
+            .map(|p| (p.instance_id.as_str(), p.data_root.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("x0xd", "/root/.local/share/x0x"),
+                ("x0xd-443", "/var/lib/x0x-443")
+            ]
+        );
+    }
+
     fn plan_in(root: &Path) -> FrozenPlan {
         freeze_plan(input_in(root)).unwrap()
     }

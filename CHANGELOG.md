@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Launcher enable step 2: data-root stage lock, installer plan anchor and
+  a signed launcher asset (#2012; A14 amendment of 22 Nov 2026).** The
+  prepare producer holds a lock on the data root
+  (`upgrade-stage.lock`) for every stage, so two install pairs staging in
+  one data root never interleave. The dormant launcher checks a plan
+  against its anchor before it creates any lock file at the plan's daemon
+  target, does not wait on its own lock when the plan names the daemon
+  through a symlinked directory, and reports a host journal of another
+  install with the typed reason `other-install-journal`, which `x0x doctor`
+  shows with its remedy. `.deployment/install.sh --launcher` now writes one
+  root-owned plan anchor per install (`/etc/x0x/launcher/install-<key>.anchor.json`,
+  shared by every unit of that install that it binds) and adds
+  `--plan-anchor` to the drop-in. It changes the launcher, the drop-in and
+  the anchor only when no data root of the install holds a journal other
+  than an idle or superseded one, runs one install at a time per anchor
+  directory, and never leaves the anchor naming a unit without its drop-in.
+  With no path it fetches and GPG-verifies the
+  `x0x-launcher-<platform>.tar.gz` release asset (Linux x64 and ARM64),
+  which releases carry only once the separate release workflow change
+  (#2190) lands; until then it fails closed and `--launcher PATH` is used. The fleet's `x0xd-443` units cannot be bound
+  yet, so fleet hosts have no trial. The launcher is still dormant (`ENABLED` is
+  false) and no apply path calls the producer, so no install changes
+  behaviour.
 - **Launcher journal integrity binding (#2012, design B4; A14 amendment of
   22 Nov 2026).** The launcher argv's trial form takes an optional
   `--plan-anchor <path>`, which names a root-owned file that lists the

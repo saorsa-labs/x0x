@@ -254,6 +254,21 @@ fn remove_bindings_except(data_root: &Path, keep: &[Option<&str>]) {
     }
 }
 
+/// The stage lock of a data root: `<data_root>/upgrade-stage.lock`.
+pub(crate) const STAGE_LOCK_NAME: &str = "upgrade-stage.lock";
+
+/// Take the stage lock of `data_root` (#2171 fourth review): every `stage`
+/// holds it from its journal read to its last binding removal, so two
+/// stages in one data root never interleave, whatever install pair each
+/// is for. Without it, two pairs that stage for the first time in a data
+/// root with no journal hold different install locks, and each could
+/// remove the other's new binding. It is taken after the host lock and
+/// held while nothing else is waited for, so it cannot deadlock.
+#[cfg(unix)]
+fn stage_lock(data_root: &Path) -> io::Result<InstallLock> {
+    InstallLock::take(lock_file(&data_root.join(STAGE_LOCK_NAME))?)
+}
+
 /// The new transaction's binding write. A test can make it fail at one
 /// barrier step (`tests::fail_binding_write`).
 #[cfg(unix)]
@@ -274,6 +289,10 @@ fn write_binding(path: &Path, binding: &plan_binding::PlanBinding) -> io::Result
 /// (`tests::fail_journal_write`), as a crash or a full disk would.
 #[cfg(unix)]
 fn write_staged_journal(path: &Path, record: &JournalRecord) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = tests::BEFORE_JOURNAL_WRITE.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     #[cfg(test)]
     if let Some(step) = tests::JOURNAL_FAILURE.with(std::cell::Cell::take) {
         return journal::write_record_with_failure(path, record, step);
@@ -525,6 +544,7 @@ impl Prepared {
         if transaction_id.trim().is_empty() {
             return Err(refused("empty transaction id"));
         }
+        let _stage = stage_lock(data_root)?;
         let path = data_root.join(journal::JOURNAL_FILE_NAME);
         let mut current = None;
         match std::fs::symlink_metadata(&path) {
@@ -689,6 +709,13 @@ pub(crate) mod tests {
         /// The barrier step at which this thread's next binding write fails.
         pub(crate) static BINDING_FAILURE: std::cell::Cell<Option<journal::BarrierStep>> =
             const { std::cell::Cell::new(None) };
+    }
+
+    thread_local! {
+        /// Runs once, on this thread, just before the next Staged journal
+        /// write, after the new binding is durable.
+        pub(crate) static BEFORE_JOURNAL_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// Make this thread's next binding write fail at `step`.
@@ -949,40 +976,110 @@ pub(crate) mod tests {
         }
     }
 
-    /// #2171 review: over a settled journal for another install pair, a
-    /// stage is refused and changes nothing.
-    #[test]
-    fn staging_refuses_another_install_pair_over_a_journal() {
-        let (_dir, root) = root();
-        let plan = freeze_plan(input_in(&root)).unwrap();
-        let lock = HostLock::acquire(&plan).unwrap();
-        let anchor = plan_binding::test_anchored(&plan);
-        Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).unwrap();
-        settle(&root, Phase::HostCommitted);
-        drop(lock);
-        let (_other_dir, other_root) = super::tests::root();
-        let mut other = freeze_plan(input_in(&other_root)).unwrap();
-        // The other pair, staged into this data root.
-        other.participants = plan.participants.clone();
+    /// The plan of another install pair staged into `root`: the daemon
+    /// target, the CLI target or both (`daemon`, `cli`) from a pair in
+    /// another directory, the participants `plan`'s.
+    fn other_pair(plan: &FrozenPlan, daemon: bool, cli: bool) -> (tempfile::TempDir, FrozenPlan) {
+        let (other_dir, other_root) = super::tests::root();
+        let fresh = freeze_plan(input_in(&other_root)).unwrap();
+        let mut other = plan.clone();
+        if daemon {
+            other.daemon = fresh.daemon;
+        }
+        if cli {
+            other.cli = fresh.cli;
+        }
         for participant in &mut other.participants {
             participant.executable = other.daemon.target_path.clone();
             participant.argv[0] = other.daemon.target_path.to_string_lossy().into_owned();
         }
-        let other_lock = HostLock::acquire(&other).unwrap();
-        let other_anchor = plan_binding::test_anchored(&other);
-        let before = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
-        let error =
-            Prepared::stage(&other_lock, &root, "tx-2", other, &other_anchor).expect_err("refused");
-        assert!(
-            error.to_string().contains("another install pair"),
-            "{error}"
-        );
-        assert_eq!(
-            std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap(),
-            before
-        );
-        assert!(root.join(plan_binding::binding_file_name("tx-1")).exists());
-        assert!(!root.join(plan_binding::binding_file_name("tx-2")).exists());
+        (other_dir, other)
+    }
+
+    /// #2171 review: over a settled journal for another install pair, a
+    /// stage is refused and changes nothing. Each target is compared on
+    /// its own: a pair that differs only in the daemon target, or only in
+    /// the CLI target, is another pair.
+    #[test]
+    fn staging_refuses_another_install_pair_over_a_journal() {
+        for (daemon, cli) in [(true, false), (false, true), (true, true)] {
+            let (_dir, root) = root();
+            let plan = freeze_plan(input_in(&root)).unwrap();
+            let lock = HostLock::acquire(&plan).unwrap();
+            let anchor = plan_binding::test_anchored(&plan);
+            Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).unwrap();
+            settle(&root, Phase::HostCommitted);
+            drop(lock);
+            let (_other_dir, other) = other_pair(&plan, daemon, cli);
+            let other_lock = HostLock::acquire(&other).unwrap();
+            let other_anchor = plan_binding::test_anchored(&other);
+            let before = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+            let error = Prepared::stage(&other_lock, &root, "tx-2", other, &other_anchor)
+                .expect_err("refused");
+            let case = format!("daemon differs {daemon}, cli differs {cli}");
+            assert!(
+                error.to_string().contains("another install pair"),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap(),
+                before,
+                "{case}"
+            );
+            assert!(root.join(plan_binding::binding_file_name("tx-1")).exists());
+            assert!(!root.join(plan_binding::binding_file_name("tx-2")).exists());
+        }
+    }
+
+    /// #2171 fourth review: two install pairs that stage for the first time
+    /// in one data root (no journal yet) hold different install locks. The
+    /// data root's stage lock still keeps them apart: the second waits for
+    /// the first, then sees its Staged journal in flight and is refused, so
+    /// the first journal keeps its binding. Without the stage lock the
+    /// second runs inside the first and removes its binding.
+    #[test]
+    fn first_stages_of_two_pairs_in_one_data_root_never_interleave() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let (_other_dir, other) = other_pair(&plan, true, true);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let racer_root = root.clone();
+        let racer = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let racer_slot = racer.clone();
+        BEFORE_JOURNAL_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let thread = std::thread::spawn(move || {
+                    let other_lock = HostLock::acquire(&other).unwrap();
+                    let result = stage(&other_lock, &racer_root, "tx-other", other).map(drop);
+                    let _ = sender.send(());
+                    result
+                });
+                // Give the racing stage time to run to its end if it can.
+                let finished = receiver
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .is_ok();
+                *racer_slot.lock().unwrap() = Some((thread, finished));
+            }))
+        });
+        stage(&lock, &root, "tx-first", plan).unwrap();
+        let (thread, finished_inside) = racer.lock().unwrap().take().expect("the hook ran");
+        let raced = thread.join().unwrap();
+        assert!(!finished_inside, "the second stage ran inside the first");
+        let error = raced.expect_err("the second stage is refused");
+        assert!(error.to_string().contains("in flight"), "{error}");
+        let bytes = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+        let journal::RecordRead::Journal(record) = journal::classify_record(&bytes, "journal")
+        else {
+            panic!("no journal");
+        };
+        assert_eq!(record.transaction_id, "tx-first");
+        assert!(root
+            .join(plan_binding::binding_file_name("tx-first"))
+            .exists());
+        assert!(!root
+            .join(plan_binding::binding_file_name("tx-other"))
+            .exists());
     }
 
     /// #2171 review: a transaction id equal to the current journal's is
