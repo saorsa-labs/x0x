@@ -1274,6 +1274,9 @@ async fn serve_with_options_inner(
         shutdown_started: tokio_util::sync::CancellationToken::new(),
         join_artifact_egress: StdMutex::new(HashMap::new()),
         join_artifact_egress_owners: StdMutex::new(Vec::new()),
+        welcome_ack_sends: Arc::new(tokio::sync::Semaphore::new(
+            crate::server::routes::named_groups::WELCOME_ACK_SEND_PERMITS,
+        )),
         welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,

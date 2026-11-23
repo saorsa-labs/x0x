@@ -55782,6 +55782,13 @@ async fn handle_welcome_fetch_request_via<S, F>(
         );
         return;
     }
+    // #2202: a repeated fetch while this recipient's stream is still live
+    // leaves it running. Restarting it dropped its acks and sent every
+    // chunk again, so under slow acks a stream could never finish.
+    if welcome_stream_live(state, &welcome_id).await {
+        tracing::debug!(target: "welcome.trace", stage = "stream_live_kept", welcome_id = %welcome_id);
+        return;
+    }
     let stream_state = Arc::clone(state);
     let recipient = *sender;
     let stream_id = welcome_id.clone();
@@ -55797,6 +55804,17 @@ async fn handle_welcome_fetch_request_via<S, F>(
         .await;
     })
     .await;
+}
+
+/// Whether a Welcome stream for `welcome_id` is registered and still runs.
+async fn welcome_stream_live(state: &AppState, welcome_id: &str) -> bool {
+    state
+        .pending_welcome_streams
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|streams| streams.get(welcome_id))
+        .is_some_and(|handle| !handle.is_finished())
 }
 
 async fn replace_welcome_stream<F>(state: &Arc<AppState>, welcome_id: &str, stream: F)
@@ -56088,19 +56106,84 @@ async fn handle_welcome_blob_chunk(
         receive.received_bytes = receive.received_bytes.saturating_add(decoded.len() as u64);
         receive.chunks.insert(sequence, decoded);
     }
+    let all_present = receive.received_bytes == receive.byte_len
+        && receive.chunks.len() as u64 == receive.total_chunks;
     drop(receives);
     tracing::debug!(target: "welcome.trace", stage = "chunk_recv", welcome_id = %welcome_id, seq = sequence);
 
-    let ack = WelcomeBlobMessage::ChunkAck {
-        welcome_id: welcome_id.clone(),
-        sequence,
+    ack_welcome_chunk(state, sender, &welcome_id, sequence);
+    // #2202: every byte is here, so the content hash decides now. The
+    // owner sends `Complete` only after it has our acks, which can lag far
+    // behind the chunks; a later `Complete` finds no receive and is ignored.
+    if all_present {
+        finish_welcome_receive(state, &welcome_id).await;
+    }
+}
+
+/// The number of Welcome `ChunkAck` sends that may run at once off the
+/// Welcome listener (#2202).
+pub(in crate::server) const WELCOME_ACK_SEND_PERMITS: usize = 32;
+
+/// #2202: send a `ChunkAck` off the Welcome listener. The listener is one
+/// loop for every Welcome frame, and an ack send can wait 24 s for its
+/// receipt; awaited inline, one slow ack held every chunk queued behind it.
+/// The owner records the highest sequence acked, so acks may land out of
+/// order. With every permit busy the ack is dropped: a later chunk's ack
+/// covers it, and the joiner completes from the chunks it holds.
+fn ack_welcome_chunk(state: &Arc<AppState>, sender: &AgentId, welcome_id: &str, sequence: u64) {
+    let Ok(permit) = Arc::clone(&state.welcome_ack_sends).try_acquire_owned() else {
+        tracing::warn!(target: "welcome.trace", stage = "chunk_ack_dropped_busy", welcome_id = %welcome_id, seq = sequence);
+        return;
     };
-    match send_welcome_blob_message(state, sender, &ack).await {
-        Ok(_) => {
-            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
+    let task_state = Arc::clone(state);
+    let recipient = *sender;
+    let welcome_id = welcome_id.to_string();
+    let task = async move {
+        let _permit = permit;
+        #[cfg(test)]
+        welcome_ack_test_gate::wait(&welcome_id).await;
+        let ack = WelcomeBlobMessage::ChunkAck {
+            welcome_id: welcome_id.clone(),
+            sequence,
+        };
+        match send_welcome_blob_message(&task_state, &recipient, &ack).await {
+            Ok(_) => {
+                tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
+            }
+            Err(e) => {
+                tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "failed to ack Welcome blob chunk: {e}");
+            }
         }
-        Err(e) => {
-            tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "failed to ack Welcome blob chunk: {e}");
+    };
+    state.spawn_detached(task);
+}
+
+/// #2202 tests: hold the `ChunkAck` sends of one Welcome until released,
+/// as a slow receipt does.
+#[cfg(test)]
+pub(in crate::server) mod welcome_ack_test_gate {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    static GATES: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Hold every later ack send of `welcome_id`; returns the release.
+    pub(in crate::server) fn hold(welcome_id: &str) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert(welcome_id.to_string(), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(super) async fn wait(welcome_id: &str) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(welcome_id).cloned());
+        if let Some(gate) = gate {
+            let _ = gate.acquire().await;
         }
     }
 }
@@ -56116,6 +56199,12 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
             return;
         }
     }
+    finish_welcome_receive(state, welcome_id).await;
+}
+
+/// Ends one Welcome receive: checks every chunk, the length and the content
+/// hash, and wakes the fetch with the bytes or the error.
+async fn finish_welcome_receive(state: &Arc<AppState>, welcome_id: &str) {
     let receive = state
         .pending_welcome_receives
         .write()
@@ -56553,6 +56642,7 @@ pub(in crate::server) mod tests {
     mod issue1840_sequence;
     mod issue2004_expired_catchup;
     mod issue2135_removal_commit_binding;
+    mod issue2202_welcome_listener;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue646_base_roster_fetch;
@@ -57380,6 +57470,9 @@ pub(in crate::server) mod tests {
             shutdown_started: tokio_util::sync::CancellationToken::new(),
             join_artifact_egress: StdMutex::new(HashMap::new()),
             join_artifact_egress_owners: StdMutex::new(Vec::new()),
+            welcome_ack_sends: Arc::new(tokio::sync::Semaphore::new(
+                crate::server::routes::named_groups::WELCOME_ACK_SEND_PERMITS,
+            )),
             welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
