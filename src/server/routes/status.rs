@@ -392,6 +392,9 @@ pub(in crate::server) struct StatusData {
     egress_budget_warning: Option<x0x::gossip::EgressBudgetWarning>,
     /// Effective GUI session idle timeout (`gui_idle_timeout_minutes`).
     gui_idle_timeout_secs: u64,
+    /// #1172: the allocator this build runs with and, for jemalloc, its
+    /// effective options. Additive field.
+    allocator: x0x::allocator::AllocatorInfo,
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +670,7 @@ pub(in crate::server) async fn status(
             warnings,
             bandwidth,
             egress_budget_warning,
+            allocator: x0x::allocator::allocator_info(),
         },
     })
 }
@@ -899,6 +903,7 @@ mod tests {
             bandwidth: usage,
             egress_budget_warning: None,
             gui_idle_timeout_secs: 3600,
+            allocator: x0x::allocator::allocator_info(),
         };
         let json =
             serde_json::to_value(&super::ApiResponse { ok: true, data }).expect("serializes");
@@ -921,6 +926,10 @@ mod tests {
             );
         }
         assert_eq!(json["gui_idle_timeout_secs"], 3600);
+        assert!(
+            json["allocator"]["name"].is_string(),
+            "#1172: status names the allocator"
+        );
         assert!(
             json["egress_budget_warning"].is_null(),
             "#1964: the warning field is always present, null when clear"

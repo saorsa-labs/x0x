@@ -258,7 +258,7 @@ daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/health` | `x0x health` | Health probe with the M1 structured verdict (#1380); the node-specific detail is gated to loopback/authenticated callers (see the privacy boundary below) |
-| GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings, `gui_idle_timeout_secs` (effective GUI session idle timeout) |
+| GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings, `gui_idle_timeout_secs` (effective GUI session idle timeout), `allocator` (#1172) |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/report` | `x0x report [--deliver-to <agent_id>]` | Authenticated (durable owner only). Builds a redacted problem-report bundle and stores it as `<data_dir>/reports/x0x-report-<unix-secs>.json` (mode 0600, directory 0700). Without `deliver_to` nothing is sent. One report per minute per daemon (`429` with `retry_after_secs`); the newest 10 bundles are kept and older ones deleted. `201` body: `path`, `file_name`, `schema`, `created_unix`, `size_bytes`, `log_lines`, `log_lines_dropped_for_size`, `older_reports_deleted`, `sent: false`, `delivery` (#1354 slices 2 and 3; see below). Optional JSON body `{"deliver_to": "<agent_id hex>"}` (CLI `--deliver-to`) also queues a sent copy to that owner device; `delivery` is then `{outcome: "queued", agent_id, logical_id, request_id, deliver_until_ms, size_bytes}`, else `null` |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6). Response: `session_token`, `expires_in`, `idle_timeout_secs`; a mint counts as user activity |
@@ -546,9 +546,17 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 #     "down_bps":       { "total": 0.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0 },
 #     "window_secs": 60.0
 #   },
-#   "egress_budget_warning": null
+#   "egress_budget_warning": null,
+#   "allocator": { "name": "system", "jemalloc": null }
 # }
 ```
+
+`allocator` (#1172) names the allocator this `x0xd` build runs with:
+`"jemalloc"` for a build with `--features jemalloc`, otherwise `"system"`.
+Release builds do not enable jemalloc yet. For jemalloc, `jemalloc` holds
+the options read back from jemalloc at run time (`background_thread`,
+`dirty_decay_ms`, `muzzy_decay_ms`); it is `null` for the system allocator.
+The values are read once and cached, because jemalloc fixes them at start.
 
 `bandwidth` shows the transport bytes of this process. `sent_bytes` and
 `received_bytes` are totals since start; a read does not clear them.

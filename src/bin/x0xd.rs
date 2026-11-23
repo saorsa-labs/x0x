@@ -31,19 +31,18 @@ mod log_flush;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-// jemalloc as the daemon's global allocator. Eliminates the 50 MB+
-// heap-to-RSS amplification observed under glibc malloc, where retired
-// arenas held pages indefinitely. dirty_decay_ms / muzzy_decay_ms are
-// configured via MALLOC_CONF below for aggressive page return.
+// jemalloc as the daemon's global allocator, only in builds with
+// `--features jemalloc`. Release builds do not enable that feature yet, so
+// released x0xd uses the system allocator (#1172). Under glibc malloc,
+// arenas keep freed pages; jemalloc returns them. The options in
+// `x0x::allocator::JEMALLOC_CONF` reach jemalloc through the prefixed
+// `_rjem_malloc_conf` symbol that `export_jemalloc_conf!` defines here.
 #[cfg(all(feature = "jemalloc", not(feature = "profile-heap")))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(all(feature = "jemalloc", not(feature = "profile-heap")))]
-#[allow(non_upper_case_globals)]
-#[export_name = "malloc_conf"]
-pub static MALLOC_CONF: &[u8] =
-    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true\0";
+x0x::export_jemalloc_conf!();
 
 use x0x::server::{DaemonConfig, InstanceName, ServeOptions};
 

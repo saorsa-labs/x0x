@@ -108,8 +108,8 @@ dhat = { version = "0.3", optional = true }
 serde_ignored = "0.1"
 # jemalloc for the daemon binary — glibc malloc holds pages after free,
 # producing the 50 MB+ heap-to-RSS amplification observed during the
-# 2026-04-25 soak. tikv-jemallocator is the maintained fork. We configure
-# aggressive purge via MALLOC_CONF in the binary entry point.
+# 2026-04-25 soak. tikv-jemallocator is the maintained fork. The purge
+# options are in src/allocator.rs (exported as `_rjem_malloc_conf`, #1172).
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
@@ -134,8 +134,8 @@ optional = true
 upgrade-test-signing = ["dep:fips204"]
 # jemalloc with aggressive purge — eliminates the 50 MB heap-to-RSS
 # amplification glibc was producing. Opt-in (not default) so library
-# consumers aren't forced into a particular allocator. The daemon binary
-# enables this in its own production builds.
+# consumers aren't forced into a particular allocator. Release builds of
+# x0xd do not enable it yet (#1172).
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Enable dhat heap profiling in x0xd. Outputs dhat-heap.json at exit.
 # Build: cargo build --bin x0xd --features profile-heap
