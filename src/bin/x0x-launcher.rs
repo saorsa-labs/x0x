@@ -34,6 +34,12 @@ fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     {
         let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        if argv.len() == 1 && argv[0] == launcher::contract::CAPABILITIES_FLAG {
+            for capability in launcher::contract::capabilities() {
+                println!("{capability}");
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
         let args = match launcher::issuer::launcher_argv(&argv) {
             Ok(args) => args,
             Err(error) => {

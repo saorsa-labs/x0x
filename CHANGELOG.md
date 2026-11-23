@@ -6,6 +6,28 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Self-update replaces x0xd before x0x and fails as a pair (#2012; A14
+  amendment of 23 Nov 2026).** An apply that also replaces the sibling `x0x`
+  now swaps `x0xd` first. A sibling `x0x` that cannot be validated or locked
+  fails the apply before any file changes, and one whose swap fails makes
+  the apply restore `x0xd` and fail with no restart (before, the failure was
+  only a warning and `x0xd` was upgraded alone). The restart owner keeps both
+  install locks until the process exits, also through the HTTP apply's
+  750 ms delayed restart. A successful apply installs the same files and
+  restarts as before.
+- **Launcher enable step 3: gated producer and journal end of life (#2012).**
+  The daemon's apply path can write the host journal through SwappedCli, but
+  only behind a gate that is closed in this release (`LAUNCHER_ENABLED` is
+  false): a launcher-bound systemd unit with its drop-in in place, a plan
+  anchor naming exactly this one instance, and a launcher that answers
+  `x0x-launcher --capabilities` with `trial-v1`. The gate's last decision is
+  in `GET /diagnostics/upgrade` (`launcher_gate`). Idle and Superseded
+  journals no longer refuse an apply; the dormant launcher's retire writes
+  Idle, and a start that finds a swap interrupted before SwappedCli restores
+  the previous files and writes Superseded. The installer now also takes the
+  data root's stage lock. `/health` (`inputs.upgrade.journal`) and
+  `x0x doctor` show a failed launcher-protected attempt.
+
 - **Launcher enable step 2: data-root stage lock, installer plan anchor and
   a signed launcher asset (#2012; A14 amendment of 22 Nov 2026).** The
   prepare producer holds a lock on the data root

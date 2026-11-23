@@ -36,6 +36,8 @@ pub(crate) mod prepare;
 pub(crate) mod prepare_live;
 pub(crate) mod probe;
 pub(crate) mod probe_retry;
+#[cfg(unix)]
+pub mod producer;
 pub mod restart;
 pub mod rollout;
 #[cfg_attr(not(unix), allow(dead_code))]

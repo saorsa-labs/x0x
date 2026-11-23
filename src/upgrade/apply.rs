@@ -82,8 +82,74 @@ type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + 
 
 /// Restart continuation, handed the `(target, fresh backup)` pairs this
 /// transaction actually swapped so a failed flush restores exactly those —
-/// the daemon/CLI pair together or not at all.
-type RestartContinuation = Box<dyn FnOnce(&[(PathBuf, PathBuf)]) + Send>;
+/// the daemon/CLI pair together or not at all — and the install locks the
+/// worker took. The owner keeps the locks until the process exits, or until
+/// it returns after a refusal, so no other apply or start reads the install
+/// between the swap and the restart (#2012).
+type RestartContinuation = Box<dyn FnOnce(&[(PathBuf, PathBuf)], HeldInstallLocks) + Send>;
+
+/// The install locks an apply worker holds: the companion CLI's (when a
+/// companion is replaced) and the daemon's. They are released when this
+/// value is dropped.
+pub(crate) struct HeldInstallLocks {
+    inner: HeldInner,
+}
+
+enum HeldInner {
+    Files {
+        _cli: Option<std::fs::File>,
+        _daemon: std::fs::File,
+    },
+    /// The producer's host lock and the journal it wrote (SwappedCli), so
+    /// a restart that is refused can settle the journal after it restored
+    /// the binaries (#2012).
+    #[cfg(unix)]
+    Producer {
+        lock: super::prepare::HostLock,
+        prepared: Box<super::prepare::Prepared>,
+    },
+}
+
+impl HeldInstallLocks {
+    fn files(cli: Option<std::fs::File>, daemon: std::fs::File) -> Self {
+        Self {
+            inner: HeldInner::Files {
+                _cli: cli,
+                _daemon: daemon,
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn producer(
+        lock: super::prepare::HostLock,
+        prepared: super::prepare::Prepared,
+    ) -> Self {
+        Self {
+            inner: HeldInner::Producer {
+                lock,
+                prepared: Box::new(prepared),
+            },
+        }
+    }
+
+    /// The restart owner restored every binary this apply swapped: settle
+    /// the producer's journal (Superseded). Nothing to do on the
+    /// unprotected path. The outcome is logged as it is.
+    pub(crate) fn binaries_restored(&mut self) {
+        #[cfg(unix)]
+        if let HeldInner::Producer { lock, prepared } = &mut self.inner {
+            match prepared.abandon(lock, [true, true]) {
+                Ok(()) => info!("the host journal is superseded after the restore"),
+                Err(error) => error!(
+                    %error,
+                    "the binaries are restored but the host journal could not be superseded; \
+                     applies stay refused until it is settled"
+                ),
+            }
+        }
+    }
+}
 
 #[cfg(unix)]
 async fn inspect_probe_admission(
@@ -212,15 +278,19 @@ fn arm_http_deferred_restart_owner(
     version: String,
     flush_reservation: Option<super::shutdown_flush::Reservation>,
 ) -> Result<RestartContinuation, std::io::Error> {
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<Vec<(PathBuf, PathBuf)>>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<(Vec<(PathBuf, PathBuf)>, HeldInstallLocks)>();
     #[cfg(test)]
     let test_restart = http_deferred_restart_seam::capture(&restart_plan.executable);
     spawn_http_deferred_restart_thread(move || match go_rx.recv() {
-        Ok(swapped) => {
+        // The install locks stay held through the delay and the restart:
+        // the process exits with them, or a refusal drops them when this
+        // thread ends (#2012).
+        Ok((swapped, locks)) => {
             std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
             #[cfg(test)]
             if let Some(restart) = test_restart {
                 restart(&restart_plan, &version);
+                drop(locks);
                 return;
             }
             let owner = AutoApplyUpgrader::new(&binary_name)
@@ -228,6 +298,7 @@ fn arm_http_deferred_restart_owner(
                 .with_restart_context(restart_context)
                 .with_flush_reservation(flush_reservation)
                 .with_swapped_artifacts(swapped)
+                .with_held_locks(locks)
                 .with_restart_on_success(false);
             if let Err(e) = owner.trigger_restart(&restart_plan, &version) {
                 // Refusal before any flush started (engineer ruling, 24 Oct
@@ -248,8 +319,8 @@ fn arm_http_deferred_restart_owner(
             // Pre-admission cancel / apply failure: sender dropped; no restart.
         }
     })?;
-    Ok(Box::new(move |swapped: &[(PathBuf, PathBuf)]| {
-        if go_tx.send(swapped.to_vec()).is_err() {
+    Ok(Box::new(move |swapped: &[(PathBuf, PathBuf)], locks| {
+        if go_tx.send((swapped.to_vec(), locks)).is_err() {
             warn!(
                 installed_bytes = true,
                 restart = "not_started",
@@ -680,9 +751,147 @@ impl Drop for UnusedFlushReservation {
     }
 }
 
+/// What the pair swap left: success with the swapped artifacts and the
+/// locks the restart owner keeps, or a daemon replace that rolled itself
+/// back (nothing swapped).
+pub(crate) enum Swapped {
+    Done {
+        result: UpgradeResult,
+        swapped: Vec<(PathBuf, PathBuf)>,
+        locks: HeldInstallLocks,
+    },
+    RolledBack(UpgradeResult),
+}
+
+/// The unprotected pair swap, with every lock already held: the daemon
+/// first, then the companion CLI (#2012), the order the host journal
+/// records. A companion swap that fails restores the daemon this call
+/// swapped and fails the apply, so the pair never ends mixed by this
+/// transaction. When the daemon cannot be restored the error says so and
+/// names the manual recovery.
+fn swap_pair(
+    upgrader: &Upgrader,
+    extracted_path: &Path,
+    target_version: &semver::Version,
+    companion: Option<(Upgrader, PathBuf)>,
+    companion_lock: Option<super::install_lock::InstallLock>,
+    daemon_lock: super::install_lock::InstallLock,
+) -> Result<Swapped, UpgradeError> {
+    #[cfg(test)]
+    order_tests::record_swap(upgrader.target_path());
+    let (result, daemon_backup) =
+        upgrader.finish_upgrade_under_host_lock(extracted_path, target_version)?;
+    if !matches!(result, UpgradeResult::Success { .. }) {
+        return Ok(Swapped::RolledBack(result));
+    }
+    let mut swapped = Vec::new();
+    if let Some(backup) = daemon_backup {
+        swapped.push((upgrader.target_path().to_path_buf(), backup));
+    }
+    if let Some((x0x_upgrader, extracted_x0x)) = companion {
+        #[cfg(test)]
+        order_tests::record_swap(x0x_upgrader.target_path());
+        let failure =
+            match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, target_version) {
+                Ok((UpgradeResult::Success { .. }, Some(backup))) => {
+                    info!("x0x companion upgraded successfully");
+                    swapped.push((x0x_upgrader.target_path().to_path_buf(), backup));
+                    None
+                }
+                Ok((UpgradeResult::Success { .. }, None)) => {
+                    info!("x0x companion already matches the incoming bytes; no swap");
+                    None
+                }
+                Ok((UpgradeResult::RolledBack { reason }, _)) => Some(reason),
+                Ok((UpgradeResult::NoUpgrade, _)) => Some("no upgrade".to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+        if let Some(reason) = failure {
+            return Err(restore_after_companion_failure(&swapped, &reason));
+        }
+    }
+    Ok(Swapped::Done {
+        result,
+        swapped,
+        locks: HeldInstallLocks::files(
+            companion_lock.map(super::install_lock::InstallLock::into_file),
+            daemon_lock.into_file(),
+        ),
+    })
+}
+
+/// Restore what this transaction swapped (the daemon) after the companion
+/// swap failed, and build the apply's error. Every outcome is logged as it
+/// is: restored, nothing to restore, or a restore that failed.
+fn restore_after_companion_failure(swapped: &[(PathBuf, PathBuf)], reason: &str) -> UpgradeError {
+    if swapped.is_empty() {
+        error!(
+            reason,
+            "x0x companion swap failed; the daemon was not swapped by this apply"
+        );
+        return UpgradeError::Other(format!(
+            "x0x companion swap failed ({reason}); nothing was replaced"
+        ));
+    }
+    match super::restore_swapped_binaries(swapped) {
+        Ok(()) => {
+            warn!(
+                reason,
+                "x0x companion swap failed; restored the daemon binary this apply swapped"
+            );
+            UpgradeError::Other(format!(
+                "x0x companion swap failed ({reason}); the daemon binary was restored"
+            ))
+        }
+        Err(restore) => {
+            error!(
+                reason,
+                restore_error = %restore,
+                "x0x companion swap failed and the daemon binary cannot be restored; \
+                 the installed pair is mixed and needs manual recovery"
+            );
+            UpgradeError::Other(format!(
+                "x0x companion swap failed ({reason}) and the daemon binary cannot be \
+                 restored ({restore}); the installed pair is mixed and needs manual recovery"
+            ))
+        }
+    }
+}
+
 // Keep the existing replacement inputs together with its admission custody.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn apply_replacements_with_permit(
+    upgrader: Upgrader,
+    extracted_path: PathBuf,
+    target_version: semver::Version,
+    companion: Option<(Upgrader, PathBuf)>,
+    temp_guard: TempDirGuard,
+    on_success: Option<RestartContinuation>,
+    probe_admission: Option<ProbeAdmission>,
+    permit: Option<&ReleasePermit>,
+    flush_reservation: Option<super::shutdown_flush::Reservation>,
+) -> Result<UpgradeResult, UpgradeError> {
+    apply_replacements_with_producer(
+        upgrader,
+        extracted_path,
+        target_version,
+        companion,
+        temp_guard,
+        on_success,
+        probe_admission,
+        permit,
+        flush_reservation,
+        #[cfg(unix)]
+        None,
+    )
+    .await
+}
+
+/// `apply_replacements_with_permit`, with the prepare producer's
+/// transaction when its gate is open (#2012).
+#[allow(clippy::too_many_arguments)]
+async fn apply_replacements_with_producer(
     upgrader: Upgrader,
     extracted_path: PathBuf,
     target_version: semver::Version,
@@ -692,6 +901,7 @@ async fn apply_replacements_with_permit(
     probe_admission: Option<ProbeAdmission>,
     permit: Option<&ReleasePermit>,
     flush_reservation: Option<super::shutdown_flush::Reservation>,
+    #[cfg(unix)] producer: Option<super::producer::Transaction>,
 ) -> Result<UpgradeResult, UpgradeError> {
     let caller_alive = Arc::new(AtomicBool::new(true));
     let registration = permit
@@ -721,32 +931,27 @@ async fn apply_replacements_with_permit(
 
         upgrader.validate_upgrade(&target_version)?;
 
-        // Companion validate / lock / replace failures stay warn-and-skip (same
-        // as the pre-RC2 perform_upgrade match); they must not refuse the
-        // daemon replace.
-        let mut companion = companion.and_then(|(x0x_upgrader, extracted_x0x)| match x0x_upgrader
-            .validate_upgrade(&target_version)
-        {
-            Ok(()) => Some((x0x_upgrader, extracted_x0x)),
-            Err(e) => {
-                warn!("Failed to upgrade x0x companion: {e}");
-                None
-            }
-        });
+        // A present companion is part of the pair (#2012): one that fails
+        // to validate or lock fails the apply before any byte changes, and
+        // one that fails to swap restores the daemon and fails the apply.
+        if let Some((x0x_upgrader, _)) = &companion {
+            x0x_upgrader
+                .validate_upgrade(&target_version)
+                .map_err(|e| UpgradeError::Other(format!("x0x companion refused: {e}")))?;
+        }
 
-        // Take every host lock before any backup/replace. Nested perform_upgrade
-        // locks would deadlock; finish_* assumes the caller already holds them.
-        let _companion_lock = if let Some((ref x0x_upgrader, _)) = companion {
+        // Take every host lock before any backup/replace, CLI first: the
+        // order of `prepare::HostLock` and the launcher's `Host::locked`.
+        // Nested perform_upgrade locks would deadlock; finish_* assumes the
+        // caller already holds them.
+        let companion_lock = if let Some((ref x0x_upgrader, _)) = companion {
             #[cfg(test)]
             tests::acknowledge_host_lock_attempt(x0x_upgrader.target_path());
-            match super::acquire_host_upgrade_lock(x0x_upgrader.target_path()) {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    warn!("Failed to upgrade x0x companion: {e}");
-                    companion = None;
-                    None
-                }
-            }
+            Some(
+                super::acquire_install_lock(x0x_upgrader.target_path()).map_err(|e| {
+                    UpgradeError::Other(format!("x0x companion lock unavailable: {e}"))
+                })?,
+            )
         } else {
             None
         };
@@ -758,7 +963,7 @@ async fn apply_replacements_with_permit(
 
         #[cfg(test)]
         tests::acknowledge_host_lock_attempt(upgrader.target_path());
-        let _daemon_lock = super::acquire_host_upgrade_lock(upgrader.target_path())?;
+        let daemon_lock = super::acquire_install_lock(upgrader.target_path())?;
         if !worker_alive.load(Ordering::Acquire) {
             return Err(UpgradeError::Other(
                 "upgrade cancelled before host replace".to_string(),
@@ -799,61 +1004,42 @@ async fn apply_replacements_with_permit(
                 ));
             }
         }
-        // (target, fresh backup) pairs this transaction actually swapped.
-        let mut companion_swapped: Vec<(PathBuf, PathBuf)> = Vec::new();
-        if let Some((x0x_upgrader, extracted_x0x)) = companion {
-            match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, &target_version) {
-                Ok((_, Some(backup))) => {
-                    info!("x0x companion upgraded successfully");
-                    companion_swapped.push((x0x_upgrader.target_path().to_path_buf(), backup));
-                }
-                Ok((_, None)) => {
-                    info!("x0x companion already matches the incoming bytes; no swap")
-                }
-                Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
-            }
-        }
 
-        // Roll the companion back whenever the daemon replace failed or
-        // rolled itself back: a daemon/CLI pair never ends mixed (engineer
-        // ruling, 23 Oct 2026).
-        let restore_companions = |companion_swapped: &[(PathBuf, PathBuf)]| {
-            if companion_swapped.is_empty() {
-                return;
-            }
-            match super::restore_swapped_binaries(companion_swapped) {
-                Ok(()) => warn!(
-                    targets = ?companion_swapped
-                        .iter()
-                        .map(|(target, _)| target.display().to_string())
-                        .collect::<Vec<_>>(),
-                    "daemon replace failed; restored the companion binaries this transaction swapped"
-                ),
-                Err(error) => error!(
-                    %error,
-                    "cannot restore the companion binaries this transaction \
-                     swapped; manual recovery applies"
-                ),
-            }
+        #[cfg(unix)]
+        let swaps = match producer {
+            Some(producer) => producer.run(
+                companion_lock,
+                daemon_lock,
+                &upgrader,
+                &extracted_path,
+                companion,
+            )?,
+            None => swap_pair(
+                &upgrader,
+                &extracted_path,
+                &target_version,
+                companion,
+                companion_lock,
+                daemon_lock,
+            )?,
         };
-
-        let daemon_replace =
-            upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version);
-        let (result, daemon_backup) = match daemon_replace {
-            Ok(pair) => pair,
-            Err(error) => {
-                restore_companions(&companion_swapped);
-                return Err(error);
-            }
+        #[cfg(not(unix))]
+        let swaps = swap_pair(
+            &upgrader,
+            &extracted_path,
+            &target_version,
+            companion,
+            companion_lock,
+            daemon_lock,
+        )?;
+        let (result, swapped, locks) = match swaps {
+            Swapped::Done {
+                result,
+                swapped,
+                locks,
+            } => (result, swapped, locks),
+            Swapped::RolledBack(result) => return Ok(result),
         };
-        if !matches!(result, UpgradeResult::Success { .. }) {
-            restore_companions(&companion_swapped);
-            return Ok(result);
-        }
-        let mut swapped = companion_swapped;
-        if let Some(backup) = daemon_backup {
-            swapped.push((upgrader.target_path().to_path_buf(), backup));
-        }
         if let Some(cont) = on_success.take() {
             // Clean temp before a continuation that may `_exit` / `exit`
             // without running Drop (#1447 RC4 P2).
@@ -861,7 +1047,7 @@ async fn apply_replacements_with_permit(
             if let Some(admission) = &mut flush_admission {
                 admission.handed_off = true;
             }
-            cont(&swapped);
+            cont(&swapped, locks);
         }
         Ok(result)
     });
@@ -914,6 +1100,9 @@ pub struct AutoApplyUpgrader {
     /// plan's daemon pair, as before; `Some(..)` is what the apply worker
     /// recorded, and may be empty when nothing swapped.
     swapped_artifacts: Option<Vec<(PathBuf, PathBuf)>>,
+    /// The install locks the apply worker handed to this restart owner;
+    /// `None` for direct restart callers.
+    held_locks: std::sync::Mutex<Option<HeldInstallLocks>>,
 }
 
 impl AutoApplyUpgrader {
@@ -929,6 +1118,24 @@ impl AutoApplyUpgrader {
             release_permit: None,
             flush_reservation: None,
             swapped_artifacts: None,
+            held_locks: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn with_held_locks(self, locks: HeldInstallLocks) -> Self {
+        if let Ok(mut held) = self.held_locks.lock() {
+            *held = Some(locks);
+        }
+        self
+    }
+
+    /// Every swapped binary is restored: let the held locks settle what
+    /// they guard (the producer's journal).
+    fn binaries_restored(&self) {
+        if let Ok(mut held) = self.held_locks.lock() {
+            if let Some(locks) = held.as_mut() {
+                locks.binaries_restored();
+            }
         }
     }
 
@@ -1189,6 +1396,7 @@ impl AutoApplyUpgrader {
             #[cfg(unix)]
             staging: self.staging.clone(),
             release_permit: self.release_permit.clone(),
+            held_locks: std::sync::Mutex::new(None),
         }
     }
 
@@ -1650,6 +1858,32 @@ impl AutoApplyUpgrader {
         #[cfg(not(unix))]
         let probe_admission = None;
 
+        // The prepare producer runs only behind its gate (#2012): while
+        // `LAUNCHER_ENABLED` is false the gate is closed and this apply is
+        // the unprotected swap.
+        #[cfg(unix)]
+        let producer = if self.binary_name == "x0xd" {
+            let plan = restart_plan.clone();
+            let cli = companion
+                .as_ref()
+                .map(|(cli, _)| cli.target_path().to_path_buf());
+            let release = super::producer::Release {
+                previous_version: current_version.to_string(),
+                candidate_version: target_version.to_string(),
+                manifest_sha256: Sha256::digest(
+                    serde_json::to_vec(manifest).map_err(|e| UpgradeError::Other(e.to_string()))?,
+                )
+                .into(),
+            };
+            tokio::task::spawn_blocking(move || {
+                super::producer::gate_for_apply(&plan, cli.as_deref(), release)
+            })
+            .await
+            .map_err(|error| UpgradeError::Other(format!("producer gate failed: {error}")))?
+        } else {
+            None
+        };
+
         // Move temp-dir custody into the blocking task so cancel cannot delete
         // extracted binaries mid-replace. The guard cleans up when that task ends
         // (and is dropped before any non-returning restart continuation — RC4 P2).
@@ -1666,12 +1900,13 @@ impl AutoApplyUpgrader {
         let restart_context = self.restart_context.clone();
         let continuation_reservation = flush_reservation.clone();
         let on_success: Option<RestartContinuation> = if self.restart_on_success {
-            Some(Box::new(move |swapped: &[(PathBuf, PathBuf)]| {
+            Some(Box::new(move |swapped: &[(PathBuf, PathBuf)], locks| {
                 let owner = AutoApplyUpgrader::new(&binary_name)
                     .with_stop_on_upgrade(stop_on_upgrade)
                     .with_restart_context(restart_context)
                     .with_flush_reservation(continuation_reservation)
                     .with_swapped_artifacts(swapped.to_vec())
+                    .with_held_locks(locks)
                     .with_restart_on_success(false);
                 if let Err(e) = owner.trigger_restart(&restart_plan_for_cont, &version_for_cont) {
                     // Only a refusal can return here: it happened before any
@@ -1715,7 +1950,7 @@ impl AutoApplyUpgrader {
 
         self.check_release()?;
         super::monitor::validate_manifest_timestamp(manifest)?;
-        let result = apply_replacements_with_permit(
+        let result = apply_replacements_with_producer(
             upgrader,
             extracted_path,
             target_version.clone(),
@@ -1725,6 +1960,8 @@ impl AutoApplyUpgrader {
             probe_admission,
             self.release_permit.as_ref(),
             flush_reservation,
+            #[cfg(unix)]
+            producer,
         )
         .await?;
 
@@ -1841,7 +2078,10 @@ impl AutoApplyUpgrader {
                         // it; manual recovery applies.
                         let restored_bytes = match self.swapped_artifacts.as_deref() {
                             Some(swapped) => match super::restore_swapped_binaries(swapped) {
-                                Ok(()) => true,
+                                Ok(()) => {
+                                    self.binaries_restored();
+                                    true
+                                }
                                 Err(restore_error) => {
                                     error!(
                                         error = %restore_error,
@@ -1892,7 +2132,10 @@ impl AutoApplyUpgrader {
                         // update cycle.
                         let restored_bytes = match self.swapped_artifacts.as_deref() {
                             Some(swapped) => match super::restore_swapped_binaries(swapped) {
-                                Ok(()) => true,
+                                Ok(()) => {
+                                    self.binaries_restored();
+                                    true
+                                }
                                 Err(restore_error) => {
                                     error!(
                                         error = %restore_error,
@@ -2621,7 +2864,7 @@ mod tests {
         let continuation_reservation = reservation.clone();
         let called = Arc::new(AtomicBool::new(false));
         let observed = called.clone();
-        let on_success = Box::new(move |_: &[(PathBuf, PathBuf)]| {
+        let on_success = Box::new(move |_: &[(PathBuf, PathBuf)], _: HeldInstallLocks| {
             observed.store(true, Ordering::SeqCst);
             drop(continuation_reservation);
         });
@@ -2828,7 +3071,7 @@ mod tests {
                 TempDirGuard {
                     path: fixture.stage.clone(),
                 },
-                Some(Box::new(move |_| marker.store(true, Ordering::Release))),
+                Some(Box::new(move |_, _| marker.store(true, Ordering::Release))),
                 Some(Box::new(move |alive| {
                     let result = if failure == "timeout" {
                         super::super::probe::run_before_swap_with_options(
@@ -2893,7 +3136,7 @@ mod tests {
             TempDirGuard {
                 path: fixture.stage.clone(),
             },
-            Some(Box::new(move |_| {
+            Some(Box::new(move |_, _| {
                 assert_eq!(std::fs::read(primary).unwrap(), daemon_bytes);
                 assert_eq!(std::fs::read(cli).unwrap(), cli_bytes);
                 assert!(!stage.exists());
@@ -2937,7 +3180,7 @@ mod tests {
                     incoming_cli,
                 )),
                 TempDirGuard { path: stage },
-                Some(Box::new(move |_| marker.store(true, Ordering::Release))),
+                Some(Box::new(move |_, _| marker.store(true, Ordering::Release))),
                 Some(Box::new(move |alive| {
                     entered.send(()).unwrap();
                     released
@@ -4068,7 +4311,7 @@ mod tests {
         let task = tokio::spawn(async move {
             // Worker-owned continuation: same ownership site as production
             // restart_on_success (RC3). Pre-admission cancel must not run it.
-            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_, _| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             apply_replacements_offloaded(
@@ -4193,7 +4436,7 @@ mod tests {
             TempDirGuard {
                 path: scratch.clone(),
             },
-            Some(Box::new(move |_| {
+            Some(Box::new(move |_, _| {
                 std::fs::write(marker, b"restart reached").unwrap();
             })),
             None,
@@ -4266,7 +4509,7 @@ mod tests {
         let scratch_for_task = scratch.clone();
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_, _| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let replacement = apply_replacements_offloaded(
@@ -4481,7 +4724,7 @@ mod tests {
         let task = tokio::spawn(async move {
             // Worker-owned restart continuation (production restart_on_success
             // site). Survives abort of this async observer after admission.
-            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_, _| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let result = apply_replacements_offloaded(
@@ -4644,7 +4887,7 @@ mod tests {
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_, _| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let replacement = apply_replacements_offloaded(
@@ -4808,7 +5051,7 @@ mod tests {
             }
         })
         .expect("normal spawn must succeed");
-        let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
+        let on_success: Option<RestartContinuation> = Some(Box::new(move |_, _| {
             let _ = go_tx.send(());
         }));
 
@@ -4896,7 +5139,7 @@ mod tests {
         let task = tokio::spawn(async move {
             // Mirrors production HTTP deferred ownership: arm at admission on
             // an OS thread (not a cancellable Tokio task), sleep, then restart.
-            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_, _| {
                 std::thread::spawn(move || {
                     entered_worker.wait();
                     std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
@@ -4989,7 +5232,7 @@ mod tests {
         let scratch_watch = scratch.clone();
         let cleaned_before_cont = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cleaned_before_cont);
-        let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
+        let on_success: Option<RestartContinuation> = Some(Box::new(move |_, _| {
             flag.store(!scratch_watch.exists(), Ordering::SeqCst);
         }));
 
@@ -5144,6 +5387,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "apply_order_tests.rs"]
+mod order_tests;
 
 #[cfg(all(test, unix))]
 mod d194_tests {

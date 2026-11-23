@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -759,6 +760,44 @@ class InstallShTests(unittest.TestCase):
         result = self.install(launcher=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.anchor.exists())
+
+    def test_a_held_stage_lock_holds_the_anchor_and_the_drop_in(self) -> None:
+        # #2012: a producer holds its data root's stage lock from its anchor
+        # read to its Staged journal. The installer waits for it, then
+        # refuses with nothing changed. Red: no stage lock in the installer.
+        self.assert_installed(self.install())
+        before = self.anchor.read_bytes()
+        dropin_before = self.dropin.read_bytes()
+        lock = self.data_root / "upgrade-stage.lock"
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        self.env["X0X_INSTALL_LOCK_WAIT"] = "0.3"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            removal = self.install(launcher=False)
+            rerun = self.install()
+        finally:
+            os.close(fd)
+        for result in (removal, rerun):
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("staging in", result.stderr)
+        self.assertEqual(self.anchor.read_bytes(), before)
+        self.assertEqual(self.dropin.read_bytes(), dropin_before)
+        self.assert_installed(self.install())
+
+    def test_the_stage_lock_is_created_for_the_data_roots_account(self) -> None:
+        # The installer runs as root; a stage lock it creates must stay
+        # usable by the daemon's account: 0600 and owned like the data root.
+        self.assert_installed(self.install())
+        lock = self.data_root / "upgrade-stage.lock"
+        info = lock.lstat()
+        self.assertEqual(info.st_mode & 0o777, 0o600)
+        self.assertEqual(info.st_uid, self.data_root.stat().st_uid)
+        lock.unlink()
+        lock.symlink_to(self.tmp / "elsewhere")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stage lock", result.stderr)
+        self.assertFalse((self.tmp / "elsewhere").exists())
 
     def test_the_launcher_is_replaced_only_with_no_active_transaction(self) -> None:
         # ADR 0094 §5: the launcher is updated only with no active

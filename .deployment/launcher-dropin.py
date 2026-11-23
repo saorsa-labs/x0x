@@ -121,6 +121,9 @@ JOURNAL_FILE_NAME = "upgrade-journal.json"
 JOURNAL_MAX_BYTES = 1024 * 1024
 # Journal phases under which no launcher reads the anchor again.
 ANCHOR_FREE_PHASES = ("idle", "superseded")
+# The data root's stage lock (src/upgrade/prepare.rs STAGE_LOCK_NAME). A
+# producer holds it from its anchor read to its Staged journal (#2012).
+STAGE_LOCK_NAME = "upgrade-stage.lock"
 
 
 class Refused(Exception):
@@ -625,9 +628,10 @@ def check_no_journal(data_roots: set[str]) -> None:
             raise Held(
                 f"the host journal in {root} is {phase}; the launcher, its drop-in and the "
                 "plan anchor cannot change while a launcher may still read it. For an update "
-                "in progress, wait until it settles. A settled journal (host_committed or "
-                "restored) stays so after every update, also for this same install in its "
-                "steady state, since nothing writes idle yet: stop the install's units, move "
+                "in progress, wait until it settles: a committed update becomes idle once "
+                "every instance's launcher has retired its trial, and an interrupted one "
+                "becomes superseded at the next start. A restored journal stays restored: stop "
+                "the install's units, move "
                 f"{JOURNAL_FILE_NAME} and its upgrade-plan-binding.*.json files aside, run "
                 "the install again, then start the units (docs/upgrade-system.md, 'Moving a "
                 "data root to another install')"
@@ -707,6 +711,82 @@ def install_lock(anchor_dir: Path, wait: float):
         yield
     finally:
         os.close(fd)
+
+
+class StageLocks:
+    """The stage locks of data roots, held until `close` (#2012). Every
+    producer stage holds its data root's stage lock from its anchor read to
+    its Staged journal, so while the installer holds the lock of every data
+    root the anchor names, before and after its change, from its journal
+    check to its last anchor write, a stage either finished before the
+    check (and the check sees its journal) or reads the new anchor."""
+
+    def __init__(self, wait: float):
+        self.deadline = time.monotonic() + wait
+        self.fds: dict[str, int] = {}
+
+    def take(self, roots: set[str]) -> None:
+        for root in sorted(roots - self.fds.keys()):
+            fd = open_stage_lock(root)
+            if fd is None:
+                continue
+            self.fds[root] = fd
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= self.deadline:
+                        raise Held(f"an update is staging in {root}; run again when it ends")
+                    time.sleep(0.1)
+
+    def close(self) -> None:
+        for fd in self.fds.values():
+            os.close(fd)
+        self.fds.clear()
+
+
+def open_stage_lock(root: str) -> int | None:
+    """Open `<root>/upgrade-stage.lock` without following a symlink; None
+    when the data root does not exist (no stage can run there). A missing
+    lock file is created 0600 and given to the data root's owner, the
+    account the producer runs as. Anything but a regular file is refused."""
+    try:
+        info = os.stat(root)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    path = os.path.join(root, STAGE_LOCK_NAME)
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.fchown(fd, info.st_uid, info.st_gid)
+            os.fchmod(fd, 0o600)
+        except OSError:
+            os.close(fd)
+            raise
+    except FileExistsError:
+        try:
+            fd = os.open(path, flags)
+        except OSError as error:
+            raise Refused(f"cannot open the stage lock {path}: {error}")
+    except OSError as error:
+        raise Refused(f"cannot create the stage lock {path}: {error}")
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise Refused(f"{path} is not a regular file")
+    return fd
+
+
+@contextlib.contextmanager
+def stage_locks(wait: float):
+    locks = StageLocks(wait)
+    try:
+        yield locks
+    finally:
+        locks.close()
 
 
 def read_regular(path: Path, what: str) -> bytes | None:
@@ -797,11 +877,12 @@ def install(options: argparse.Namespace) -> None:
     new_launcher = read_regular(Path(options.launcher_source), "the launcher source")
     if new_launcher is None:
         raise Refused(f"launcher not found: {options.launcher_source}")
-    with install_lock(anchor_dir, lock_wait()):
+    with install_lock(anchor_dir, lock_wait()), stage_locks(lock_wait()) as staging:
         # The unit files alone: systemd still sees the earlier drop-in.
         files = file_settings(Path(options.unit), dropin)
         account = unit_account(files.user)
         early = unit_host_root(files.exec_start, options.binary, account.pw_dir, account.pw_uid, files.user)
+        staging.take(anchored_roots(anchor, daemon) | {early})
         check_no_journal(anchored_roots(anchor, daemon) | {early})
         installed = read_regular(launcher, "the installed launcher")
         previous = read_regular(dropin, "the launcher drop-in")
@@ -824,6 +905,7 @@ def install(options: argparse.Namespace) -> None:
                 settings.user,
                 str(anchor),
             )
+            staging.take(set(anchor_participants(anchor, daemon)[1].values()) | {early, root})
             check_no_journal(set(anchor_participants(anchor, daemon)[1].values()) | {early, root})
         except Held as held:
             # Back as it was: the drop-in first, then the anchor, then
@@ -878,9 +960,10 @@ def remove(options: argparse.Namespace) -> None:
     found = anchor_of(options)
     if found is not None:
         anchor, daemon, cli = found
-        with install_lock(anchor.parent, lock_wait()):
+        with install_lock(anchor.parent, lock_wait()), stage_locks(lock_wait()) as staging:
             old, new = anchor_change(anchor, daemon, cli, options.instance, None)
             if new != old:
+                staging.take(anchored_roots(anchor, daemon))
                 check_no_journal(anchored_roots(anchor, daemon))
                 write_anchor(anchor, new)
             dropin.unlink(missing_ok=True)

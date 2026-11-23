@@ -276,10 +276,12 @@ macro_rules! background_permit_regression_tests {
                     REPLACE_HOOK_INIT.call_once(|| {
                         tracing::subscriber::set_global_default(PauseAtReplacingBinary).unwrap();
                     });
-                    REPLACE_HOOKS.lock().unwrap().insert(daemon.clone(), ReplaceHook {
+                    // The daemon is swapped first (#2012): pause at the
+                    // CLI's rename, between the two.
+                    REPLACE_HOOKS.lock().unwrap().insert(cli.clone(), ReplaceHook {
                         entered: entered_tx, release: release_rx,
                     });
-                    Some(ReplaceHookGuard { target: daemon.clone() })
+                    Some(ReplaceHookGuard { target: cli.clone() })
                 } else { None };
                 let release = ReleasePause(Some(release_tx));
                 let operation = apply_replacements_with_permit(
@@ -287,7 +289,7 @@ macro_rules! background_permit_regression_tests {
                     semver::Version::new(2, 0, 0),
                     Some((Upgrader::new(cli.clone(), semver::Version::new(1, 0, 0)), incoming_cli)),
                     TempDirGuard { path: scratch.clone() },
-                    Some(Box::new(move |_| std::fs::write(continued, b"restart owned").unwrap())),
+                    Some(Box::new(move |_, _| std::fs::write(continued, b"restart owned").unwrap())),
                     None, Some(&permit), None,
                 );
                 tokio::pin!(operation);
@@ -304,20 +306,20 @@ macro_rules! background_permit_regression_tests {
                             entered = entered_rx => entered.unwrap(),
                         }
                     }).await.unwrap();
-                    // The actual CLI rename proves admission already occurred.
-                    assert_eq!(std::fs::read(&cli).unwrap(), b"new-cli");
+                    // The actual daemon rename proves admission already occurred.
+                    assert_eq!(std::fs::read(&daemon).unwrap(), b"new-daemon");
                     assert_eq!(std::fs::read(cli.with_extension("backup")).unwrap(), b"old-cli");
                     assert_eq!(std::fs::read(daemon.with_extension("backup")).unwrap(), b"old-daemon");
                     assert!(permit.admitted(),
                         "the real worker marks the permit at admission");
                 } else {
-                    assert_eq!(std::fs::read(&cli).unwrap(), b"old-cli");
+                    assert_eq!(std::fs::read(&daemon).unwrap(), b"old-daemon");
                     assert!(!cli.with_extension("backup").exists());
                     assert!(!daemon.with_extension("backup").exists());
                     assert!(!permit.admitted(),
                         "a worker still waiting on the host lock has not admitted");
                 }
-                assert_eq!(std::fs::read(&daemon).unwrap(), b"old-daemon");
+                assert_eq!(std::fs::read(&cli).unwrap(), b"old-cli");
                 assert!(!marker.exists());
                 permit.cancel();
                 drop(held.take());

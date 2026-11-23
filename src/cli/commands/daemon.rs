@@ -496,6 +496,36 @@ pub(crate) fn store_integrity_check(val: &serde_json::Value) -> DoctorCheck {
 mod store_integrity_tests {
     use super::*;
 
+    /// #2012 (#1378 done-when): `x0x doctor` names a failed
+    /// launcher-protected attempt from `/diagnostics/upgrade` `plan`; a
+    /// committed or settled journal, and a legacy handoff, are not one.
+    #[test]
+    fn the_doctor_names_a_failed_launcher_attempt() {
+        let plan = |phase: &str, cause: serde_json::Value| {
+            serde_json::json!({"plan": {
+                "record": "journal", "phase": phase, "cause": cause,
+                "candidate_version": "0.50.0",
+            }})
+        };
+        let failed = failed_attempt(&plan("restored", "failed".into())).expect("failed");
+        assert!(
+            failed.contains("0.50.0") && failed.contains("restored"),
+            "{failed}"
+        );
+        assert!(failed_attempt(&plan("recovery_failed", serde_json::Value::Null)).is_some());
+        assert!(failed_attempt(&plan("superseded", "interrupted".into())).is_some());
+        for settled in ["idle", "host_committed", "superseded", "swapped_cli"] {
+            assert!(
+                failed_attempt(&plan(settled, serde_json::Value::Null)).is_none(),
+                "{settled}"
+            );
+        }
+        assert!(
+            failed_attempt(&serde_json::json!({"plan": {"record": "legacy_handoff"}})).is_none()
+        );
+        assert!(failed_attempt(&serde_json::json!({"plan": null})).is_none());
+    }
+
     /// #1970: a group store at the image limit makes the doctor warn and
     /// name it; `ok` and `full` stores do not.
     #[test]
@@ -577,15 +607,43 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
     } else {
         format!("up to date ({current})")
     };
-    DoctorCheck::ok_with(
-        detail,
-        serde_json::json!({
-            "source": path,
-            "update_available": update_available,
-            "current_version": current,
-            "latest_version": latest,
-        }),
-    )
+    let evidence = serde_json::json!({
+        "source": path,
+        "update_available": update_available,
+        "current_version": current,
+        "latest_version": latest,
+        "launcher_gate": val.get("launcher_gate").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    if let Some(failed) = failed_attempt(&val) {
+        return DoctorCheck::warn(format!("{detail}; {failed}"), Some(evidence));
+    }
+    DoctorCheck::ok_with(detail, evidence)
+}
+
+/// A failed launcher-protected attempt in the host journal that
+/// `/diagnostics/upgrade` reports in `plan` (#2012, #1378): a recorded
+/// cause, or a restored or recovery-failed host.
+pub(crate) fn failed_attempt(diagnostics: &serde_json::Value) -> Option<String> {
+    let plan = diagnostics
+        .get("plan")
+        .filter(|plan| plan.get("record").and_then(|r| r.as_str()) == Some("journal"))?;
+    let phase = plan
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let cause = plan.get("cause").and_then(|v| v.as_str());
+    if cause.is_none() && !matches!(phase, "restored" | "recovery_failed") {
+        return None;
+    }
+    let candidate = plan
+        .get("candidate_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    Some(format!(
+        "the last launcher-protected update to {candidate} did not commit (host journal {phase}, \
+         cause {})",
+        cause.unwrap_or("none")
+    ))
 }
 
 fn write_doctor_text(report: &DoctorReport, out: &mut dyn Write) -> Result<()> {

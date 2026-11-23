@@ -58,8 +58,10 @@ macro_rules! http_custody_regression_tests {
                 REPLACE_HOOK_INIT.call_once(|| { tracing::subscriber::set_global_default(PauseAtReplacingBinary).unwrap(); });
                 let (entered_tx,entered_rx)=tokio::sync::oneshot::channel();
                 let (release_tx,release_rx)=std::sync::mpsc::channel();
-                REPLACE_HOOKS.lock().unwrap().insert(daemon.clone(),ReplaceHook { entered:entered_tx, release:release_rx });
-                let _pause=ReplaceHookGuard {target:daemon.clone()};
+                // The daemon is swapped first (#2012): pause at the CLI's
+                // rename, between the two.
+                REPLACE_HOOKS.lock().unwrap().insert(cli.clone(),ReplaceHook { entered:entered_tx, release:release_rx });
+                let _pause=ReplaceHookGuard {target:cli.clone()};
                 let wait_lock=Arc::new(tokio::sync::Mutex::new(()));
                 let mut permit=ReleasePermit::for_http(Arc::new(Arc::clone(&wait_lock).try_lock_owned().unwrap()));
                 let (worker_tx,mut worker_rx)=tokio::sync::mpsc::unbounded_channel();
@@ -89,7 +91,7 @@ macro_rules! http_custody_regression_tests {
                 let (restart_target,restart_version,scratch_present)=tokio::time::timeout(Duration::from_secs(5),restart_events.recv()).await.unwrap().unwrap();
                 drop(drain);
                 assert!(saw_entry); assert!(capacity_retained); assert!(capacity_released);
-                assert_eq!(mid_cli.unwrap(),b"new-cli"); assert_eq!(mid_daemon.unwrap(),b"old-daemon");
+                assert_eq!(mid_cli.unwrap(),b"old-cli"); assert_eq!(mid_daemon.unwrap(),b"new-daemon");
                 assert_eq!(early_restarts,0); assert_eq!(restart_target,daemon); assert_eq!(restart_version,"2.0.0");
                 assert!(!scratch_present,"scratch must be gone before external restart");
                 assert_eq!(std::fs::read(&daemon).unwrap(),b"new-daemon"); assert_eq!(std::fs::read(&cli).unwrap(),b"new-cli");

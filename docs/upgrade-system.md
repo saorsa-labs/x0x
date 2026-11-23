@@ -185,6 +185,21 @@ that daemon at a different version does not get the hint. Apply still
 replaces that sibling. `x0x --name <instance>` and `x0x --api <address>`
 select that daemon for `--check` and `--apply`.
 
+**Pair order and lock custody (#2012).** An apply that replaces the sibling
+`x0x` replaces `x0xd` first, then `x0x`: the order the host journal records
+(`SwappedDaemon`, then `SwappedCli`). A sibling `x0x` that fails to validate
+or to lock fails the apply before any file changes. A sibling `x0x` whose
+swap fails makes the apply restore the `x0xd` it swapped and fail; no restart
+is requested. If that restore also fails, the apply fails with an error that
+says the pair is mixed and needs manual recovery. In 0.49.1 and earlier a failed
+companion only logged a warning, and the daemon was upgraded alone. The
+apply worker hands both install locks (`<x0x>.upgrade.lock`,
+`<x0xd>.upgrade.lock`) to the restart owner. The immediate owner keeps them
+until the process exits. The HTTP apply's deferred owner keeps them through
+its 750 ms delay and the restart, so no second apply and no launcher start
+reads the install between the swap and the exit. A restart that is refused
+(and restores the binaries) releases them when it returns.
+
 A daemon apply that finds no sibling `x0x` records that the file is missing
 at debug level. It does not warn. `POST /upgrade/apply` and `x0x doctor` do
 not carry a companion status field. A14 plans a `cli_status` value of
@@ -398,11 +413,66 @@ SKILL remains unchanged. A later installer must enforce the applicable gate:
 host commit on protected paths, or matching candidate bytes and stable local
 health on unprotected paths under D195. It must retain the prior guide.
 
-#### Prepare producer (#2012, dormant)
+#### Prepare producer (#2012, gated and dormant)
 
 `upgrade::prepare` writes the prepared host journal
 (`<data_root>/upgrade-journal.json`) that the launcher-side issuer, the
-launcher's `Host::new` and the arm handler read. No apply path calls it yet.
+launcher's `Host::new` and the arm handler read. The daemon's apply worker
+calls it only through `upgrade::producer`, behind a gate that is closed in
+this build.
+
+**The gate.** An `x0xd` apply evaluates it after the restart plan and the
+download, and records the decision (`GET /diagnostics/upgrade`
+`launcher_gate`: `open`, `reason`, `plan_anchor`). It is open only when all
+of these hold, in this order:
+
+1. `launcher_contract::LAUNCHER_ENABLED` is true. It is false, so the gate
+   is closed on every host and no launcher is run;
+2. the restart plan is `SupervisedExit`;
+3. the systemd readback of this instance found a loaded `ExecStart` that runs
+   `x0x-launcher` in the trial form with `--plan-anchor`, whose `--host-root`
+   is this daemon's data root;
+4. systemd reports `NeedDaemonReload=no` and exactly one loaded drop-in named
+   `30-x0x-launcher.conf`, a regular file whose last `ExecStart=` is the
+   loaded command. A drop-in removed or edited by hand closes the gate even
+   while the anchor still names the unit;
+5. the plan anchor passes the launcher's checks, names this install, and
+   names exactly one participant: this instance with this data root. A host
+   whose anchor names more than one participant (`x0xd` and `x0xd-443` from
+   one install) has no protected apply yet;
+6. `x0x-launcher --capabilities` (empty environment, no input, 5 s bound)
+   exits 0 and prints `trial-v1`. The launcher prints nothing for it while it
+   is dormant, and a launcher older than the flag exits 64.
+
+A closed gate is the unprotected apply described above, unchanged. macOS has
+no gate input yet (launchd), so its gate is always closed.
+
+**The transaction.** With the gate open, the worker holds both install
+locks and has passed admission and the probes. Then it:
+
+1. writes `<x0xd>.backup` and `<x0x>.backup` durably (a synced temporary file,
+   renamed, then the directory synced);
+2. freezes the plan (one participant: this daemon, observed live; the
+   captured environment leaves out `X0X_M2_BOOT_FD` and systemd's
+   per-start variables: `INVOCATION_ID`, `JOURNAL_STREAM`, `NOTIFY_SOCKET`,
+   `LISTEN_*`, `MAINPID`, `MANAGERPID`, `SYSTEMD_EXEC_PID`, `WATCHDOG_*`,
+   `TRIGGER_*`, `MONITOR_*`);
+3. adopts the two locks as the `HostLock` and stages: the anchor is read
+   while the data root's stage lock is held, then the binding and the Staged
+   journal are written;
+4. writes Prepared;
+5. puts the daemon candidate in place (mode 0755, synced, renamed, directory
+   synced), then writes SwappedDaemon;
+6. does the same for the CLI, then writes SwappedCli;
+7. hands the host lock and the journal to the restart owner, which exits by
+   `SupervisedExit` as on the unprotected path.
+
+A failure in steps 4 to 6 restores every target it swapped from its backup
+(a copy; the backup stays), then writes `Superseded`. A restart that is
+refused before the daemon stops restores the binaries and writes
+`Superseded` too. What the launcher does after `SwappedCli` (arming the
+old daemon, the trial) is not exercised end to end yet: that is the
+lifecycle test of the enable step.
 
 - `freeze_plan` checks the plan before anything is written:
   - the daemon's and the CLI's target and backup paths exist and are
@@ -627,12 +697,13 @@ drop-in's `ExecStart`:
   be missing, which keeps the rule below. The unit file, the config and any
   `--binary` that `install.sh` wrote before the launcher step stay
   installed; the message says so.
-- **Steady state blocks the installer (open before the launcher is
-  enabled).** No production code writes an Idle or Superseded journal yet.
-  After the first update of a bound host, its journal stays HostCommitted
-  (or Restored), so every later `install.sh` run for that install, with or
-  without `--launcher`, is refused until the journal is moved aside by hand
-  (stop the install's units, move `upgrade-journal.json` and its
+- **Steady state.** A committed update's journal becomes Idle once every
+  instance's launcher has retired its trial, and an interrupted one becomes
+  Superseded at the next start (see "Journal end of life"); the installer
+  then runs again. A Restored or RecoveryFailed journal is not settled by any
+  code: every `install.sh` run for that install, with or without
+  `--launcher`, is refused until the journal is moved aside by hand (stop the
+  install's units, move `upgrade-journal.json` and its
   `upgrade-plan-binding.*.json` files aside). The refusal message says this.
 - **The anchor names a unit only while its drop-in is in place.** The unit
   leaves the anchor first, then the launcher and the drop-in are written,
@@ -692,6 +763,41 @@ the archive's bytes only, so an older validly signed launcher is accepted
 (no version binding, no rollback protection); the launcher binary has no
 build-provenance record; and the release does not run the packaged
 launcher before shipping it.
+
+#### Journal end of life (#2012)
+
+A journal is settled when it is `Idle` or `Superseded`. A settled journal
+does not refuse a later apply, opens the host-commit gate, is a passthrough
+for the launcher, and lets the installer change the launcher and its anchor.
+
+- **Idle.** The launcher's retire (under the host lock, CLI lock then daemon
+  lock) saves its trial `Committed` and, in the same locked step, writes
+  `Idle` when every participant's trial record of the transaction is
+  `Committed`. A crash before the write leaves `HostCommitted`, which the
+  next start's retire settles. A retire on a host already `Idle` for a
+  `Committed` trial is still a retire.
+- **Superseded.** The producer writes it when it gives up before the
+  hand-off. A launcher start that finds `Staged`, `Probed`, `Prepared` or
+  `SwappedDaemon` writes it too: the producer is gone, since it keeps the
+  install locks until it exits. Under the host lock, with the journal read
+  again and its binding checked against the anchor, the start restores every
+  target that holds the candidate from its backup, writes `Superseded`, and
+  exits 75 so that the next start reads the settled journal. A target that
+  holds neither release, a backup that is not the previous release, a
+  missing anchor or binding, or an unfinished trial is a typed refusal (78)
+  and nothing changes. This closes the crash between the daemon swap and the
+  SwappedDaemon record, which before left a Prepared journal over swapped
+  bytes and a passthrough to the candidate, and the crash between the CLI
+  swap and its record, which before was a refusal (78) with the daemon down.
+- `Restored` and `RecoveryFailed` are not settled by any code: the cause
+  they keep decides the hold. The installer still refuses while they are
+  there.
+
+The installer takes the stage lock of every data root the anchor names,
+before and after its change, from its journal check to its last anchor
+write, so a stage either finished before the check (and the check refuses
+on its journal) or reads the new anchor. It creates a missing lock file 0600
+for the data root's owner and refuses one that is not a regular file.
 
 #### Moving a data root to another install (#2012)
 
@@ -978,8 +1084,9 @@ has no hash or signature of its own. A trial also needs the plan anchor
 and the plan binding (see [Plan binding](#plan-binding-2012-b4-dormant)):
 without `--plan-anchor`, or with an anchor or binding that does not check,
 an in-flight journal is a typed refusal (78), never a trial. The writer of
-that journal is the M2 prepare producer (#2012), which no apply path calls
-yet, so with the engine held every start is still the passthrough. An owned start installs its SIGTERM and
+that journal is the M2 prepare producer (#2012), which the apply path calls
+only behind a gate that is closed while `LAUNCHER_ENABLED` is false, so with
+the engine held every start is still the passthrough. An owned start installs its SIGTERM and
 SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
 exits or a step can be retried (an issuer error never falls back to the
 passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed

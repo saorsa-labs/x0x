@@ -212,6 +212,8 @@ pub(in crate::server) struct VerdictSample {
     /// Local recovery-record diagnosis; represented by existing verdict reasons.
     pub upgrade_record_diagnostic: Option<String>,
     pub upgrade_failed_artifact: bool,
+    /// The host journal's phase and cause, when a journal exists (#2012).
+    pub upgrade_journal: Option<JournalReport>,
     /// Age of the refresher's cached sample when it was served, set by
     /// the handler merge in `HealthSnapshot::merged_verdict_inputs`.
     /// `None` on a bare/unsampled sample (no staleness claim). Past
@@ -251,6 +253,7 @@ impl Default for VerdictSample {
             upgrade_handoff_pending: false,
             upgrade_record_diagnostic: None,
             upgrade_failed_artifact: false,
+            upgrade_journal: None,
             sample_age_secs: None,
         }
     }
@@ -426,6 +429,7 @@ pub(in crate::server) async fn sample_verdict_inputs(
     // degrade the existing verdict without blocking configured daemon startup,
     // following recorded paths, or attempting recovery (ADR 0094 section 6).
     sample.upgrade_record_diagnostic = recovery_record_diagnostic(&state.data_dir);
+    sample.upgrade_journal = journal_report(&state.data_dir);
     sample.upgrade_failed_artifact = state
         .data_dir
         .join(crate::upgrade::restart::UPGRADE_FAILED_FILE_NAME)
@@ -452,6 +456,32 @@ fn recovery_record_diagnostic(data_dir: &Path) -> Option<String> {
         })
 }
 
+/// The host journal's phase and cause class, read only (#2012). The cause's
+/// free text is never copied: it can quote local data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(in crate::server) struct JournalReport {
+    pub(in crate::server) phase: crate::upgrade::journal::Phase,
+    pub(in crate::server) cause: Option<crate::upgrade::journal::CauseClass>,
+    /// The last launcher-protected attempt did not commit: its cause is
+    /// recorded, or the host is restored or recovery failed.
+    pub(in crate::server) failed_attempt: bool,
+}
+
+fn journal_report(data_dir: &Path) -> Option<JournalReport> {
+    use crate::upgrade::journal::{Phase, RecordRead};
+    let RecordRead::Journal(record) = crate::upgrade::journal::read_boot_records(data_dir).journal
+    else {
+        return None;
+    };
+    let cause = record.cause.as_ref().map(|cause| cause.class);
+    Some(JournalReport {
+        phase: record.phase,
+        cause,
+        failed_attempt: cause.is_some()
+            || matches!(record.phase, Phase::Restored | Phase::RecoveryFailed),
+    })
+}
+
 /// Publish the boot-time diagnosis before HTTP starts serving or refresh waits.
 /// This inspection is read-only and cannot reject configured daemon startup.
 pub(in crate::server) fn initial_health_snapshot(data_dir: &Path) -> HealthSnapshot {
@@ -465,6 +495,7 @@ pub(in crate::server) fn initial_health_snapshot(data_dir: &Path) -> HealthSnaps
             .join(crate::upgrade::restart::HANDOFF_FILE_NAME)
             .exists(),
         upgrade_record_diagnostic: diagnostic,
+        upgrade_journal: journal_report(data_dir),
         ..VerdictSample::unsampled()
     });
     snapshot
@@ -657,6 +688,7 @@ input_report! {
         checked_age_secs: Option<u64>,
         handoff_pending: bool,
         failed_artifact: bool,
+        journal: Option<JournalReport>,
     }
 }
 
@@ -922,7 +954,19 @@ pub(in crate::server) fn classify_with_detail(
     // Upgrade: read through existing accessors only. A staged handoff or
     // the loud UPGRADE_FAILED artifact is a real maintenance state. An
     // available update or a failed lookup stays `ok` (matches doctor).
-    let upgrade_state = if let Some(diagnostic) = &sample.upgrade_record_diagnostic {
+    let upgrade_state = if let Some(journal) = sample
+        .upgrade_journal
+        .as_ref()
+        .filter(|journal| journal.failed_attempt)
+    {
+        bump(InputState::Degraded);
+        reasons.push(format!(
+            "the last launcher-protected update attempt did not commit (host journal {:?}, \
+             cause {:?}); see x0x doctor",
+            journal.phase, journal.cause
+        ));
+        InputState::Degraded
+    } else if let Some(diagnostic) = &sample.upgrade_record_diagnostic {
         bump(InputState::Degraded);
         reasons.push(diagnostic.clone());
         InputState::Degraded
@@ -1031,6 +1075,7 @@ pub(in crate::server) fn classify_with_detail(
                 checked_age_secs: sample.upgrade_checked_age_secs,
                 handoff_pending: sample.upgrade_handoff_pending,
                 failed_artifact: sample.upgrade_failed_artifact,
+                journal: sample.upgrade_journal.clone(),
             },
         },
     }
@@ -1816,6 +1861,53 @@ mod tests {
             .iter()
             .any(|reason| reason.contains("restart pending")));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// #2012 (#1378 done-when): `/health` shows a failed launcher-protected
+    /// attempt from the host journal: the phase and the cause class, never
+    /// the cause text, and the upgrade input is degraded. A settled
+    /// successful journal (Idle) is shown and stays ok. Red: drop the
+    /// `failed_attempt` branch.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_attempt_in_the_host_journal_is_shown_and_degrades() {
+        use crate::upgrade::journal::Phase;
+        use crate::upgrade::prepare::tests::{input_in, prepared_in, root, settle};
+        let (_dir, data) = root();
+        prepared_in(&data, input_in(&data));
+        settle(&data, Phase::Restored);
+        let mut failed = sample();
+        failed.upgrade_journal = journal_report(&data);
+        let verdict = classify(&failed);
+        assert_eq!(verdict.inputs.upgrade.state, "degraded");
+        assert!(
+            verdict.reasons.iter().any(|r| r.contains("did not commit")),
+            "{:?}",
+            verdict.reasons
+        );
+        let json = serde_json::to_value(&verdict.inputs.upgrade).unwrap();
+        assert_eq!(json["journal"]["phase"], "restored");
+        assert_eq!(json["journal"]["cause"], "failed");
+        assert_eq!(json["journal"]["failed_attempt"], true);
+        assert!(!json.to_string().contains("fixture"), "no cause text");
+
+        settle(&data, Phase::Idle);
+        let mut path =
+            std::fs::read(data.join(crate::upgrade::journal::JOURNAL_FILE_NAME)).unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&path).unwrap();
+        record["cause"] = serde_json::Value::Null;
+        path = serde_json::to_vec(&record).unwrap();
+        let journal_path = data.join(crate::upgrade::journal::JOURNAL_FILE_NAME);
+        std::fs::remove_file(&journal_path).unwrap();
+        let record: crate::upgrade::journal::JournalRecord = serde_json::from_slice(&path).unwrap();
+        crate::upgrade::journal::write_record(&journal_path, &record).unwrap();
+        let mut settled = sample();
+        settled.upgrade_journal = journal_report(&data);
+        let verdict = classify(&settled);
+        assert_eq!(verdict.inputs.upgrade.state, "ok");
+        let json = serde_json::to_value(&verdict.inputs.upgrade).unwrap();
+        assert_eq!(json["journal"]["phase"], "idle");
+        assert_eq!(json["journal"]["failed_attempt"], false);
     }
 
     #[test]

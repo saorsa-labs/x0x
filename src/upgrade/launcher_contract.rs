@@ -21,6 +21,31 @@ use std::path::{Path, PathBuf};
 /// Basename of the stable launcher executable.
 pub const LAUNCHER_BASENAME: &str = "x0x-launcher";
 
+/// The one switch that keeps the launcher and the prepare producer dormant
+/// (#2012). The launcher's engine and the daemon's producer gate both read
+/// it, so a build either has both or neither.
+pub const LAUNCHER_ENABLED: bool = false;
+
+/// `x0x-launcher --capabilities` (the only argument) prints the
+/// capabilities of this launcher, one per line, and exits 0. It starts
+/// nothing. A launcher older than this flag exits 64 (usage), since
+/// `--capabilities` is not an absolute daemon path.
+pub const CAPABILITIES_FLAG: &str = "--capabilities";
+
+/// The capability a launcher answers when it reads the host journal and
+/// runs trials (ADR 0094 §5). The producer writes a journal only for a
+/// launcher that answers it.
+pub const TRIAL_CAPABILITY: &str = "trial-v1";
+
+/// What `--capabilities` prints: nothing while the launcher is dormant.
+pub fn capabilities() -> &'static [&'static str] {
+    if LAUNCHER_ENABLED {
+        &[TRIAL_CAPABILITY]
+    } else {
+        &[]
+    }
+}
+
 /// Where a trial-form launcher looks for its trial authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrialArgs {
