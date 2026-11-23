@@ -36,15 +36,14 @@ pub struct GlobalJemalloc;
 unsafe impl GlobalAlloc for GlobalJemalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if !JEMALLOC_SERVED.load(Ordering::Relaxed) {
-            JEMALLOC_SERVED.store(true, Ordering::Relaxed);
-        }
+        mark_jemalloc_served();
         // SAFETY: forwarded unchanged; see the impl.
         unsafe { tikv_jemallocator::Jemalloc.alloc(layout) }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        mark_jemalloc_served();
         // SAFETY: forwarded unchanged; see the impl.
         unsafe { tikv_jemallocator::Jemalloc.alloc_zeroed(layout) }
     }
@@ -59,6 +58,14 @@ unsafe impl GlobalAlloc for GlobalJemalloc {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: forwarded unchanged; see the impl.
         unsafe { tikv_jemallocator::Jemalloc.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[inline]
+fn mark_jemalloc_served() {
+    if !JEMALLOC_SERVED.load(Ordering::Relaxed) {
+        JEMALLOC_SERVED.store(true, Ordering::Relaxed);
     }
 }
 
@@ -163,7 +170,10 @@ pub struct AllocatorInfo {
 /// The process's global allocator: `"jemalloc"` when [`GlobalJemalloc`] is
 /// installed (it has served an allocation), otherwise `"system"`.
 /// jemalloc's options are fixed at initialisation, so the answer is read
-/// once and cached.
+/// once and cached. A call before the first allocation would cache
+/// `"system"` for good; `x0xd` allocates long before it serves `/status`.
+/// In a single-process `cargo test` run, `global_jemalloc_records_that_it_served`
+/// sets the flag, so a later first call there may report `"jemalloc"`.
 pub fn allocator_info() -> AllocatorInfo {
     static INFO: OnceLock<AllocatorInfo> = OnceLock::new();
     *INFO.get_or_init(|| allocator_info_for(jemalloc_is_global()))
@@ -219,17 +229,95 @@ mod tests {
         assert_eq!(info.jemalloc, Some(read_back), "{info:?}");
     }
 
+    /// The env var is read after the exported symbol, so the child's
+    /// read-back (2345) differs from `JEMALLOC_CONF` (1000).
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+    #[test]
+    fn allocator_info_reports_env_overridden_dirty_decay() {
+        const CHILD: &str = "X0X_ALLOCATOR_TEST_CHILD";
+        const NAME: &str = "allocator::tests::allocator_info_reports_env_overridden_dirty_decay";
+        if std::env::var_os(CHILD).is_some() {
+            let info = super::allocator_info_for(true);
+            let options = info.jemalloc.expect("jemalloc options");
+            assert_eq!(options.dirty_decay_ms, 2345, "{info:?}");
+            return;
+        }
+        let exe = std::env::current_exe().expect("test executable");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("_RJEM_MALLOC_CONF", "dirty_decay_ms:2345")
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+    fn thread_counters() -> (u64, u64) {
+        // SAFETY: NUL-terminated keys; jemalloc declares both as uint64_t.
+        unsafe {
+            (
+                tikv_jemalloc_ctl::raw::read::<u64>(b"thread.allocated\0").expect("allocated"),
+                tikv_jemalloc_ctl::raw::read::<u64>(b"thread.deallocated\0").expect("deallocated"),
+            )
+        }
+    }
+
+    /// Every path must reach jemalloc: jemalloc's per-thread counters move
+    /// only for its own allocations, so a forward to the system allocator
+    /// fails here (or aborts on the foreign pointer).
     #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
     #[test]
     fn global_jemalloc_records_that_it_served() {
         use std::alloc::{GlobalAlloc, Layout};
-        let layout = Layout::from_size_align(64, 8).expect("layout");
-        // SAFETY: non-zero layout; the pointer is freed with the same
-        // allocator and layout.
+        let jem = super::GlobalJemalloc;
+        let small = Layout::from_size_align(64, 8).expect("layout");
+        const BIG: usize = 64 * 1024;
+        // SAFETY: non-zero layouts; each pointer is resized and freed with
+        // the layout it currently has, through the same allocator.
         unsafe {
-            let ptr = super::GlobalJemalloc.alloc(layout);
+            let (a0, _) = thread_counters();
+            let ptr = jem.alloc(small);
             assert!(!ptr.is_null());
-            super::GlobalJemalloc.dealloc(ptr, layout);
+            let (a1, _) = thread_counters();
+            assert!(a1 > a0, "alloc did not reach jemalloc");
+            std::ptr::write_bytes(ptr, 0xAB, small.size());
+
+            let grown = jem.realloc(ptr, small, BIG);
+            assert!(!grown.is_null());
+            let (a2, _) = thread_counters();
+            assert!(a2 > a1, "growing realloc did not reach jemalloc");
+            assert_eq!(*grown.add(63), 0xAB);
+
+            let big = Layout::from_size_align(BIG, 8).expect("layout");
+            let (a3, d3) = thread_counters();
+            let shrunk = jem.realloc(grown, big, 16);
+            assert!(!shrunk.is_null());
+            let (a4, d4) = thread_counters();
+            assert!(
+                a4 > a3 || d4 > d3,
+                "shrinking realloc did not reach jemalloc"
+            );
+            assert_eq!(*shrunk.add(15), 0xAB);
+            let tiny = Layout::from_size_align(16, 8).expect("layout");
+            jem.dealloc(shrunk, tiny);
+            let (_, d5) = thread_counters();
+            assert!(d5 > d4, "dealloc did not reach jemalloc");
+
+            let (z0, _) = thread_counters();
+            let zeroed = jem.alloc_zeroed(big);
+            assert!(!zeroed.is_null());
+            let (z1, _) = thread_counters();
+            assert!(z1 > z0, "alloc_zeroed did not reach jemalloc");
+            assert!(std::slice::from_raw_parts(zeroed, BIG)
+                .iter()
+                .all(|b| *b == 0));
+            jem.dealloc(zeroed, big);
         }
         assert!(super::jemalloc_is_global());
     }
