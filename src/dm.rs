@@ -1337,7 +1337,10 @@ pub struct DmSendConfig {
     pub require_gossip: bool,
     /// If true and `require_gossip` is false, first try the legacy/raw
     /// QUIC direct-stream path when a live direct connection already exists.
-    /// If that fast path is unavailable, fall back to the normal
+    /// The check never dials (#2187); with no live connection the send goes
+    /// straight to the normal capability-aware send logic, unless
+    /// `stop_fallback_on_raw_error` is set, in which case the raw attempt
+    /// still dials. If the fast path fails, fall back to the normal
     /// capability-aware send logic. A strict send
     /// (`require_durable_app_ack`) never takes this path.
     ///

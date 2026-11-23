@@ -5447,7 +5447,11 @@ mod tests {
             let name = "x0x/dm/v1/inbox/slice1";
             let topic = TopicId::new([42; 32]);
             let mut sub = manager.subscribe_topic_id(name.into(), topic).await;
-            let expected = if full || degree == 0 || degree == 12 {
+            // Full: the #2187 ceiling of 3 is below sg's floor of 6. Leaf
+            // degree 0 (sg's stock 12) and 12 promote to sg's floor of 6.
+            let expected = if full {
+                3
+            } else if degree == 0 || degree == 12 {
                 6
             } else {
                 degree
@@ -5613,7 +5617,7 @@ mod tests {
             let sends = await_eager_settled_attempts(&manager, attempted).await;
             assert_eq!(
                 sends.len(),
-                FULL_EAGER_DEGREE_CEILING,
+                3,
                 "Full eager fan-out must equal the 3-peer Full ceiling with 12 candidates"
             );
             recorded_eager(&manager);

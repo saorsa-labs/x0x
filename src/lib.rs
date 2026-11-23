@@ -11159,9 +11159,11 @@ impl Agent {
     /// See [`dm::DmError`].
     ///
     /// Uses [`dm::DmSendConfig::default`], which since #2187 first tries the
-    /// raw-QUIC fast path when a live direct connection to the recipient
-    /// already exists (matching the `POST /direct/send` default), then falls
-    /// back to the capability-aware policy above. Call
+    /// raw-QUIC fast path, with the receive-pipeline ACK, only when a live
+    /// direct connection to the recipient already exists (matching the
+    /// `POST /direct/send` default). It never dials for that attempt; a peer
+    /// without a live connection goes straight to the capability-aware policy
+    /// above. Call
     /// [`Self::send_direct_with_config`] with `prefer_raw_quic_if_connected:
     /// false` to keep the gossip-inbox path and its application-level ACK.
     pub async fn send_direct(
@@ -12361,9 +12363,16 @@ impl Agent {
         // back to gossip at once, as before.
         // The raw-QUIC path returns a transport receipt, never an application
         // ACK, so it can never satisfy a strict send.
+        //
+        // #2187: "if connected" means a live connection now. Without this
+        // gate a NAT-only peer cost a repair, per-address dials and a dial
+        // timeout before the gossip path. A caller that makes raw terminal
+        // (`stop_fallback_on_raw_error`) still dials, and a recipient with no
+        // gossip inbox still reaches the raw fallback below, which dials.
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
             && !config.require_gossip
             && !config.require_durable_app_ack
+            && (config.stop_fallback_on_raw_error || self.has_live_direct_connection(to).await)
         {
             match self
                 .send_direct_raw_quic(
@@ -14199,6 +14208,37 @@ impl Agent {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// #2187: whether `to` has a live direct QUIC connection right now,
+    /// through the machine named by the discovery cache or by the
+    /// direct-messaging registry. It never dials, repairs or waits. It only
+    /// gates the preferred raw-QUIC attempt; the raw send still resolves and
+    /// authorizes its own target.
+    async fn has_live_direct_connection(&self, to: &identity::AgentId) -> bool {
+        let Some(network) = &self.network else {
+            // Test builds: the strict in-process stand-in owns its own
+            // target selection and connection script.
+            #[cfg(test)]
+            if pinned_standin_is_strict(&self.identity.agent_id()) {
+                return true;
+            }
+            return false;
+        };
+        let cached = self
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(to)
+            .map(|d| d.machine_id)
+            .filter(|m| m.0 != [0u8; 32]);
+        let registry = self.direct_messaging.get_machine_id(to).await;
+        for machine in [cached, registry].into_iter().flatten() {
+            if network.is_connected(&ant_quic::PeerId(machine.0)).await {
+                return true;
+            }
+        }
+        false
     }
 
     async fn send_direct_raw_quic(

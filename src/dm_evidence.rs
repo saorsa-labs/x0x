@@ -387,6 +387,34 @@ mod tests {
         );
     }
 
+    /// #2187: the default config carries the 8 s raw receive-pipeline ACK,
+    /// so each raw stage counts 2 x 8 s plus the 0.25 s grace. This pins the
+    /// default send's absolute deadline at the 4 s unknown-RTT attempt.
+    #[test]
+    fn ordinary_send_budget_of_the_default_config_counts_the_raw_ack() {
+        let config = dm::DmSendConfig::default();
+        assert_eq!(config.timeout_per_attempt, Duration::from_secs(4));
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+        // evidence 4 + refresh 3 + dial 3 + raw (2*8 + 0.25) + gossip 4
+        // + (4 + 4 backoff + 0.25 republish) + raw (2*8 + 0.25)
+        assert_eq!(
+            ordinary_send_budget(&config, None),
+            Duration::from_millis(54_750)
+        );
+        // Without the raw ACK the same config keeps the pre-#2187 deadline.
+        let no_raw_ack = dm::DmSendConfig {
+            raw_quic_receive_ack_timeout: None,
+            ..config
+        };
+        assert_eq!(
+            ordinary_send_budget(&no_raw_ack, None),
+            Duration::from_millis(38_750)
+        );
+    }
+
     /// #1239 review r1: a pathological retry schedule saturates the backoff
     /// arithmetic; the budget must stay clock-representable instead of
     /// panicking on `Instant + Duration`.
