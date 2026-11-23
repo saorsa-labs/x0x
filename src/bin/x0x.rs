@@ -2399,10 +2399,17 @@ fn main() -> ExitCode {
             }
         };
     }
-    run_cli()
+    // #1764: like x0xd (#2083), the CLI future runs on a named thread with
+    // an explicit stack, not on the platform main thread (1 MiB on Windows).
+    match x0x::server::run_cli_runtime(run_cli) {
+        Ok(code) => code,
+        Err(error) => {
+            x0x::cli::print_error(&format!("{error:#}"));
+            ExitCode::FAILURE
+        }
+    }
 }
 
-#[tokio::main]
 async fn run_cli() -> ExitCode {
     #[cfg(unix)]
     reset_sigpipe_to_default();

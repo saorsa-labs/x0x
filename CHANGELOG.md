@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Launcher enable step 2: data-root stage lock, installer plan anchor and
+  a signed launcher asset (#2012; A14 amendment of 22 Nov 2026).** The
+  prepare producer holds a lock on the data root
+  (`upgrade-stage.lock`) for every stage, so two install pairs staging in
+  one data root never interleave. The dormant launcher checks a plan
+  against its anchor before it creates any lock file at the plan's daemon
+  target, does not wait on its own lock when the plan names the daemon
+  through a symlinked directory, and reports a host journal of another
+  install with the typed reason `other-install-journal`, which `x0x doctor`
+  shows with its remedy. `.deployment/install.sh --launcher` now writes one
+  root-owned plan anchor per install (`/etc/x0x/launcher/install-<key>.anchor.json`,
+  shared by every unit of that install that it binds) and adds
+  `--plan-anchor` to the drop-in. It changes the launcher, the drop-in and
+  the anchor only when no data root of the install holds a journal other
+  than an idle or superseded one, runs one install at a time per anchor
+  directory, and never leaves the anchor naming a unit without its drop-in.
+  With no path it fetches and GPG-verifies the
+  `x0x-launcher-<platform>.tar.gz` release asset (Linux x64 and ARM64),
+  which releases carry only once the separate release workflow change
+  (#2190) lands; until then it fails closed and `--launcher PATH` is used. The fleet's `x0xd-443` units cannot be bound
+  yet, so fleet hosts have no trial. The launcher is still dormant (`ENABLED` is
+  false) and no apply path calls the producer, so no install changes
+  behaviour.
 - **Launcher journal integrity binding (#2012, design B4; A14 amendment of
   22 Nov 2026).** The launcher argv's trial form takes an optional
   `--plan-anchor <path>`, which names a root-owned file that lists the
@@ -113,6 +136,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The `x0x` CLI could crash with a stack overflow on Windows (#1764; A11
+  amendment of 22 Nov 2026).** A debug `x0x autostart` on a hosted Windows
+  runner exited with `STATUS_STACK_OVERFLOW` (0xC00000FD). The CLI ran its
+  async main on the process main thread, which has 1 MiB of stack on Windows,
+  and building the clap command tree there needs more: on a macOS arm64 debug
+  build it overflowed a 1.5 MiB thread and fit in 2 MiB, and the old debug
+  `x0x --version` aborted with the main stack limited to 1 MiB. The CLI now
+  runs on a thread named `x0x-main` with an 8 MiB stack, as `x0xd` does
+  since #2083. Release builds were not measured here; the `ci-full.yml`
+  Windows job now runs `--version`, `--help` and `autostart --help` on both
+  the debug and the release `x0x.exe`. Exit codes are unchanged, except that
+  a failure to start the CLI runtime now prints an error and exits 1 instead
+  of panicking.
 - **Package size:** the v0.49.0 crate was 12.4 MiB compressed and crates.io
   rejected it (413, 10 MiB limit). The `exclude` list now drops `tests/` (except
   the two `[[test]]` targets), `docs/`, `issues/`, `scripts/`, `.github/`,
