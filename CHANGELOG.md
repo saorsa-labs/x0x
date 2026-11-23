@@ -61,11 +61,14 @@ All notable changes to this project will be documented in this file.
   so a `--features jemalloc` build ran with jemalloc's defaults
   (`dirty_decay_ms` 10000, no background thread). They are now exported as
   `_rjem_malloc_conf`: `dirty_decay_ms:1000,muzzy_decay_ms:0`, plus
-  `background_thread:true` on Linux glibc (jemalloc has no background
-  thread on macOS or musl). `abort_conf:true` is dropped, so a bad
-  `_RJEM_MALLOC_CONF` value gives a jemalloc warning, not an abort at
-  start. `GET /status` gains an additive `allocator` object (`name`
-  `"jemalloc"` or `"system"`, and the effective jemalloc options).
+  `background_thread:true` on Linux glibc only. On macOS jemalloc has no
+  background thread (asked for one, it prints a warning and runs partly
+  initialised); tikv-jemalloc-sys marks musl as not supported, so it is
+  left off there too (untested at run time). `abort_conf:true` is
+  dropped, so a bad `_RJEM_MALLOC_CONF` value gives a jemalloc warning,
+  not an abort at start. `GET /status` gains an additive `allocator`
+  object (`name` `"jemalloc"` when the installed global allocator is
+  jemalloc, else `"system"`, and the effective jemalloc options).
   Release builds do not enable `--features jemalloc` yet, so released
   binaries are not changed by this fix.
 - **A renewed or live-announced certificate keeps a rider's roster mode

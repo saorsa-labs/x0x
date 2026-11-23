@@ -4,6 +4,8 @@
 //! `x0xd` uses jemalloc as its global allocator only when it is built with
 //! `--features jemalloc` (and without `profile-heap`). Release builds do not
 //! enable that feature yet, so released binaries use the system allocator.
+//! jemalloc is prefixed, so only Rust allocations move to it; C code in the
+//! process keeps the system `malloc`.
 //!
 //! `tikv-jemalloc-sys` builds jemalloc with the `_rjem_` symbol prefix, so
 //! jemalloc reads its compile-time options from the symbol
@@ -13,15 +15,68 @@
 
 use serde::Serialize;
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+use std::alloc::{GlobalAlloc, Layout};
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+
+static JEMALLOC_SERVED: AtomicBool = AtomicBool::new(false);
+
+/// tikv-jemallocator's allocator, which also records that it has served an
+/// allocation, so [`allocator_info`] reports the allocator the process
+/// really installed rather than the crate feature. Install it with
+/// `#[global_allocator]`.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+pub struct GlobalJemalloc;
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+// SAFETY: every method forwards to tikv_jemallocator::Jemalloc with the
+// caller's arguments, so its GlobalAlloc contract carries over.
+unsafe impl GlobalAlloc for GlobalJemalloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if !JEMALLOC_SERVED.load(Ordering::Relaxed) {
+            JEMALLOC_SERVED.store(true, Ordering::Relaxed);
+        }
+        // SAFETY: forwarded unchanged; see the impl.
+        unsafe { tikv_jemallocator::Jemalloc.alloc(layout) }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded unchanged; see the impl.
+        unsafe { tikv_jemallocator::Jemalloc.alloc_zeroed(layout) }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: forwarded unchanged; see the impl.
+        unsafe { tikv_jemallocator::Jemalloc.dealloc(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: forwarded unchanged; see the impl.
+        unsafe { tikv_jemallocator::Jemalloc.realloc(ptr, layout, new_size) }
+    }
+}
+
+/// True once [`GlobalJemalloc`] has served an allocation in this process.
+pub fn jemalloc_is_global() -> bool {
+    JEMALLOC_SERVED.load(Ordering::Relaxed)
+}
 
 /// The jemalloc options `x0xd` asks for: return dirty pages to the OS
 /// after about one second and skip the muzzy stage. On Linux glibc a
-/// background thread does the purging. jemalloc has no background-thread
-/// support on macOS or musl, and asking for it there makes jemalloc fail to
-/// initialise, so those targets leave it out and purge on the allocation
-/// path instead.
+/// background thread does the purging. Other targets leave it out and purge
+/// on the allocation path. On macOS jemalloc has no background-thread
+/// support: with `background_thread:true` it prints "option
+/// background_thread currently supports pthread only", its initialisation
+/// returns an error and the process carries on with jemalloc partly
+/// initialised (`opt.narenas` 0, one arena). On musl jemalloc itself has the
+/// support, but tikv-jemalloc-sys marks musl as not supported, so it is left
+/// off; run-time behaviour on musl is untested.
 #[cfg(all(
     feature = "jemalloc",
     not(target_env = "msvc"),
@@ -95,7 +150,7 @@ pub fn jemalloc_options() -> Result<JemallocOptions, tikv_jemalloc_ctl::Error> {
     })
 }
 
-/// The allocator `x0xd` uses in this build, reported in `GET /status`.
+/// The process's global allocator, reported in `GET /status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AllocatorInfo {
     /// `"jemalloc"` or `"system"`.
@@ -105,34 +160,28 @@ pub struct AllocatorInfo {
     pub jemalloc: Option<JemallocOptions>,
 }
 
-/// The allocator `x0xd` uses in this build. jemalloc's options are fixed
-/// at initialisation, so they are read once and cached.
+/// The process's global allocator: `"jemalloc"` when [`GlobalJemalloc`] is
+/// installed (it has served an allocation), otherwise `"system"`.
+/// jemalloc's options are fixed at initialisation, so the answer is read
+/// once and cached.
 pub fn allocator_info() -> AllocatorInfo {
     static INFO: OnceLock<AllocatorInfo> = OnceLock::new();
-    *INFO.get_or_init(|| {
-        #[cfg(all(
-            feature = "jemalloc",
-            not(feature = "profile-heap"),
-            not(target_env = "msvc")
-        ))]
-        {
-            AllocatorInfo {
-                name: "jemalloc",
-                jemalloc: jemalloc_options().ok(),
-            }
-        }
-        #[cfg(not(all(
-            feature = "jemalloc",
-            not(feature = "profile-heap"),
-            not(target_env = "msvc")
-        )))]
-        {
-            AllocatorInfo {
-                name: "system",
-                jemalloc: None,
-            }
-        }
-    })
+    *INFO.get_or_init(|| allocator_info_for(jemalloc_is_global()))
+}
+
+fn allocator_info_for(jemalloc_global: bool) -> AllocatorInfo {
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+    if jemalloc_global {
+        return AllocatorInfo {
+            name: "jemalloc",
+            jemalloc: jemalloc_options().ok(),
+        };
+    }
+    let _ = jemalloc_global;
+    AllocatorInfo {
+        name: "system",
+        jemalloc: None,
+    }
 }
 
 #[cfg(test)]
@@ -143,7 +192,11 @@ mod tests {
     /// #1172: the options in `JEMALLOC_CONF` must reach jemalloc. Before the
     /// fix the static was exported as `malloc_conf`, which the prefixed
     /// jemalloc never reads, so it ran with its defaults
-    /// (dirty_decay_ms 10000, no background thread).
+    /// (dirty_decay_ms 10000, no background thread). The muzzy assertion
+    /// catches nothing on its own: jemalloc 5.3 already defaults
+    /// muzzy_decay_ms to 0. Dropping the Linux-glibc gate on
+    /// `background_thread:true` fails this test only on a non-glibc host
+    /// (macOS); hosted Linux CI cannot see that mutation.
     #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
     #[test]
     fn jemalloc_reads_the_exported_conf() {
@@ -154,17 +207,41 @@ mod tests {
         assert_eq!(options.background_thread, expect_background, "{options:?}");
     }
 
+    /// The jemalloc branch must report the values read back from jemalloc.
+    /// It is driven directly, because the lib test binary's global
+    /// allocator is the system one.
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
     #[test]
-    fn allocator_info_names_the_build_allocator() {
-        let info = super::allocator_info();
-        let jemalloc_build = cfg!(all(
-            feature = "jemalloc",
-            not(feature = "profile-heap"),
-            not(target_env = "msvc")
-        ));
-        assert_eq!(info.name == "jemalloc", jemalloc_build, "{info:?}");
-        assert_eq!(info.jemalloc.is_some(), jemalloc_build, "{info:?}");
-        let json = serde_json::to_value(info).expect("serializes");
+    fn allocator_info_reports_read_back_jemalloc_options() {
+        let info = super::allocator_info_for(true);
+        assert_eq!(info.name, "jemalloc");
+        let read_back = super::jemalloc_options().expect("mallctl opt.* reads");
+        assert_eq!(info.jemalloc, Some(read_back), "{info:?}");
+    }
+
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+    #[test]
+    fn global_jemalloc_records_that_it_served() {
+        use std::alloc::{GlobalAlloc, Layout};
+        let layout = Layout::from_size_align(64, 8).expect("layout");
+        // SAFETY: non-zero layout; the pointer is freed with the same
+        // allocator and layout.
+        unsafe {
+            let ptr = super::GlobalJemalloc.alloc(layout);
+            assert!(!ptr.is_null());
+            super::GlobalJemalloc.dealloc(ptr, layout);
+        }
+        assert!(super::jemalloc_is_global());
+    }
+
+    #[test]
+    fn allocator_info_follows_the_installed_allocator() {
+        let system = super::allocator_info_for(false);
+        assert_eq!(system.name, "system");
+        assert_eq!(system.jemalloc, None);
+        let json = serde_json::to_value(system).expect("serializes");
         assert!(json.get("name").is_some() && json.get("jemalloc").is_some());
+        let info = super::allocator_info();
+        assert_eq!(info.name == "jemalloc", info.jemalloc.is_some(), "{info:?}");
     }
 }

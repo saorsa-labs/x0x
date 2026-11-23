@@ -392,7 +392,7 @@ pub(in crate::server) struct StatusData {
     egress_budget_warning: Option<x0x::gossip::EgressBudgetWarning>,
     /// Effective GUI session idle timeout (`gui_idle_timeout_minutes`).
     gui_idle_timeout_secs: u64,
-    /// #1172: the allocator this build runs with and, for jemalloc, its
+    /// #1172: the installed global allocator and, for jemalloc, its
     /// effective options. Additive field.
     allocator: x0x::allocator::AllocatorInfo,
 }

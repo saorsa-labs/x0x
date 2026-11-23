@@ -39,7 +39,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 // `_rjem_malloc_conf` symbol that `export_jemalloc_conf!` defines here.
 #[cfg(all(feature = "jemalloc", not(feature = "profile-heap")))]
 #[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static ALLOC: x0x::allocator::GlobalJemalloc = x0x::allocator::GlobalJemalloc;
 
 #[cfg(all(feature = "jemalloc", not(feature = "profile-heap")))]
 x0x::export_jemalloc_conf!();

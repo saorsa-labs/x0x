@@ -551,8 +551,10 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 # }
 ```
 
-`allocator` (#1172) names the allocator this `x0xd` build runs with:
-`"jemalloc"` for a build with `--features jemalloc`, otherwise `"system"`.
+`allocator` (#1172) names the process's global allocator: `"jemalloc"`
+when `x0x::allocator::GlobalJemalloc` is installed (as in an `x0xd` built
+with `--features jemalloc`), otherwise `"system"`. An embedder built with
+the feature but without that global allocator reports `"system"`.
 Release builds do not enable jemalloc yet. For jemalloc, `jemalloc` holds
 the options read back from jemalloc at run time (`background_thread`,
 `dirty_decay_ms`, `muzzy_decay_ms`); it is `null` for the system allocator.
