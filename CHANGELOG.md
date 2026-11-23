@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Release builds of `x0xd` use jemalloc on Linux and macOS (#1172).**
+  `release.yml` and the matching `build.yml` legs build `linux-x64-gnu`,
+  `linux-x64-musl`, `linux-arm64-gnu`, `macos-x64` and `macos-arm64` with
+  `--features jemalloc`, so jemalloc is the global allocator of the shipped
+  `x0xd` (the `x0x` CLI links the crate but keeps the system allocator).
+  `windows-x64` keeps the system allocator, because jemalloc does not
+  support MSVC. In the v0.49.1 local soak, glibc-malloc nodes grew +5 to
+  +12 MB/h under load and a jemalloc node +0.37 MB/h.
 - **Launcher journal integrity binding (#2012, design B4; A14 amendment of
   22 Nov 2026).** The launcher argv's trial form takes an optional
   `--plan-anchor <path>`, which names a root-owned file that lists the

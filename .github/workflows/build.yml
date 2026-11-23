@@ -103,6 +103,8 @@ jobs:
       BUILD_PLATFORM: linux-x64-gnu
       BUILD_TARGET: x86_64-unknown-linux-gnu
       BUILD_CROSS: 'false'
+      # Same features as the release.yml leg (#1172).
+      BUILD_FEATURES: jemalloc
     steps: &build-steps
       - uses: actions/checkout@v5
 
@@ -163,6 +165,7 @@ jobs:
         run: |
           set -o pipefail
           cargo build --locked --release --target ${{ env.BUILD_TARGET }} \
+            ${BUILD_FEATURES:+--features "$BUILD_FEATURES"} \
             --message-format=json-render-diagnostics \
             | tee "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}-build.jsonl"
 
@@ -172,6 +175,7 @@ jobs:
         run: |
           set -o pipefail
           cross build --locked --release --target ${{ env.BUILD_TARGET }} \
+            ${BUILD_FEATURES:+--features "$BUILD_FEATURES"} \
             --message-format=json-render-diagnostics \
             | tee "${RUNNER_TEMP}/x0x-${{ env.BUILD_PLATFORM }}-build.jsonl"
 
@@ -271,32 +275,39 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
+            features: jemalloc
 
           # Linux ARM64
           - platform: linux-arm64-gnu
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross: true
+            features: jemalloc
 
           # macOS x86_64 (cross-compiled on Apple Silicon)
           - platform: macos-x64
             os: macos-15
             target: x86_64-apple-darwin
             cross: false
+            features: jemalloc
 
           # macOS ARM64 (Apple Silicon)
           - platform: macos-arm64
             os: macos-15
             target: aarch64-apple-darwin
             cross: false
+            features: jemalloc
 
           # Windows x86_64
           - platform: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
+            # jemalloc does not support MSVC: system allocator.
+            features: ''
     env:
       BUILD_PLATFORM: ${{ matrix.platform }}
       BUILD_TARGET: ${{ matrix.target }}
       BUILD_CROSS: ${{ matrix.cross }}
+      BUILD_FEATURES: ${{ matrix.features }}
     steps: *build-steps
