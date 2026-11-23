@@ -91,6 +91,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A failed TreeKEM Welcome fetch no longer leaves a re-added member
+  broken for good (#2202; A08 and A15 amendments of 23 Nov 2026).** Before,
+  when a joiner verified its own admission commit but could not fetch the
+  Welcome over the direct path, the join attempt timed out, the joiner
+  dropped its group row (404) while the authority kept the seat `Active`,
+  and nothing asked again. Now the timeout keeps the row (`timed_out`,
+  reason `welcome_fetch_failed`), and the daemon re-arms the join with ADR
+  0107's fetch-only re-arm after a back-off (5, 15, 30, then 60 s), at most
+  6 times and only within the staged Welcome's 10-minute lifetime. The
+  retry survives a restart (`<data_dir>/welcome-retries.json`). It ends
+  when the joiner holds its keys, or as `lost` with the remedy (an admin
+  removes the agent and invites it again). A new invite for the group
+  forgets it. `GET /groups/:id/join-status` and `GET /groups/:id` show it as
+  `welcome_retry`; `/diagnostics/groups` counts `welcome_retry_rearms`,
+  `welcome_retry_seated` and `welcome_retry_lost`. The authority's serving
+  checks are unchanged. The direct-path timeouts that cause the failed
+  fetch are tracked in #2189.
+
 - **jemalloc builds of `x0xd` apply their jemalloc options (#1172; A06
   amendment of 23 Nov 2026).** The options were exported as `malloc_conf`,
   which the `_rjem_`-prefixed jemalloc of `tikv-jemalloc-sys` never reads,

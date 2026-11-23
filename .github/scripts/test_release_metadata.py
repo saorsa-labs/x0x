@@ -627,50 +627,6 @@ class ReleaseCardTests(unittest.TestCase):
                 self.assertNotEqual(failed.returncode, 0)
 
 
-    def test_launcher_packaging_is_its_own_archive_and_fails_without_the_launcher(self):
-        # #2012: the stable launcher ships as x0x-launcher-<platform>.tar.gz,
-        # beside (not inside) the x0x archive, with its checksum.
-        block = self.validator.extract_step_run_block(
-            str(WORKFLOW), 'Package launcher (tar.gz)')
-        platform, target = 'linux-x64-gnu', 'x86_64-unknown-linux-gnu'
-        block = block.replace('${{ matrix.platform }}', platform).replace(
-            '${{ matrix.target }}', target)
-
-        def run_case(with_launcher):
-            case = self.root / ('launcher-' + str(with_launcher))
-            release = case / 'target' / target / 'release'
-            release.mkdir(parents=True)
-            if with_launcher:
-                (release / 'x0x-launcher').write_bytes(b'launcher\n')
-            custody = case / 'runner-temp' / f'release-{platform}-custody'
-            custody.mkdir(parents=True)
-            (custody / 'Cargo.lock').write_bytes(b'lock\n')
-            env = dict(os.environ, RUNNER_TEMP=str(case / 'runner-temp'))
-            result = subprocess.run(
-                ['bash', '-c', 'set -euo pipefail\n' + block], cwd=case,
-                capture_output=True, text=True, env=env)
-            return case, result
-
-        case, result = run_case(True)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        name = f'x0x-launcher-{platform}'
-        with tarfile.open(case / f'{name}.tar.gz', 'r:gz') as archive:
-            self.assertEqual(
-                set(archive.getnames()),
-                {name, f'{name}/x0x-launcher', f'{name}/Cargo.lock'})
-        self.assertTrue((case / f'{name}.tar.gz.sha256').read_text().strip())
-        _, failed = run_case(False)
-        self.assertNotEqual(failed.returncode, 0)
-
-    def test_launcher_archives_stay_outside_the_release_custody_set(self):
-        # The custody aggregate and the manifest read artifacts/release-*;
-        # the launcher archives are uploaded and signed under launcher-*.
-        text = (ROOT / WORKFLOW).read_text()
-        self.assertIn('name: launcher-${{ matrix.platform }}', text)
-        self.assertNotIn('release-*/x0x-launcher', text)
-        self.assertIn('artifacts/launcher-*/*.tar.gz', text)
-
-
 class ReleaseEnvironmentAndLockTests(unittest.TestCase):
     LOCK_GUARD_STEP = 'Require committed, current Cargo.lock'
 

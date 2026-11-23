@@ -61,7 +61,7 @@
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "e23a24f40821f5401b1ac71ac1e7dfd67becbf44e62aebd41e3da309f8874195"
+      "sha256": "1a8195203e5ece6a01dd8926e69f6395ad19c0e4b8def1451f54b92696002862"
     },
     {
       "id": "A09",
@@ -110,7 +110,7 @@
       "revision": 1,
       "path": "A15-r01-compatibility-validation-and-decision-rules.md",
       "title": "Compatibility Validation and Decision Rules",
-      "sha256": "de794573f5d7ef81674feb999254d92d5e01dc29cc00da0bff857e343b3a3853"
+      "sha256": "68aa605c23705fa7f28120593267782563761310947621811521f2677f2d2f7d"
     }
   ]
 }

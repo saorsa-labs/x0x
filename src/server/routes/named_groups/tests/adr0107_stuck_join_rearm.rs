@@ -17,12 +17,12 @@ use super::*;
 
 const OWNER_SEED: [u8; 32] = [0x07; 32];
 
-fn hex_of(state: &AppState) -> String {
+pub(super) fn hex_of(state: &AppState) -> String {
     hex::encode(state.agent.agent_id().as_bytes())
 }
 
 /// One of the owner's own devices (the owner key certifies it), in-process.
-async fn device(
+pub(super) async fn device(
     dir: &std::path::Path,
     name: &str,
     kp: x0x::identity::AgentKeypair,
@@ -43,7 +43,7 @@ async fn device(
     secure_endpoint_test_state_at(&jdir, agent).await
 }
 
-fn keypair(bytes: &(Vec<u8>, Vec<u8>)) -> anyhow::Result<x0x::identity::AgentKeypair> {
+pub(super) fn keypair(bytes: &(Vec<u8>, Vec<u8>)) -> anyhow::Result<x0x::identity::AgentKeypair> {
     Ok(x0x::identity::AgentKeypair::from_bytes(&bytes.0, &bytes.1)?)
 }
 
@@ -60,7 +60,7 @@ fn owner_pin_of(authority: &AppState) -> String {
 }
 
 /// A fresh invite minted by the authority (the original sealer) for `joiner`.
-async fn mint_for(
+pub(super) async fn mint_for(
     authority: &AppState,
     group_key: &str,
     joiner: &AppState,
@@ -101,14 +101,14 @@ async fn join(
     Ok((status, body))
 }
 
-fn join_state_of(body: &serde_json::Value) -> &str {
+pub(super) fn join_state_of(body: &serde_json::Value) -> &str {
     body.get("join_state")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("<none>")
 }
 
 /// The joiner's live attempt id and its stored `MemberJoined`, if any.
-fn attempt_of(
+pub(super) fn attempt_of(
     joiner: &AppState,
     stable: &str,
 ) -> Option<(String, Option<NamedGroupMetadataEvent>)> {
@@ -125,7 +125,7 @@ fn attempt_of(
         })
 }
 
-async fn staged(
+pub(super) async fn staged(
     authority: &AppState,
     stable: &str,
     member_hex: &str,
@@ -155,7 +155,7 @@ fn revision_of(event: &NamedGroupMetadataEvent) -> Option<u64> {
 // #1166 S5: join-state PROBE (asserts the #447/#458 label), not
 // admission.
 #[allow(clippy::disallowed_methods)]
-async fn local_state(joiner: &AppState, group_key: &str) -> &'static str {
+pub(super) async fn local_state(joiner: &AppState, group_key: &str) -> &'static str {
     let info = joiner.named_groups.read().await.get(group_key).cloned();
     match info {
         Some(info) => local_join_membership_state(joiner, &info, &hex_of(joiner)).await,
@@ -163,7 +163,7 @@ async fn local_state(joiner: &AppState, group_key: &str) -> &'static str {
     }
 }
 
-async fn keyed(joiner: &AppState, group_key: &str) -> bool {
+pub(super) async fn keyed(joiner: &AppState, group_key: &str) -> bool {
     joiner.treekem_groups.read().await.contains_key(group_key)
 }
 
@@ -354,7 +354,7 @@ async fn pull_welcome_through_guarded_stream(
 /// Replace the served result's Welcome reference with the bytes the joiner
 /// pulled through the real guarded transfer (the join-result apply path's
 /// own pull uses the direct-message transport, which fails in process).
-async fn with_pulled_welcome(
+pub(super) async fn with_pulled_welcome(
     authority: &Arc<AppState>,
     joiner: &Arc<AppState>,
     stable: &str,
@@ -401,7 +401,7 @@ async fn with_pulled_welcome(
     }
 }
 
-async fn deliver(
+pub(super) async fn deliver(
     joiner: &Arc<AppState>,
     sender: &AgentId,
     result: JoinResultMessage,
@@ -412,22 +412,24 @@ async fn deliver(
 }
 
 pub(super) struct Fixture {
-    dir: std::path::PathBuf,
+    pub(super) dir: std::path::PathBuf,
     pub(super) authority: Arc<AppState>,
-    authority_id: AgentId,
+    pub(super) authority_id: AgentId,
     pub(super) group_key: String,
     pub(super) stable: String,
     /// The invite base both first invites carried (r).
-    base: u64,
+    pub(super) base: u64,
     pub(super) j1: Arc<AppState>,
-    j2: Arc<AppState>,
-    j2_kp: (Vec<u8>, Vec<u8>),
-    j1_attempt: String,
-    j2_attempt: String,
+    pub(super) j2: Arc<AppState>,
+    pub(super) j2_kp: (Vec<u8>, Vec<u8>),
+    pub(super) j1_attempt: String,
+    /// #2202: J1's agent key, to restart J1 over the same data dir.
+    pub(super) j1_kp: (Vec<u8>, Vec<u8>),
+    pub(super) j2_attempt: String,
     /// J1's sealed add at r+1, as the authority staged it.
     pub(super) j1_add: NamedGroupMetadataEvent,
     /// J2's sealed add at r+2 (Welcome by reference), as staged.
-    j2_add: NamedGroupMetadataEvent,
+    pub(super) j2_add: NamedGroupMetadataEvent,
 }
 
 /// Two Home devices join through the REAL route with two invites minted from
@@ -450,6 +452,7 @@ pub(super) async fn build(dir: &std::path::Path) -> anyhow::Result<Fixture> {
     let base = home.state_revision;
 
     let j1_kp = x0x::identity::AgentKeypair::generate()?;
+    let j1_bytes = j1_kp.to_bytes();
     let j2_kp = x0x::identity::AgentKeypair::generate()?;
     let j2_bytes = j2_kp.to_bytes();
     let j1 = device(dir, "j1", j1_kp).await?;
@@ -518,6 +521,7 @@ pub(super) async fn build(dir: &std::path::Path) -> anyhow::Result<Fixture> {
         j1,
         j2,
         j2_kp: j2_bytes,
+        j1_kp: j1_bytes,
         j1_attempt,
         j2_attempt,
         j1_add,
@@ -559,7 +563,7 @@ async fn stuck_with_carry(s: &Fixture) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn remnant_revision(joiner: &AppState, group_key: &str) -> Option<u64> {
+pub(super) async fn remnant_revision(joiner: &AppState, group_key: &str) -> Option<u64> {
     joiner
         .named_groups
         .read()
@@ -614,7 +618,7 @@ async fn seed_leftover_treekem(joiner: &AppState, group_key: &str) -> anyhow::Re
 
 /// Redeem a fresh base-seated invite from the original sealer, then return
 /// the new attempt (if one was registered) with the route's body.
-async fn redeem_fresh_invite(
+pub(super) async fn redeem_fresh_invite(
     s: &Fixture,
     joiner: &Arc<AppState>,
     minted_by: &AppState,
@@ -623,7 +627,7 @@ async fn redeem_fresh_invite(
     redeem_link(s, joiner, link).await
 }
 
-async fn redeem_link(
+pub(super) async fn redeem_link(
     s: &Fixture,
     joiner: &Arc<AppState>,
     link: String,
@@ -973,7 +977,10 @@ async fn s8a_1150_rearm_restores_the_original_seat_and_post_seal_commits_need_ca
 /// then a fresh invite (whose base no longer seats the device) clears the
 /// remnant and admits the device again through the ordinary join — served by
 /// the guarded paths, ending keyed-active.
-async fn owner_remove_and_reinvite_restores_keys(s: &Fixture, ctx: &str) -> anyhow::Result<()> {
+pub(super) async fn owner_remove_and_reinvite_restores_keys(
+    s: &Fixture,
+    ctx: &str,
+) -> anyhow::Result<()> {
     let removed = remove_named_group_member(
         State(Arc::clone(&s.authority)),
         axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),

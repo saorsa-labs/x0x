@@ -1352,6 +1352,7 @@ async fn serve_with_options_inner(
         treekem_dir,
         revocation_evictions: routes::named_groups::S4Runtime::awaiting_startup_load(),
         group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),
+        welcome_retries: Default::default(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -2512,6 +2513,11 @@ async fn serve_with_options_inner(
 
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_group_recovery_worker(Arc::clone(&state)),
+    ));
+    // #2202: re-arms a join whose verified seal's Welcome could not be
+    // fetched, and resumes such retries after a restart.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_welcome_retry_worker(Arc::clone(&state)),
     ));
 
     {

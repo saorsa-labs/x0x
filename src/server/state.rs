@@ -1404,6 +1404,9 @@ pub(super) struct AppState {
     pub(super) revocation_evictions: super::routes::named_groups::S4Runtime,
     /// ADR 0109 S3: ownerless attestation and manual re-seat runtime.
     pub(super) group_recovery: super::routes::named_groups::S3Runtime,
+    /// #2202: joiner-side retries for a verified own seal whose TreeKEM
+    /// Welcome could not be fetched.
+    pub(super) welcome_retries: super::routes::named_groups::WelcomeRetries,
     /// Active WebSocket sessions.
     pub(super) ws_sessions: RwLock<HashMap<String, WsSession>>,
     /// Shared WS topic state (single lock for channel + subscribers + forwarder per topic).

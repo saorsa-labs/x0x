@@ -22,6 +22,7 @@ pub(in crate::server) use key_republish::PendingKeyRepublish;
 mod revocation_eviction;
 pub(in crate::server) use revocation_eviction::rebind::rebind_member_certificate;
 mod seat_cert_fetch;
+mod welcome_retry;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
@@ -44,6 +45,7 @@ pub(in crate::server) use seat_cert_fetch::{
     handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
     CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
 };
+pub(in crate::server) use welcome_retry::{run_welcome_retry_worker, WelcomeRetries};
 
 #[cfg(test)]
 mod issue1229_stored_delivery;
@@ -19501,6 +19503,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                     next.stable_group_id(),
                                 )
                                 .await;
+                                // #2202: keep a typed, retryable record so
+                                // the end of this attempt does not leave the
+                                // seat keyless for good.
+                                welcome_retry::note_own_seal_unfetched(
+                                    state,
+                                    &resolved_group_key,
+                                    next.stable_group_id(),
+                                    &welcome_ref,
+                                    &e,
+                                )
+                                .await;
                                 return ApplyMetadataResult::REJECTED;
                             }
                         }
@@ -20889,6 +20902,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 group_recovery::note_welcome_unfetched(
                                     state,
                                     next.stable_group_id(),
+                                )
+                                .await;
+                                // #2202: keep a typed, retryable record so
+                                // the end of this attempt does not leave the
+                                // seat keyless for good.
+                                welcome_retry::note_own_seal_unfetched(
+                                    state,
+                                    &resolved_group_key,
+                                    next.stable_group_id(),
+                                    &welcome_ref,
+                                    &e,
                                 )
                                 .await;
                                 return ApplyMetadataResult::REJECTED;
@@ -23210,7 +23234,7 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
         None => None,
     };
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    let (pending, outcome, pending_cause) = {
+    let status = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get(id)
@@ -23278,9 +23302,19 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
         } else {
             None
         };
-        (pending, outcome, pending_cause)
+        (
+            pending,
+            outcome,
+            pending_cause,
+            resolved.map(|(stable, _)| stable),
+        )
     };
+    let (pending, outcome, pending_cause, resolved_stable) = status;
     let group_exists = state.named_groups.read().await.contains_key(id);
+    let welcome_retry_value = match resolved_stable.as_deref() {
+        Some(stable) => welcome_retry::status_json(state, stable).await,
+        None => serde_json::Value::Null,
+    };
     if !group_exists {
         // #477 O2: after a terminal finalize removed the stub, the route
         // answers 404 WITH the terminal outcome in the body; with neither
@@ -23310,6 +23344,9 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
                 "reason": o.reason,
                 "finished_at_ms": o.finished_at_ms,
             })),
+            // #2202: the key is always present; `null` unless this joiner
+            // keeps a Welcome retry for the group.
+            "welcome_retry": welcome_retry_value,
         }),
     )
 }
@@ -23387,6 +23424,8 @@ pub(in crate::server) async fn get_named_group(
     // state for the group).
     let s3_recovery = group_recovery::recovery_json(&state, &info).await;
     let own_join_request = join_request_outcome::own_join_request_json(&state, &info).await;
+    // #2202: the additive `welcome_retry` object (`null` without a record).
+    let welcome_retry = welcome_retry::status_json(&state, info.stable_group_id()).await;
 
     (
         StatusCode::OK,
@@ -23394,6 +23433,7 @@ pub(in crate::server) async fn get_named_group(
             "ok": true,
             "group_id": info.mls_group_id,
             "membership_state": membership_state,
+            "welcome_retry": welcome_retry,
             "revocation_evictions": s4_status.rows,
             "revocation_eviction_store": s4_status.store,
             "admin_availability": s4_status.admin_availability,
@@ -27318,6 +27358,65 @@ async fn rearm_sealed_unconfirmed_join(
     inviter: AgentId,
     await_treekem: bool,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // #2202: a redeemed invite starts a new join attempt (D64), so the
+    // automatic Welcome retry of the attempt that ended is forgotten.
+    welcome_retry::forget(state.as_ref(), remnant.stable_group_id()).await;
+    let chat_topic = remnant.general_chat_topic();
+    rearm_sealed_unconfirmed_join_core(
+        state,
+        membership_guard,
+        group_id_hex,
+        remnant,
+        RearmPin {
+            inviter_hex: invite.inviter.clone(),
+            inviter_public_key_b64: invite.inviter_public_key_b64.clone(),
+            invite_fingerprint: join_invite_fingerprint(invite_link),
+            inviter,
+        },
+        await_treekem,
+    )
+    .await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "already_joined": false,
+            "join_state": "pending_authority_commit",
+            "group_id": group_id_hex,
+            "group_name": invite.group_name,
+            "chat_topic": chat_topic,
+        })),
+    )
+}
+
+/// The pin a fetch-only re-arm registers: the device that sealed the
+/// original add (ADR 0107: the expected inviter), its pinned ML-DSA
+/// public key and the invite fingerprint of the attempt.
+pub(super) struct RearmPin {
+    pub(super) inviter_hex: String,
+    pub(super) inviter_public_key_b64: String,
+    pub(super) invite_fingerprint: String,
+    pub(super) inviter: AgentId,
+}
+
+/// The re-arm itself, shared by the join route (a redeemed base-seated
+/// invite) and the #2202 Welcome retry ([`welcome_retry`]). Returns the
+/// new attempt's id. The caller holds the membership guard, which is
+/// released once the attempt and its poll are installed.
+pub(super) async fn rearm_sealed_unconfirmed_join_core(
+    state: &Arc<AppState>,
+    membership_guard: tokio::sync::MutexGuard<'_, ()>,
+    group_id_hex: &str,
+    remnant: x0x::groups::GroupInfo,
+    pin: RearmPin,
+    await_treekem: bool,
+) -> String {
+    let RearmPin {
+        inviter_hex,
+        inviter_public_key_b64,
+        invite_fingerprint,
+        inviter,
+    } = pin;
     let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
     let stable = remnant.stable_group_id().to_string();
     let expected_key = join_result_key(&stable, &joiner_hex);
@@ -27342,11 +27441,7 @@ async fn rearm_sealed_unconfirmed_join(
         // The same membership → persistence critical section as a fresh
         // install, so join-status never observes a torn re-arm.
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-        record_expected_join_result_inviter(
-            state.as_ref(),
-            expected_key.clone(),
-            invite.inviter.clone(),
-        );
+        record_expected_join_result_inviter(state.as_ref(), expected_key.clone(), inviter_hex);
         // #1661: the re-armed attempt starts with fresh S3 attempt flags.
         group_recovery::begin_join_attempt(state.as_ref(), &stable).await;
         state
@@ -27363,9 +27458,9 @@ async fn rearm_sealed_unconfirmed_join(
                 PendingJoinAttempt {
                     attempt_id: attempt_id.clone(),
                     local_group_key: remnant_key.clone(),
-                    invite_fingerprint: join_invite_fingerprint(invite_link),
+                    invite_fingerprint,
                     invite_group_id: stable.clone(),
-                    inviter_public_key_b64: invite.inviter_public_key_b64.clone(),
+                    inviter_public_key_b64,
                     stored_resend: None,
                     polls: Vec::new(),
                     tasks: Vec::new(),
@@ -27409,17 +27504,7 @@ async fn rearm_sealed_unconfirmed_join(
         revision = remnant.state_revision,
         "ADR 0107: re-armed a sealed-but-unconfirmed join; re-fetching the authority's original join result"
     );
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "already_joined": false,
-            "join_state": "pending_authority_commit",
-            "group_id": group_id_hex,
-            "group_name": invite.group_name,
-            "chat_topic": remnant.general_chat_topic(),
-        })),
-    )
+    attempt_id
 }
 
 pub(in crate::server) async fn join_group_via_invite(
@@ -28582,6 +28667,9 @@ pub(super) async fn join_group_via_invite_inner(
                 // #1661: the new attempt starts with fresh S3 attempt
                 // flags on any existing recovery record.
                 group_recovery::begin_join_attempt(state.as_ref(), &stable_id_for_event).await;
+                // #2202: and the Welcome retry of the attempt that ended
+                // (a remove and re-add redeems a new invite) is forgotten.
+                welcome_retry::forget(state.as_ref(), &stable_id_for_event).await;
                 state
                     .last_join_outcomes
                     .lock()
@@ -50502,6 +50590,11 @@ pub(in crate::server) enum JoinAttemptOutcome {
 /// remove-member + re-invite.
 pub(in crate::server) const JOIN_REARM_TIMEOUT_REASON: &str = "rearm_original_result_unavailable";
 
+/// #2202: the `timed_out` reason when this joiner verified its own seal but
+/// could not fetch the TreeKEM Welcome it names. The kept stub and the
+/// Welcome retry ([`welcome_retry`]) follow it.
+pub(in crate::server) const JOIN_WELCOME_FETCH_FAILED_REASON: &str = "welcome_fetch_failed";
+
 /// ADR 0108 §8: the `timed_out` reason when the attempt reached its poll
 /// deadline without a verified `JoinPendingNotice`. With a held notice the
 /// reason is that notice's cause instead.
@@ -50786,6 +50879,13 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             stubs.contains(local_group_key)
         };
+        // #2202: this joiner's own seal was verified but its Welcome could
+        // not be fetched. The Welcome retry owns the stub, so a timeout
+        // keeps it (the retry's worker makes it durable) instead of leaving
+        // a seat on the authority's roster and no group here.
+        let retry_owns_stub = outcome == JoinAttemptOutcome::TimedOut
+            && welcome_retry::owns_stub(state, local_group_key);
+        let stub_is_pending = stub_is_pending && !retry_owns_stub;
         // #477 (r7 item 5): the stub/marker removal and the terminal
         // outcome write are ONE persistence-guarded step (the guard was
         // taken at the top of this function). A reader under the same
@@ -50816,6 +50916,11 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         let reason = match (outcome, reason) {
             (JoinAttemptOutcome::TimedOut, None) if fetch_only && !stub_is_pending => {
                 Some(JOIN_REARM_TIMEOUT_REASON)
+            }
+            // #2202: the seal arrived and was verified; only its Welcome
+            // could not be fetched. The Welcome retry re-arms the join.
+            (JoinAttemptOutcome::TimedOut, None) if retry_owns_stub => {
+                Some(JOIN_WELCOME_FETCH_FAILED_REASON)
             }
             (JoinAttemptOutcome::TimedOut, None) => {
                 Some(held_cause.unwrap_or(JOIN_NO_ADMISSION_RESULT_REASON))
@@ -55224,12 +55329,52 @@ async fn fetch_treekem_welcome_with_retries(
     group_id: &str,
     welcome_ref: &WelcomeRef,
 ) -> std::result::Result<Vec<u8>, String> {
+    #[cfg(test)]
+    if welcome_fetch_fault::take(&welcome_ref.welcome_id) {
+        return Err(welcome_fetch_fault::INJECTED.to_string());
+    }
     let send_state = Arc::clone(state);
     fetch_treekem_welcome_via(state, group_id, welcome_ref, move |source, request| {
         let state = Arc::clone(&send_state);
         async move { send_welcome_fetch_request(&state, &source, &request).await }
     })
     .await
+}
+
+/// #2202 tests: an injected direct-path fault. The next `n` own-seal
+/// Welcome fetches of one Welcome fail at once, as a fetch whose chunk
+/// acks timed out does after its whole budget. Keyed by Welcome id (a
+/// content hash), so parallel tests do not share it.
+#[cfg(test)]
+pub(in crate::server) mod welcome_fetch_fault {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    pub(in crate::server) const INJECTED: &str =
+        "timed out waiting for TreeKEM Welcome blob (injected direct-path fault)";
+
+    static FAULTS: LazyLock<Mutex<HashMap<String, u32>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Fail the next `times` fetches of `welcome_id`.
+    pub(in crate::server) fn inject(welcome_id: &str, times: u32) {
+        if let Ok(mut faults) = FAULTS.lock() {
+            faults.insert(welcome_id.to_string(), times);
+        }
+    }
+
+    pub(super) fn take(welcome_id: &str) -> bool {
+        let Ok(mut faults) = FAULTS.lock() else {
+            return false;
+        };
+        match faults.get_mut(welcome_id) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Fetch a Welcome with an injectable request sender so the receive path can
@@ -56553,6 +56698,7 @@ pub(in crate::server) mod tests {
     mod issue1840_sequence;
     mod issue2004_expired_catchup;
     mod issue2135_removal_commit_binding;
+    mod issue2202_welcome_retry;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue646_base_roster_fetch;
@@ -57440,6 +57586,7 @@ pub(in crate::server) mod tests {
             treekem_dir,
             revocation_evictions: S4Runtime::default(),
             group_recovery: S3Runtime::default(),
+            welcome_retries: Default::default(),
             ws_sessions: RwLock::new(HashMap::new()),
             ws_topics: RwLock::new(HashMap::new()),
             ws_outbound_stats: Arc::new(WsOutboundStats::default()),

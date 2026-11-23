@@ -133,6 +133,16 @@ pub struct GroupCounters {
     /// #908: offer obligations dropped after the bounded retry schedule
     /// ran out (ADR 0028 offsets).
     pub requester_offer_retry_exhausted: u64,
+    /// #2202: automatic re-arms of this joiner's own sealed join after its
+    /// TreeKEM Welcome could not be fetched.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub welcome_retry_rearms: u64,
+    /// #2202: Welcome retries that ended with this joiner seated and keyed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub welcome_retry_seated: u64,
+    /// #2202: Welcome retries that ended without keys (`lost`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub welcome_retry_lost: u64,
     /// #482: TreeKEM membership events queued awaiting state-chain
     /// catch-up/replay (the wedge class where a verified event — e.g. a
     /// second device's self-leave — could previously sit queued forever
@@ -450,6 +460,15 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.requester_offer_retry_exhausted = dst
         .requester_offer_retry_exhausted
         .saturating_add(src.requester_offer_retry_exhausted);
+    dst.welcome_retry_rearms = dst
+        .welcome_retry_rearms
+        .saturating_add(src.welcome_retry_rearms);
+    dst.welcome_retry_seated = dst
+        .welcome_retry_seated
+        .saturating_add(src.welcome_retry_seated);
+    dst.welcome_retry_lost = dst
+        .welcome_retry_lost
+        .saturating_add(src.welcome_retry_lost);
     dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (None, Some(b)) => Some(b),
@@ -978,6 +997,27 @@ impl GroupsDiagnostics {
         });
     }
 
+    /// #2202: an automatic Welcome-retry re-arm started.
+    pub fn record_welcome_retry_rearm(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.welcome_retry_rearms = c.welcome_retry_rearms.saturating_add(1);
+        });
+    }
+
+    /// #2202: a Welcome retry ended with this joiner seated and keyed.
+    pub fn record_welcome_retry_seated(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.welcome_retry_seated = c.welcome_retry_seated.saturating_add(1);
+        });
+    }
+
+    /// #2202: a Welcome retry ended without keys.
+    pub fn record_welcome_retry_lost(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.welcome_retry_lost = c.welcome_retry_lost.saturating_add(1);
+        });
+    }
+
     /// #908: an offer obligation's bounded retry schedule ran out.
     pub fn record_requester_offer_retry_exhausted(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
@@ -1385,6 +1425,9 @@ mod tests {
             requester_offer_delivered: base + 50,
             requester_offer_resolved_drop: base + 51,
             requester_offer_retry_exhausted: base + 52,
+            welcome_retry_rearms: base + 53,
+            welcome_retry_seated: base + 54,
+            welcome_retry_lost: base + 55,
             task_deltas_seal_rejected: base + 53,
         };
         let src = counters_with(1_000);
@@ -1596,6 +1639,18 @@ mod tests {
             merged.fork_quarantine_owner_anchored_refusals,
             dst.fork_quarantine_owner_anchored_refusals
                 + src.fork_quarantine_owner_anchored_refusals
+        );
+        assert_eq!(
+            merged.welcome_retry_rearms,
+            dst.welcome_retry_rearms + src.welcome_retry_rearms
+        );
+        assert_eq!(
+            merged.welcome_retry_seated,
+            dst.welcome_retry_seated + src.welcome_retry_seated
+        );
+        assert_eq!(
+            merged.welcome_retry_lost,
+            dst.welcome_retry_lost + src.welcome_retry_lost
         );
         assert_eq!(merged.members_awaiting_certificate, gauge_before);
     }
