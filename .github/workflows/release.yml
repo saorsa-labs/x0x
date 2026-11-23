@@ -614,8 +614,6 @@ jobs:
           path: launcher-artifacts
           pattern: launcher-*
 
-      # Own signing context: a launcher signature never verifies as a
-      # release-archive signature, or the other way round.
       - name: Sign launcher archives with ML-DSA-65
         run: |
           found=0
@@ -625,7 +623,7 @@ jobs:
               --key /tmp/release-signing.secret \
               --input "$archive" \
               --output "${archive}.sig" \
-              --context "x0x-launcher-v1"
+              --context "x0x-release-v1"
             echo "Signed: $archive"
             found=$((found + 1))
           done
