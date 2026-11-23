@@ -2042,6 +2042,7 @@ fn sibling_watch_matches_only_as_saved_event() {
     };
     let event = |head: &str| {
         serde_json::to_vec(&Event::MemberRemoved {
+            target_key_package_b64: None,
             group_id: "g".to_string(),
             revision: 6,
             actor: actor.to_string(),

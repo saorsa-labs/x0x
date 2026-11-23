@@ -36,6 +36,42 @@ All notable changes to this project will be documented in this file.
   data root's stage lock. `/health` (`inputs.upgrade.journal`) and
   `x0x doctor` show a failed launcher-protected attempt.
 
+- **Owner recovery removes every revoked leaf and the held creator's leaf in
+  one TreeKEM commit (`OwnerRecoveryV2`), and a seat with no leaf can be
+  removed (#2139, #2197; A09, A15 and A08 amendments of 23 Nov 2026).** A
+  TreeKEM owner recovery that excludes the creator held on its own expired
+  certificate, or removes two or more leaves, now sends a V2 frame (prefix
+  `X0XORC2`, capability bit 23 `owner_recovery_v2`). Its one commit, made by
+  saorsa-mls `remove_members`, gives none of the removed leaves the new epoch;
+  the creator stays seated with no leaf. Receivers check that the commit
+  removes exactly those leaves and read the creator's expiry at the author's
+  signed anchor. Other recoveries are V1, unchanged. An admin's removal, ban
+  or eviction of a seat that provably has no leaf is now roster-only (no
+  TreeKEM commit), so the excluded creator can be removed and invited again.
+  saorsa-mls is now 0.3.10. **Upgrade notes:** as for V1 (ADR 0110 D76), a
+  survivor whose current advert lacks bit 23 holds a needed V2 recovery
+  (`waiting_for_receiver_upgrade` with `"capability": "owner_recovery_v2"`);
+  a survivor with no current advert is not written the frame, is listed under
+  `receiver_upgrade_members`, and catches up after it upgrades. V1 is never
+  sent instead. New statuses: `recovery_commit_failed` (a commit attempt
+  failed and is retried) and, on the excluded creator's node,
+  `local_seat.state: "excluded_by_owner_recovery"`; on that node
+  `DELETE /groups/:id` drops only the local copy, and after an admin removes
+  the seat a fresh invite starts an ordinary join (the admission is the
+  existing join path, and the owner must re-certify the creator first,
+  because an owner-certified add needs a valid certificate). A named invite
+  for that agent minted before the removal is refused
+  (`remove_leafless_seat_first`); an open invite is not checked, and a join
+  on it before the removal is refused as already a member. `MemberRemoved` gains the
+  optional `target_key_package_b64` for the roster-only removal (older
+  receivers ignore it). A 0.49.x node applies
+  nothing from a V2 frame and refuses a roster-only removal of a seated
+  member; an author downgraded to 0.49.x after committing V2 can resend the
+  V2 frame to bit-7 members, which apply nothing. Limits: a creator not yet
+  expired at the anchor keeps its leaf; giving a still-seated creator its
+  leaf back after re-certification is open (#2197); the exclusion reads only
+  the committed certificate, so an announced but uncommitted renewal does not
+  stop it.
 - **Launcher enable step 2: data-root stage lock, installer plan anchor and
   a signed launcher asset (#2012; A14 amendment of 22 Nov 2026).** The
   prepare producer holds a lock on the data root

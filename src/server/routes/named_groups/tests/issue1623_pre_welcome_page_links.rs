@@ -88,6 +88,7 @@ fn removal_event(
     commit: &x0x::groups::GroupStateCommit,
 ) -> NamedGroupMetadataEvent {
     NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: info.stable_group_id().to_string(),
         revision: commit.revision,
         actor: owner_hex.to_string(),
@@ -1401,6 +1402,7 @@ async fn membership_link_behind_the_roster_clock_is_still_served() -> anyhow::Re
         commit: Some(rename.clone()),
     };
     let leave_event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: stable,
         // The roster clock lags the state chain by one.
         revision: rename.revision,
@@ -2738,6 +2740,7 @@ fn issue1427_added(target: &str) -> NamedGroupMetadataEvent {
 
 fn issue1427_removed(target: &str) -> NamedGroupMetadataEvent {
     NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: "1427".repeat(8),
         revision: 3,
         actor: agent("01"),
@@ -2921,6 +2924,7 @@ async fn restore_with_held_removal(readd: bool) -> anyhow::Result<()> {
         take_treekem_epoch(next);
     })?;
     let removed = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: before_add.stable_group_id().to_string(),
         revision: removal.revision,
         actor: owner_hex.clone(),

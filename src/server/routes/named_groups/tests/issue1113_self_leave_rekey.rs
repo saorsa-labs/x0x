@@ -123,6 +123,7 @@ async fn signed_self_leave(fixture: &LeaveFixture) -> Result<NamedGroupMetadataE
     leaving.remove_member(&member_hex, Some(member_hex.clone()));
     let commit = leaving.seal_commit(&fixture.member_kp, now_millis_u64())?;
     Ok(NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: fixture.group_id.clone(),
         revision,
         actor: member_hex.clone(),
@@ -3835,6 +3836,7 @@ async fn deliver_conflicting_self_leave_rekey(
         now_millis_u64(),
     )?;
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: fixture.group_id.clone(),
         revision,
         actor: actor_hex.to_string(),

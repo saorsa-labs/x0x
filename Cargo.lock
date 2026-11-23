@@ -3601,9 +3601,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-mls"
-version = "0.3.8"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "931d3dcde2afb4d1f8db4364aa43ac7db347e6350e531b65ff15466375af2196"
+checksum = "062e56ee2be8029dfcf3272bbb876af37f18c6f766b9e1849faa4da9b611ec44"
 dependencies = [
  "anyhow",
  "async-trait",

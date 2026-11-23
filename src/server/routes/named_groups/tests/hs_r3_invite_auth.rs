@@ -2900,6 +2900,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
         )
         .await?;
         let event = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.clone(),
             revision: 1,
             actor: authority_hex.clone(),

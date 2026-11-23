@@ -134,6 +134,33 @@ pub fn commit_leaf_changes(commit_bytes: &[u8]) -> Result<(usize, usize)> {
     Ok((commit.added.len(), commit.removed_leaves.len()))
 }
 
+/// The leaf shape of one encoded commit: who committed it, how many leaves
+/// it adds and which leaves it removes (in the signed order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRemovals {
+    /// The committer's leaf index.
+    pub committer_leaf: u32,
+    /// How many leaves the commit adds.
+    pub added: usize,
+    /// The removed leaf indices, as the commit lists them.
+    pub removed_leaves: Vec<u32>,
+}
+
+/// The [`CommitRemovals`] of an encoded commit.
+///
+/// # Errors
+/// Returns [`MlsError`] if the commit bytes do not decode.
+pub fn commit_removals(commit_bytes: &[u8]) -> Result<CommitRemovals> {
+    let commit: TreeKemCommit = decode(commit_bytes, "commit")?;
+    Ok(CommitRemovals {
+        committer_leaf: commit.committer_leaf,
+        added: commit.added.len(),
+        removed_leaves: commit.removed_leaves,
+    })
+}
+
+pub use saorsa_mls::treekem_group::RemovalError;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedTreeKemSnapshot {
     version: u8,
@@ -424,6 +451,59 @@ impl TreeKemMlsGroup {
             return false;
         };
         self.inner.find_leaf_by_key_package(&kp).is_some()
+    }
+
+    /// The leaf that `key_package` occupies in the tree, if any.
+    #[must_use]
+    pub fn leaf_of_key_package(&self, key_package: &[u8]) -> Option<u32> {
+        let kp = decode::<KeyPackage>(key_package, "key package").ok()?;
+        self.inner.find_leaf_by_key_package(&kp)
+    }
+
+    /// #2139: ONE commit that removes every listed member's leaf (saorsa-mls
+    /// `remove_members`). Every listed leaf is blanked before the committer's
+    /// path is sealed, so no removed leaf receives key material from the
+    /// commit. Each leaf is found from the member's roster KeyPackage, as in
+    /// [`Self::remove_member_verified`]. On error the group is unchanged.
+    ///
+    /// # Errors
+    /// [`MlsError::MemberNotInGroup`] when a KeyPackage names no live leaf,
+    /// and [`MlsError`] when saorsa-mls refuses the list or the commit.
+    pub fn remove_members_verified(&mut self, members: &[(AgentId, &[u8])]) -> Result<Vec<u8>> {
+        let mut leaves = Vec::with_capacity(members.len());
+        for (member, key_package) in members {
+            let kp: KeyPackage = decode(key_package, "expected member key package")?;
+            let leaf = self.inner.find_leaf_by_key_package(&kp).ok_or_else(|| {
+                MlsError::MemberNotInGroup(format!(
+                    "no active TreeKEM leaf matching roster KeyPackage for {:?}",
+                    member.as_bytes()
+                ))
+            })?;
+            leaves.push(leaf);
+        }
+        leaves.sort_unstable();
+        let commit = self
+            .inner
+            .remove_members(&leaves)
+            .map_err(|e| MlsError::SaorsaMls(format!("treekem remove_members: {e}")))?;
+        for (member, _) in members {
+            self.agent_to_leaf.remove(member);
+        }
+        encode(&commit, "commit")
+    }
+
+    /// saorsa-mls `check_commit_removals` for an encoded commit against
+    /// this tree: the typed structural reason a removal list is malformed.
+    /// The outer error is a commit that does not decode.
+    ///
+    /// # Errors
+    /// [`MlsError`] when the commit bytes do not decode.
+    pub fn check_commit_removals(
+        &self,
+        commit: &[u8],
+    ) -> Result<std::result::Result<(), RemovalError>> {
+        let commit: TreeKemCommit = decode(commit, "commit")?;
+        Ok(self.inner.check_commit_removals(&commit))
     }
 
     fn remove_leaf_for_member(&mut self, member: AgentId, leaf: u32) -> Result<Vec<u8>> {
