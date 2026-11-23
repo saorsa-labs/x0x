@@ -187,18 +187,43 @@ select that daemon for `--check` and `--apply`.
 
 **Pair order and lock custody (#2012).** An apply that replaces the sibling
 `x0x` replaces `x0xd` first, then `x0x`: the order the host journal records
-(`SwappedDaemon`, then `SwappedCli`). A sibling `x0x` that fails to validate
-or to lock fails the apply before any file changes. A sibling `x0x` whose
-swap fails makes the apply restore the `x0xd` it swapped and fail; no restart
-is requested. If that restore also fails, the apply fails with an error that
-says the pair is mixed and needs manual recovery. In 0.49.1 and earlier a failed
-companion only logged a warning, and the daemon was upgraded alone. The
-apply worker hands both install locks (`<x0x>.upgrade.lock`,
+(`SwappedDaemon`, then `SwappedCli`). A sibling `x0x` that cannot be locked
+fails the apply before any file changes. A sibling `x0x` whose swap fails
+(an error, or a replace that rolled itself back) makes the apply restore the
+`x0xd` it swapped and fail; no restart is requested. If that restore also
+fails, the apply fails with an error that says the pair is mixed and needs
+manual recovery. On Windows a release archive without a usable `x0x.exe`
+fails the apply too (nothing is replaced): an unattended host then keeps a
+matching pair instead of a new daemon beside an old CLI, and the failure is
+reported as below. In 0.49.1 and earlier a failed companion only logged a
+warning, and the daemon was upgraded alone.
+
+A companion failure is recorded in `<data_root>/upgrade-companion-failure.json`
+(release, the error naming the `x0x` path, the count, the time). `/health`
+(`inputs.upgrade.companion_failure`, loopback or owner only), `GET
+/diagnostics/upgrade` (`companion_failure`) and `x0x doctor` show it, with the
+remedy: make the file readable and `x0x.backup` and `x0x.upgrade.lock` beside
+it writable by the daemon's account, or reinstall `x0x`. The same release is
+not downloaded again for 30 minutes after the first such failure, doubling
+per further failure up to 24 hours; a newer release is tried at once. A record
+for the version the daemon now runs is not shown.
+
+Crash window: the two renames are separate steps. A power loss or kill
+between them leaves the new `x0xd` beside the old `x0x`. Nothing repairs this
+until the next release is applied (with 0.49.1's order it was the old `x0xd`
+beside the new `x0x`, which the next update cycle replaced).
+
+The apply worker hands both install locks (`<x0x>.upgrade.lock`,
 `<x0xd>.upgrade.lock`) to the restart owner. The immediate owner keeps them
 until the process exits. The HTTP apply's deferred owner keeps them through
-its 750 ms delay and the restart, so no second apply and no launcher start
-reads the install between the swap and the exit. A restart that is refused
-(and restores the binaries) releases them when it returns.
+its 750 ms delay and the restart. While they are held, no other process that
+takes these locks swaps the install between the swap and the exit. Not every
+reader takes them: `install.sh --binary` does not, and the dormant launcher
+takes no lock. Inside the daemon, every wait for these locks (a second apply,
+`x0x upgrade --clear-hold`, a skill update, the probe-retry loop) fails at
+once with "restart in progress" instead of waiting, so it cannot hold up the
+restart's shutdown drain. A restart that is refused (and restores the
+binaries) releases the locks when it returns.
 
 A daemon apply that finds no sibling `x0x` records that the file is missing
 at debug level. It does not warn. `POST /upgrade/apply` and `x0x doctor` do
@@ -453,10 +478,13 @@ locks and has passed admission and the probes. Then it:
 1. writes `<x0xd>.backup` and `<x0x>.backup` durably (a synced temporary file,
    renamed, then the directory synced);
 2. freezes the plan (one participant: this daemon, observed live; the
-   captured environment leaves out `X0X_M2_BOOT_FD` and systemd's
-   per-start variables: `INVOCATION_ID`, `JOURNAL_STREAM`, `NOTIFY_SOCKET`,
-   `LISTEN_*`, `MAINPID`, `MANAGERPID`, `SYSTEMD_EXEC_PID`, `WATCHDOG_*`,
-   `TRIGGER_*`, `MONITOR_*`);
+   captured environment leaves out the per-start variables in
+   `prepare_live::PER_START_ENV`: `X0X_M2_BOOT_FD`, `INVOCATION_ID`,
+   `JOURNAL_STREAM`, `NOTIFY_SOCKET`, `LISTEN_PID`, `LISTEN_FDS`,
+   `LISTEN_FDNAMES`, `MAINPID`, `MANAGERPID`, `SYSTEMD_EXEC_PID`,
+   `WATCHDOG_PID`, `WATCHDOG_USEC`, `TRIGGER_UNIT`, `TRIGGER_PATH`,
+   `TRIGGER_TIMER_REALTIME_USEC`, `TRIGGER_TIMER_MONOTONIC_USEC` and the five
+   `MONITOR_*` variables systemd sets for `OnFailure=`/`OnSuccess=` units);
 3. adopts the two locks as the `HostLock` and stages: the anchor is read
    while the data root's stage lock is held, then the binding and the Staged
    journal are written;
@@ -796,8 +824,10 @@ for the launcher, and lets the installer change the launcher and its anchor.
 The installer takes the stage lock of every data root the anchor names,
 before and after its change, from its journal check to its last anchor
 write, so a stage either finished before the check (and the check refuses
-on its journal) or reads the new anchor. It creates a missing lock file 0600
-for the data root's owner and refuses one that is not a regular file.
+on its journal) or reads the new anchor. It opens the data root as a
+directory without following a symlink and opens or creates the lock file
+relative to that handle (0600, given to the data root's owner); anything but
+a regular file is refused.
 
 #### Moving a data root to another install (#2012)
 

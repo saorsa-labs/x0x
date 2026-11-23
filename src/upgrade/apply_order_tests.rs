@@ -5,10 +5,18 @@ use std::sync::{LazyLock, Mutex};
 use tempfile::TempDir;
 
 static SWAPS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+type SwapHook = Box<dyn FnOnce() + Send>;
+static SWAP_HOOKS: LazyLock<Mutex<std::collections::HashMap<PathBuf, SwapHook>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// The swap seam: each target, in the order `swap_pair` starts its swap.
+/// The swap seam: each target, in the order `swap_pair` starts its swap,
+/// and a hook a test may run just before that target's swap.
 pub(super) fn record_swap(target: &Path) {
     SWAPS.lock().unwrap().push(target.to_path_buf());
+    let hook = SWAP_HOOKS.lock().unwrap().remove(target);
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 fn swaps_under(root: &Path) -> Vec<PathBuf> {
@@ -71,6 +79,15 @@ impl Pair {
             None,
         )
         .await
+    }
+
+    /// A second scratch directory with fresh candidates, for a second apply.
+    fn second_scratch(&self) -> PathBuf {
+        let scratch = self.root.path().join("scratch-2");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("daemon"), b"newer-daemon").unwrap();
+        std::fs::write(scratch.join("cli"), b"newer-cli").unwrap();
+        scratch
     }
 
     fn marker(&self) -> PathBuf {
@@ -155,27 +172,14 @@ async fn a_companion_that_cannot_be_locked_fails_before_any_swap() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("companion lock"), "{error}");
+    assert!(error.to_string().starts_with(COMPANION_FAILURE), "{error}");
+    assert!(
+        error.to_string().contains("install lock cannot be taken"),
+        "{error}"
+    );
     assert_eq!(std::fs::read(&pair.daemon).unwrap(), b"old-daemon");
     assert!(swaps_under(pair.root.path()).is_empty());
     assert!(!pair.marker().exists());
-}
-
-/// A companion that fails validation fails the apply before any lock or
-/// swap. Red: the pre-#2012 warn-and-skip.
-#[tokio::test]
-async fn a_companion_that_fails_validation_fails_before_any_swap() {
-    let pair = Pair::new();
-    let error = pair
-        .apply(
-            pair.companion(semver::Version::new(3, 0, 0)),
-            pair.continuation(),
-        )
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("companion refused"), "{error}");
-    assert_eq!(std::fs::read(&pair.daemon).unwrap(), b"old-daemon");
-    assert!(swaps_under(pair.root.path()).is_empty());
 }
 
 /// The immediate restart owner runs with both install locks held. Red:
@@ -267,4 +271,125 @@ async fn the_http_deferred_restart_keeps_the_install_locks_until_it_runs() {
         (true, true),
         "the locks are held while the restart runs"
     );
+}
+
+/// A companion swap that rolls itself back (its replace failed and its
+/// own backup was put back) is a failure, not a success: the daemon is
+/// restored and the apply fails. Red: treat `RolledBack` as success.
+#[tokio::test]
+async fn a_companion_swap_that_rolls_back_fails_the_apply() {
+    let pair = Pair::new();
+    // A directory as the CLI candidate: the rename over the file fails.
+    std::fs::remove_file(pair.scratch.join("cli")).unwrap();
+    std::fs::create_dir(pair.scratch.join("cli")).unwrap();
+    let error = pair
+        .apply(
+            pair.companion(semver::Version::new(1, 0, 0)),
+            pair.continuation(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().starts_with(COMPANION_FAILURE), "{error}");
+    assert!(
+        error.to_string().contains("daemon binary was restored"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&pair.daemon).unwrap(), b"old-daemon");
+    assert_eq!(std::fs::read(&pair.cli).unwrap(), b"old-cli");
+    assert!(!pair.marker().exists());
+}
+
+/// A companion failure when this apply swapped no daemon (it already held
+/// the candidate) says that nothing was replaced. Red: report a restore.
+#[tokio::test]
+async fn a_companion_failure_over_an_unswapped_daemon_replaces_nothing() {
+    let pair = Pair::new();
+    std::fs::write(&pair.daemon, b"new-daemon").unwrap();
+    std::fs::create_dir(pair.cli.with_extension("backup")).unwrap();
+    let error = pair
+        .apply(
+            pair.companion(semver::Version::new(1, 0, 0)),
+            pair.continuation(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().ends_with("nothing was replaced"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&pair.cli).unwrap(), b"old-cli");
+}
+
+/// A daemon that cannot be restored after a companion failure is named as
+/// a mixed pair that needs manual recovery. Red: report it as restored.
+#[tokio::test]
+async fn a_daemon_that_cannot_be_restored_is_named_a_mixed_pair() {
+    let pair = Pair::new();
+    std::fs::create_dir(pair.cli.with_extension("backup")).unwrap();
+    let daemon_backup = pair.daemon.with_extension("backup");
+    SWAP_HOOKS.lock().unwrap().insert(
+        pair.cli.clone(),
+        Box::new(move || std::fs::remove_file(daemon_backup).unwrap()),
+    );
+    let error = pair
+        .apply(
+            pair.companion(semver::Version::new(1, 0, 0)),
+            pair.continuation(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("mixed"), "{error}");
+    assert!(error.to_string().contains("cannot be restored"), "{error}");
+    assert_eq!(std::fs::read(&pair.daemon).unwrap(), b"new-daemon");
+    assert!(!pair.marker().exists());
+}
+
+/// #2012 review: while a restart owner in this process holds the install
+/// locks (here parked, as the HTTP deferred owner is during its delay and
+/// flush), a second apply in the same process fails at once with
+/// `RESTART_IN_PROGRESS` instead of waiting for the locks, so it cannot
+/// hold up the restart's shutdown drain. Red: the blocking lock wait of
+/// baacd676 (the second apply waits until the owner releases).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_in_process_lock_wait_fails_fast_while_the_restart_owner_holds_the_locks() {
+    let pair = Pair::new();
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let owner: Option<RestartContinuation> = Some(Box::new(move |_, locks| {
+        std::thread::spawn(move || {
+            let _locks = locks;
+            parked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(20));
+        });
+    }));
+    pair.apply(pair.companion(semver::Version::new(1, 0, 0)), owner)
+        .await
+        .unwrap();
+    parked_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let scratch = pair.second_scratch();
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        apply_replacements_offloaded(
+            Upgrader::new(pair.daemon.clone(), semver::Version::new(1, 0, 0)),
+            scratch.join("daemon"),
+            semver::Version::new(3, 0, 0),
+            Some((
+                Upgrader::new(pair.cli.clone(), semver::Version::new(1, 0, 0)),
+                scratch.join("cli"),
+            )),
+            TempDirGuard {
+                path: scratch.clone(),
+            },
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("an in-process lock wait must not block while the restart owner holds the locks");
+    let error = second.unwrap_err();
+    assert!(super::super::is_restart_in_progress(&error), "{error}");
+    assert_eq!(std::fs::read(&pair.daemon).unwrap(), b"new-daemon");
+    release_tx.send(()).unwrap();
 }

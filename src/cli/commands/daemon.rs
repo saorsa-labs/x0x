@@ -526,6 +526,23 @@ mod store_integrity_tests {
         assert!(failed_attempt(&serde_json::json!({"plan": null})).is_none());
     }
 
+    /// #2012 review: the doctor names a companion failure, its path and
+    /// the remedy; none without the record.
+    #[test]
+    fn the_doctor_names_a_failed_companion() {
+        let diagnostics = serde_json::json!({"companion_failure": {
+            "version": "0.50.0", "failures": 2, "last_unix": 100,
+            "detail": "x0x companion failed at /opt/x0x/x0x (denied); nothing was replaced",
+        }});
+        let warning = companion_failure(&diagnostics).expect("warned");
+        assert!(warning.contains("/opt/x0x/x0x"), "{warning}");
+        assert!(
+            warning.contains("0.50.0") && warning.contains("reinstall"),
+            "{warning}"
+        );
+        assert!(companion_failure(&serde_json::json!({"companion_failure": null})).is_none());
+    }
+
     /// #1970: a group store at the image limit makes the doctor warn and
     /// name it; `ok` and `full` stores do not.
     #[test]
@@ -613,11 +630,42 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
         "current_version": current,
         "latest_version": latest,
         "launcher_gate": val.get("launcher_gate").cloned().unwrap_or(serde_json::Value::Null),
+        "companion_failure": val.get("companion_failure").cloned().unwrap_or(serde_json::Value::Null),
     });
+    if let Some(failed) = companion_failure(&val) {
+        return DoctorCheck::warn(format!("{detail}; {failed}"), Some(evidence));
+    }
     if let Some(failed) = failed_attempt(&val) {
         return DoctorCheck::warn(format!("{detail}; {failed}"), Some(evidence));
     }
     DoctorCheck::ok_with(detail, evidence)
+}
+
+/// A release whose apply failed on the sibling `x0x` (`/diagnostics/upgrade`
+/// `companion_failure`, #2012 review), with the path and the remedy.
+pub(crate) fn companion_failure(diagnostics: &serde_json::Value) -> Option<String> {
+    let failed = diagnostics
+        .get("companion_failure")
+        .filter(|v| v.is_object())?;
+    let text = |key: &str| {
+        failed
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+    };
+    let number = |key: &str| failed.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    Some(format!(
+        "the update to {} failed {} time(s) on the sibling x0x CLI and both binaries were kept: \
+         {}. Fix that file (it must be readable, and x0x.backup and x0x.upgrade.lock beside it \
+         must be writable by the daemon's account), or reinstall x0x; the release is retried \
+         after unix time {}",
+        text("version"),
+        number("failures"),
+        text("detail"),
+        number("last_unix").saturating_add(crate::upgrade::companion_failure::backoff_secs(
+            u32::try_from(number("failures")).unwrap_or(u32::MAX)
+        ))
+    ))
 }
 
 /// A failed launcher-protected attempt in the host journal that

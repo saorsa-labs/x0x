@@ -747,36 +747,42 @@ class StageLocks:
 
 
 def open_stage_lock(root: str) -> int | None:
-    """Open `<root>/upgrade-stage.lock` without following a symlink; None
-    when the data root does not exist (no stage can run there). A missing
-    lock file is created 0600 and given to the data root's owner, the
-    account the producer runs as. Anything but a regular file is refused."""
+    """Open `<root>/upgrade-stage.lock`; None when the data root does not
+    exist (no stage can run there). The data root is opened first as a
+    directory without following a symlink, and the lock file is opened,
+    created and given away relative to that handle, so the daemon's account
+    cannot swap a path component for a link between the steps. A missing
+    lock file is created 0600 for the data root's owner, the account the
+    producer runs as. Anything but a regular file is refused."""
     try:
-        info = os.stat(root)
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         return None
-    if not stat.S_ISDIR(info.st_mode):
-        return None
-    path = os.path.join(root, STAGE_LOCK_NAME)
-    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-    try:
-        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            os.fchown(fd, info.st_uid, info.st_gid)
-            os.fchmod(fd, 0o600)
-        except OSError:
-            os.close(fd)
-            raise
-    except FileExistsError:
-        try:
-            fd = os.open(path, flags)
-        except OSError as error:
-            raise Refused(f"cannot open the stage lock {path}: {error}")
     except OSError as error:
-        raise Refused(f"cannot create the stage lock {path}: {error}")
+        raise Refused(f"cannot open the data root {root} for its stage lock: {error}")
+    try:
+        info = os.fstat(directory)
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        try:
+            fd = os.open(STAGE_LOCK_NAME, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+            try:
+                os.fchown(fd, info.st_uid, info.st_gid)
+                os.fchmod(fd, 0o600)
+            except OSError:
+                os.close(fd)
+                raise
+        except FileExistsError:
+            try:
+                fd = os.open(STAGE_LOCK_NAME, flags, dir_fd=directory)
+            except OSError as error:
+                raise Refused(f"cannot open the stage lock in {root}: {error}")
+        except OSError as error:
+            raise Refused(f"cannot create the stage lock in {root}: {error}")
+    finally:
+        os.close(directory)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
-        raise Refused(f"{path} is not a regular file")
+        raise Refused(f"the stage lock in {root} is not a regular file")
     return fd
 
 

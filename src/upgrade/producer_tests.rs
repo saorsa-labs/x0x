@@ -283,6 +283,21 @@ fn each_gate_check_alone_closes_the_gate() {
         edit(&mut probe, &host);
         closed_by(evaluate(true, &plan(&host), &host.cli, &probe), reason);
     }
+    // Near misses of the capability name are not it.
+    for near in [
+        &["trial-v10"][..],
+        &["xtrial-v1"],
+        &["trial-v1 extra"],
+        &["TRIAL-V1"],
+    ] {
+        let host = self::host();
+        let mut probe = FakeProbe::open(&host);
+        probe.capabilities = Ok(near.iter().map(|c| c.to_string()).collect());
+        closed_by(
+            evaluate(true, &plan(&host), &host.cli, &probe),
+            "does not answer trial-v1",
+        );
+    }
     let host = self::host();
     let mut probe = FakeProbe::open(&host);
     probe.capabilities = Err(io::Error::other("exit 64"));
@@ -476,7 +491,15 @@ fn the_transaction_swaps_the_daemon_then_the_cli_under_its_records() {
     };
     assert_eq!(
         STEPS.with(|steps| steps.borrow().clone()),
-        vec!["prepared", "daemon swapped", "cli swapped"]
+        vec![
+            "directory synced",
+            "directory synced",
+            "prepared",
+            "directory synced",
+            "daemon swapped",
+            "directory synced",
+            "cli swapped"
+        ]
     );
     let record = journal_record(&install.root);
     assert_eq!(record.phase, Phase::SwappedCli);

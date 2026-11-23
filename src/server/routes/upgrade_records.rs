@@ -35,6 +35,12 @@ pub(super) fn records_json(data_dir: &Path, install: Option<&Path>) -> Map<Strin
     );
     body.insert("launcher_gate".into(), launcher_gate_json());
     body.insert(
+        "companion_failure".into(),
+        crate::upgrade::companion_failure::current(data_dir)
+            .and_then(|record| serde_json::to_value(record).ok())
+            .unwrap_or(Value::Null),
+    );
+    body.insert(
         "records_error".into(),
         if errors.is_empty() {
             Value::Null

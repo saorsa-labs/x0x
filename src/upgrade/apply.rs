@@ -93,6 +93,9 @@ type RestartContinuation = Box<dyn FnOnce(&[(PathBuf, PathBuf)], HeldInstallLock
 /// value is dropped.
 pub(crate) struct HeldInstallLocks {
     inner: HeldInner,
+    /// While it exists, in-process lock waits fail fast
+    /// (`RESTART_IN_PROGRESS`). Dropped after the locks.
+    _mark: super::RestartOwnerMark,
 }
 
 enum HeldInner {
@@ -111,12 +114,13 @@ enum HeldInner {
 }
 
 impl HeldInstallLocks {
-    fn files(cli: Option<std::fs::File>, daemon: std::fs::File) -> Self {
+    fn files(targets: &[&Path], cli: Option<std::fs::File>, daemon: std::fs::File) -> Self {
         Self {
             inner: HeldInner::Files {
                 _cli: cli,
                 _daemon: daemon,
             },
+            _mark: super::RestartOwnerMark::new(targets),
         }
     }
 
@@ -125,11 +129,14 @@ impl HeldInstallLocks {
         lock: super::prepare::HostLock,
         prepared: super::prepare::Prepared,
     ) -> Self {
+        let plan = &prepared.record().plan;
+        let mark = super::RestartOwnerMark::new(&[&plan.cli.target_path, &plan.daemon.target_path]);
         Self {
             inner: HeldInner::Producer {
                 lock,
                 prepared: Box::new(prepared),
             },
+            _mark: mark,
         }
     }
 
@@ -788,6 +795,9 @@ fn swap_pair(
     if let Some(backup) = daemon_backup {
         swapped.push((upgrader.target_path().to_path_buf(), backup));
     }
+    let cli_target = companion
+        .as_ref()
+        .map(|(cli, _)| cli.target_path().to_path_buf());
     if let Some((x0x_upgrader, extracted_x0x)) = companion {
         #[cfg(test)]
         order_tests::record_swap(x0x_upgrader.target_path());
@@ -807,31 +817,79 @@ fn swap_pair(
                 Err(error) => Some(error.to_string()),
             };
         if let Some(reason) = failure {
-            return Err(restore_after_companion_failure(&swapped, &reason));
+            return Err(restore_after_companion_failure(
+                x0x_upgrader.target_path(),
+                &swapped,
+                &reason,
+            ));
         }
     }
+    let mut targets = vec![upgrader.target_path()];
+    targets.extend(cli_target.as_deref());
     Ok(Swapped::Done {
         result,
         swapped,
         locks: HeldInstallLocks::files(
+            &targets,
             companion_lock.map(super::install_lock::InstallLock::into_file),
             daemon_lock.into_file(),
         ),
     })
 }
 
+/// The text every companion failure starts with; `apply_upgrade_from_manifest`
+/// records such a failure for `/health`, `/diagnostics/upgrade` and
+/// `x0x doctor`, and backs off the same release (#2012 review).
+pub(crate) const COMPANION_FAILURE: &str = "x0x companion failed";
+
+/// A companion failure: `x0x companion failed at <path> (<reason>); <outcome>`.
+fn companion_failure(path: &Path, reason: &str, outcome: &str) -> UpgradeError {
+    UpgradeError::Other(format!(
+        "{COMPANION_FAILURE} at {} ({reason}); {outcome}",
+        path.display()
+    ))
+}
+
+/// Record a companion failure (`error` starting with [`COMPANION_FAILURE`])
+/// for `/health`, `/diagnostics/upgrade`, `x0x doctor` and the backoff.
+/// Any other error passes through unrecorded.
+fn note_companion_failure(data_root: &Path, version: &str, error: UpgradeError) -> UpgradeError {
+    let detail = error.to_string();
+    if detail.starts_with(COMPANION_FAILURE) {
+        match super::companion_failure::record(data_root, version, &detail) {
+            Ok(record) => error!(
+                version,
+                failures = record.failures,
+                retry_at_unix = record.retry_at_unix(),
+                %detail,
+                "the apply failed on the sibling x0x CLI; recorded for x0x doctor, and this \
+                 release is not tried again until its backoff passes"
+            ),
+            Err(write) => error!(
+                version,
+                %detail,
+                record_error = %write,
+                "the apply failed on the sibling x0x CLI and the failure could not be recorded"
+            ),
+        }
+    }
+    error
+}
+
 /// Restore what this transaction swapped (the daemon) after the companion
 /// swap failed, and build the apply's error. Every outcome is logged as it
 /// is: restored, nothing to restore, or a restore that failed.
-fn restore_after_companion_failure(swapped: &[(PathBuf, PathBuf)], reason: &str) -> UpgradeError {
+fn restore_after_companion_failure(
+    cli: &Path,
+    swapped: &[(PathBuf, PathBuf)],
+    reason: &str,
+) -> UpgradeError {
     if swapped.is_empty() {
         error!(
             reason,
             "x0x companion swap failed; the daemon was not swapped by this apply"
         );
-        return UpgradeError::Other(format!(
-            "x0x companion swap failed ({reason}); nothing was replaced"
-        ));
+        return companion_failure(cli, reason, "nothing was replaced");
     }
     match super::restore_swapped_binaries(swapped) {
         Ok(()) => {
@@ -839,9 +897,7 @@ fn restore_after_companion_failure(swapped: &[(PathBuf, PathBuf)], reason: &str)
                 reason,
                 "x0x companion swap failed; restored the daemon binary this apply swapped"
             );
-            UpgradeError::Other(format!(
-                "x0x companion swap failed ({reason}); the daemon binary was restored"
-            ))
+            companion_failure(cli, reason, "the daemon binary was restored")
         }
         Err(restore) => {
             error!(
@@ -850,10 +906,14 @@ fn restore_after_companion_failure(swapped: &[(PathBuf, PathBuf)], reason: &str)
                 "x0x companion swap failed and the daemon binary cannot be restored; \
                  the installed pair is mixed and needs manual recovery"
             );
-            UpgradeError::Other(format!(
-                "x0x companion swap failed ({reason}) and the daemon binary cannot be \
-                 restored ({restore}); the installed pair is mixed and needs manual recovery"
-            ))
+            companion_failure(
+                cli,
+                reason,
+                &format!(
+                    "the daemon binary cannot be restored ({restore}); the installed pair is \
+                     mixed and needs manual recovery"
+                ),
+            )
         }
     }
 }
@@ -931,15 +991,9 @@ async fn apply_replacements_with_producer(
 
         upgrader.validate_upgrade(&target_version)?;
 
-        // A present companion is part of the pair (#2012): one that fails
-        // to validate or lock fails the apply before any byte changes, and
-        // one that fails to swap restores the daemon and fails the apply.
-        if let Some((x0x_upgrader, _)) = &companion {
-            x0x_upgrader
-                .validate_upgrade(&target_version)
-                .map_err(|e| UpgradeError::Other(format!("x0x companion refused: {e}")))?;
-        }
-
+        // A present companion is part of the pair (#2012): one that cannot
+        // be locked fails the apply before any byte changes, and one that
+        // fails to swap restores the daemon and fails the apply.
         // Take every host lock before any backup/replace, CLI first: the
         // order of `prepare::HostLock` and the launcher's `Host::locked`.
         // Nested perform_upgrade locks would deadlock; finish_* assumes the
@@ -949,7 +1003,15 @@ async fn apply_replacements_with_producer(
             tests::acknowledge_host_lock_attempt(x0x_upgrader.target_path());
             Some(
                 super::acquire_install_lock(x0x_upgrader.target_path()).map_err(|e| {
-                    UpgradeError::Other(format!("x0x companion lock unavailable: {e}"))
+                    if super::is_restart_in_progress(&e) {
+                        e
+                    } else {
+                        companion_failure(
+                            x0x_upgrader.target_path(),
+                            &format!("its install lock cannot be taken: {e}"),
+                            "nothing was replaced",
+                        )
+                    }
                 })?,
             )
         } else {
@@ -1609,6 +1671,29 @@ impl AutoApplyUpgrader {
                  newer release"
             )));
         }
+        // A release whose apply failed on the sibling CLI is not downloaded
+        // again until its backoff has passed (#2012 review).
+        if let Some(failed) =
+            super::companion_failure::backed_off(&restart_plan.data_root, &manifest.version)
+        {
+            warn!(
+                version = %manifest.version,
+                failures = failed.failures,
+                retry_at_unix = failed.retry_at_unix(),
+                detail = %failed.detail,
+                "not applying a release whose last apply failed on the sibling x0x CLI \
+                 until its backoff passes; see x0x doctor"
+            );
+            return Err(UpgradeError::Other(format!(
+                "{}: release {} failed {} time(s) on the sibling x0x CLI; retry after unix \
+                 time {} ({})",
+                super::companion_failure::BACKOFF,
+                manifest.version,
+                failed.failures,
+                failed.retry_at_unix(),
+                failed.detail
+            )));
+        }
         #[cfg(unix)]
         let probe_launch = super::probe::ProbeLaunch::capture(&restart_plan.cwd);
         // Refuse a failed record barrier before download or replacement.
@@ -1808,16 +1893,27 @@ impl AutoApplyUpgrader {
                 #[cfg(not(unix))]
                 {
                     let extracted_x0x = temp_dir.join("extracted-x0x");
+                    // Fails as a pair, as on Unix (where the CLI's
+                    // extraction for the probe is already required): an
+                    // unattended host keeps a matching pair rather than a
+                    // new daemon beside an old CLI (#2012 review).
                     if let Err(e) =
                         extract_binary_from_archive(&archive_path, &extracted_x0x, cli_file_name())
                     {
-                        warn!("Failed to extract companion x0x binary: {e}");
-                    } else {
-                        companion = Some((
-                            Upgrader::new(x0x_path, current_version.clone()),
-                            extracted_x0x,
+                        return Err(note_companion_failure(
+                            &restart_plan.data_root,
+                            &manifest.version,
+                            companion_failure(
+                                &x0x_path,
+                                &format!("the release archive has no usable companion: {e}"),
+                                "nothing was replaced",
+                            ),
                         ));
                     }
+                    companion = Some((
+                        Upgrader::new(x0x_path, current_version.clone()),
+                        extracted_x0x,
+                    ));
                 }
             }
         }
@@ -1963,7 +2059,10 @@ impl AutoApplyUpgrader {
             #[cfg(unix)]
             producer,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            note_companion_failure(&restart_plan.data_root, &manifest.version, error)
+        })?;
 
         if matches!(result, UpgradeResult::Success { .. }) {
             // ADR-0061 §6 — report honestly. Installed bytes, a pending

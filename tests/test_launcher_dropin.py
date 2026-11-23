@@ -799,6 +799,23 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("stage lock", result.stderr)
         self.assertFalse((self.tmp / "elsewhere").exists())
 
+    def test_the_stage_lock_is_opened_through_the_data_root_handle(self) -> None:
+        # #2012 review: a data root that is a symlink is refused, not
+        # followed, and no lock file appears where the link points.
+        elsewhere = self.tmp / "elsewhere-root"
+        elsewhere.mkdir()
+        link = self.tmp / "linked-root"
+        link.symlink_to(elsewhere)
+        with self.assertRaises(dropin.Refused):
+            dropin.open_stage_lock(str(link))
+        self.assertFalse((elsewhere / "upgrade-stage.lock").exists())
+        self.assertIsNone(dropin.open_stage_lock(str(self.tmp / "missing-root")))
+        fd = dropin.open_stage_lock(str(self.data_root))
+        try:
+            self.assertTrue((self.data_root / "upgrade-stage.lock").is_file())
+        finally:
+            os.close(fd)
+
     def test_the_launcher_is_replaced_only_with_no_active_transaction(self) -> None:
         # ADR 0094 §5: the launcher is updated only with no active
         # transaction, and the old launcher is kept.

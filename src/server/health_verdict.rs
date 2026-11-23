@@ -214,6 +214,8 @@ pub(in crate::server) struct VerdictSample {
     pub upgrade_failed_artifact: bool,
     /// The host journal's phase and cause, when a journal exists (#2012).
     pub upgrade_journal: Option<JournalReport>,
+    /// A sibling `x0x` that made the last apply of a release fail (#2012).
+    pub upgrade_companion_failure: Option<crate::upgrade::companion_failure::CompanionFailure>,
     /// Age of the refresher's cached sample when it was served, set by
     /// the handler merge in `HealthSnapshot::merged_verdict_inputs`.
     /// `None` on a bare/unsampled sample (no staleness claim). Past
@@ -254,6 +256,7 @@ impl Default for VerdictSample {
             upgrade_record_diagnostic: None,
             upgrade_failed_artifact: false,
             upgrade_journal: None,
+            upgrade_companion_failure: None,
             sample_age_secs: None,
         }
     }
@@ -430,6 +433,7 @@ pub(in crate::server) async fn sample_verdict_inputs(
     // following recorded paths, or attempting recovery (ADR 0094 section 6).
     sample.upgrade_record_diagnostic = recovery_record_diagnostic(&state.data_dir);
     sample.upgrade_journal = journal_report(&state.data_dir);
+    sample.upgrade_companion_failure = crate::upgrade::companion_failure::current(&state.data_dir);
     sample.upgrade_failed_artifact = state
         .data_dir
         .join(crate::upgrade::restart::UPGRADE_FAILED_FILE_NAME)
@@ -689,6 +693,7 @@ input_report! {
         handoff_pending: bool,
         failed_artifact: bool,
         journal: Option<JournalReport>,
+        companion_failure: Option<crate::upgrade::companion_failure::CompanionFailure>,
     }
 }
 
@@ -966,6 +971,14 @@ pub(in crate::server) fn classify_with_detail(
             journal.phase, journal.cause
         ));
         InputState::Degraded
+    } else if let Some(failed) = &sample.upgrade_companion_failure {
+        bump(InputState::Degraded);
+        reasons.push(format!(
+            "the last apply of {} failed on the sibling x0x CLI ({} time(s)); the pair was \
+             kept and the release is retried after its backoff; see x0x doctor",
+            failed.version, failed.failures
+        ));
+        InputState::Degraded
     } else if let Some(diagnostic) = &sample.upgrade_record_diagnostic {
         bump(InputState::Degraded);
         reasons.push(diagnostic.clone());
@@ -1076,6 +1089,7 @@ pub(in crate::server) fn classify_with_detail(
                 handoff_pending: sample.upgrade_handoff_pending,
                 failed_artifact: sample.upgrade_failed_artifact,
                 journal: sample.upgrade_journal.clone(),
+                companion_failure: sample.upgrade_companion_failure.clone(),
             },
         },
     }
@@ -1087,7 +1101,7 @@ pub(in crate::server) fn classify_with_detail(
 /// full-detail detection read (#1354).
 pub(crate) const GATED_HEALTH_DETAIL: &[(&str, &[&str])] = &[
     ("disk", &["free_bytes", "total_bytes"]),
-    ("upgrade", &["latest_version"]),
+    ("upgrade", &["latest_version", "companion_failure"]),
     ("identity", &["user_present"]),
     ("log", &["errors"]),
     ("send_failure_rate", &["attempts", "failed", "rate"]),
@@ -1908,6 +1922,44 @@ mod tests {
         let json = serde_json::to_value(&verdict.inputs.upgrade).unwrap();
         assert_eq!(json["journal"]["phase"], "idle");
         assert_eq!(json["journal"]["failed_attempt"], false);
+    }
+
+    /// #2012 review: a release whose apply failed on the sibling x0x is
+    /// shown (version, count, retry time, the detail naming the path) and
+    /// degrades the upgrade input; the redacted body drops it. Red: drop
+    /// the `companion_failure` branch.
+    #[test]
+    fn a_companion_failure_is_shown_and_degrades() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::upgrade::companion_failure::record(
+            dir.path(),
+            "99.0.0",
+            "x0x companion failed at /opt/x0x/x0x (unreadable); nothing was replaced",
+        )
+        .unwrap();
+        let mut failed = sample();
+        failed.upgrade_companion_failure = crate::upgrade::companion_failure::current(dir.path());
+        let verdict = classify(&failed);
+        assert_eq!(verdict.inputs.upgrade.state, "degraded");
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("sibling x0x CLI")),
+            "{:?}",
+            verdict.reasons
+        );
+        let mut json = serde_json::to_value(&verdict.inputs.upgrade).unwrap();
+        assert_eq!(json["companion_failure"]["version"], "99.0.0");
+        assert!(json["companion_failure"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("/opt/x0x/x0x"));
+        let mut body = serde_json::json!({"verdict": {"inputs": {"upgrade": json.take()}}});
+        redact_health_detail(&mut body);
+        assert!(body["verdict"]["inputs"]["upgrade"]
+            .get("companion_failure")
+            .is_none());
     }
 
     #[test]

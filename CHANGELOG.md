@@ -8,13 +8,21 @@ All notable changes to this project will be documented in this file.
 
 - **Self-update replaces x0xd before x0x and fails as a pair (#2012; A14
   amendment of 23 Nov 2026).** An apply that also replaces the sibling `x0x`
-  now swaps `x0xd` first. A sibling `x0x` that cannot be validated or locked
-  fails the apply before any file changes, and one whose swap fails makes
-  the apply restore `x0xd` and fail with no restart (before, the failure was
-  only a warning and `x0xd` was upgraded alone). The restart owner keeps both
-  install locks until the process exits, also through the HTTP apply's
-  750 ms delayed restart. A successful apply installs the same files and
-  restarts as before.
+  now swaps `x0xd` first. A sibling `x0x` that cannot be locked fails the
+  apply before any file changes, and one whose swap fails makes the apply
+  restore `x0xd` and fail with no restart (before, the failure was only a
+  warning and `x0xd` was upgraded alone). On Windows a release archive
+  without a usable `x0x.exe` now fails the apply too. A companion failure is
+  recorded and shown by `/health`, `GET /diagnostics/upgrade`
+  (`companion_failure`) and `x0x doctor` with the path and the remedy, and
+  the same release is not downloaded again for 30 minutes, doubling up to
+  24 hours. The restart owner keeps both install locks until the process
+  exits, also through the HTTP apply's 750 ms delayed restart; inside the
+  daemon, a lock wait during that time (another apply, `--clear-hold`, a
+  skill update, a probe retry) fails at once with "restart in progress". A
+  power loss between the two renames now leaves the new `x0xd` beside the
+  old `x0x` until the next release. A successful apply installs the same
+  files and restarts as before.
 - **Launcher enable step 3: gated producer and journal end of life (#2012).**
   The daemon's apply path can write the host journal through SwappedCli, but
   only behind a gate that is closed in this release (`LAUNCHER_ENABLED` is

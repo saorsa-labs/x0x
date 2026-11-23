@@ -605,7 +605,10 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("path has no directory"))?;
-    journal::open_for_sync(parent, true)?.sync_all()
+    journal::open_for_sync(parent, true)?.sync_all()?;
+    #[cfg(test)]
+    tests::step("directory synced");
+    Ok(())
 }
 
 /// A temporary file beside `target`, created exclusively, mode 0700.
