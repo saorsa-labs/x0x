@@ -29,6 +29,7 @@ async fn wp_c_482_roster_ahead_state_adjacent_is_not_queued() {
         ..sample_commit()
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: "g".to_string(),
         revision: 9,
         actor: "cd".repeat(32),
@@ -71,6 +72,7 @@ async fn wp_c_492_non_self_leave_roster_ahead_is_not_queued() {
         ..sample_commit()
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: "g".to_string(),
         revision: 9,
         actor: "cd".repeat(32),
@@ -115,6 +117,7 @@ async fn wp_c_492_non_self_leave_hash_gap_still_queues() {
         ..sample_commit()
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: "g".to_string(),
         revision: 9,
         actor: "cd".repeat(32),
@@ -152,6 +155,7 @@ async fn wp_c_482_state_chain_gap_still_queues() {
         ..sample_commit()
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: "g".to_string(),
         revision: 9,
         actor: "cd".repeat(32),
@@ -185,6 +189,7 @@ async fn wp_c_482_hash_gap_still_queues() {
         ..sample_commit()
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: "g".to_string(),
         revision: 7,
         actor: "cd".repeat(32),
@@ -284,6 +289,7 @@ fn wp_c_491_u64_max_self_leave_is_not_queued_forever() {
         ..sample_commit()
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: "g".to_string(),
         revision: u64::MAX,
         actor: "cd".repeat(32),
@@ -361,6 +367,7 @@ async fn wp_c_491_poison_u64_max_member_removed_through_apply_arm_advances_clock
     )
     .expect("sign removal commit");
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision: u64::MAX,
         actor: leaver_hex.clone(),

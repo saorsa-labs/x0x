@@ -2154,6 +2154,7 @@ mod tests {
     fn parked_removal(sender: [u8; 32], epoch: u64) -> ParkedRoleUpdate {
         ParkedRoleUpdate {
             event: NamedGroupMetadataEvent::MemberRemoved {
+                target_key_package_b64: None,
                 group_id: "g".to_string(),
                 revision: 2,
                 actor: "01".repeat(32),
@@ -2751,6 +2752,7 @@ mod tests {
             .or_default()
             .push(ParkedRoleUpdate {
                 event: NamedGroupMetadataEvent::MemberRemoved {
+                    target_key_package_b64: None,
                     group_id: group_key.clone(),
                     revision: 3,
                     actor: actor.clone(),
@@ -2801,6 +2803,7 @@ mod tests {
             .or_default()
             .push(ParkedRoleUpdate {
                 event: NamedGroupMetadataEvent::MemberRemoved {
+                    target_key_package_b64: None,
                     group_id: group_key.clone(),
                     revision: 3,
                     actor: actor.clone(),

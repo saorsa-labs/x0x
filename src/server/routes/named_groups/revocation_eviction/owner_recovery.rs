@@ -188,6 +188,40 @@ pub(super) struct OrcState {
     excluded_local: HashMap<String, String>,
 }
 
+/// #2197: whether a verified V2 recovery excluded this node's own seat in
+/// `stable_group_id` (the `excluded_by_owner_recovery` state).
+pub(in crate::server) async fn local_seat_excluded(
+    state: &Arc<AppState>,
+    stable_group_id: &str,
+) -> bool {
+    // After a restart the state comes back from the durable received
+    // frame: the restore puts it in the stash, and its receipt records the
+    // state again.
+    ensure_restored(state).await;
+    retry_stash(state).await;
+    state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .excluded_local
+        .contains_key(stable_group_id)
+}
+
+/// #2197: forget the `excluded_by_owner_recovery` state after the local
+/// copy of the group is dropped.
+pub(in crate::server) async fn clear_local_seat_excluded(state: &AppState, stable_group_id: &str) {
+    state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .excluded_local
+        .remove(stable_group_id);
+}
+
 /// #2139: the typed state of a node whose own seat a V2 recovery excluded.
 pub(in crate::server) const EXCLUDED_BY_OWNER_RECOVERY: &str = "excluded_by_owner_recovery";
 
@@ -3988,31 +4022,6 @@ async fn receive_commit(
             ReceiveOutcome::Refused(refusal)
         };
     }
-    // #2139: a verified V2 recovery that excludes this node's own seat
-    // cannot apply here (the commit removes this node's leaf). The node
-    // records the typed state and stays at the parent head; its exit is an
-    // admin's removal and a new invitation.
-    let local = *state.agent.agent_id().as_bytes();
-    if frame
-        .v2()
-        .is_some_and(|v2| v2.excluded.iter().any(|seat| seat.agent == local))
-    {
-        drop(guard);
-        drop(membership_guard);
-        state
-            .revocation_evictions
-            .inner
-            .lock()
-            .await
-            .orc
-            .excluded_local
-            .insert(body.stable_group_id.clone(), body.commit.state_hash.clone());
-        tracing::warn!(
-            group_id = %ng::LogHexId::group(&group_key),
-            "ADR 0110 S4: an owner recovery excluded this node's seat; ask an admin to remove it and invite this agent again"
-        );
-        return ReceiveOutcome::NotApplicable;
-    }
     let commit = body.commit.to_commit();
     // ADR 0109 §2 "Conflict" (#1533 r6): the one conflict gate bounds
     // this commit as it bounds every metadata route.
@@ -4035,6 +4044,33 @@ async fn receive_commit(
     let at = (body.next_revision, body.commit.state_hash.as_str());
     if !replay_log::write_received(state, ext, held, &stable, at, &frame_bytes).await {
         return ReceiveOutcome::Retained { verified: true };
+    }
+    // #2139: a verified V2 recovery that excludes this node's own seat
+    // cannot apply here (the commit removes this node's leaf). The node
+    // records the typed state and stays at the parent head. The frame is
+    // durable above, so a restart restores the state from it. The exit:
+    // an admin removes the seat, this node drops its local copy
+    // (`DELETE /groups/:id`), and a fresh invite seats it again.
+    let local = *state.agent.agent_id().as_bytes();
+    if frame
+        .v2()
+        .is_some_and(|v2| v2.excluded.iter().any(|seat| seat.agent == local))
+    {
+        drop(guard);
+        drop(membership_guard);
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .excluded_local
+            .insert(body.stable_group_id.clone(), body.commit.state_hash.clone());
+        tracing::warn!(
+            group_id = %ng::LogHexId::group(&group_key),
+            "ADR 0110 S4: an owner recovery excluded this node's seat; ask an admin to remove it and invite this agent again"
+        );
+        return ReceiveOutcome::NotApplicable;
     }
     // #1508 rc12 (Codex P1): a GSS recovery installs only with its new
     // secret, as a GSS crypto-only exclusion does. The installed head is
@@ -4543,7 +4579,7 @@ pub(super) async fn status_json(state: &AppState, stable_group_id: &str) -> serd
             serde_json::json!({
                 "state": EXCLUDED_BY_OWNER_RECOVERY,
                 "result_head": result_head,
-                "remedy": "admin_removes_and_reinvites",
+                "remedy": "admin_removes_then_local_leave_and_new_invite",
             })
         });
     if owner.is_none() && promoted.is_none() && stranded.is_empty() && local_seat.is_none() {
@@ -8602,6 +8638,7 @@ mod restart_tests {
             &verdict,
         )?;
         let removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: stable.clone(),
             revision,
             actor: author_hex.clone(),
@@ -9069,6 +9106,7 @@ mod restart_tests {
         let (new_secret, epoch) = removed.rotate_shared_secret();
         let commit = seal_owner_certified(&mut removed, q.agent.identity().agent_keypair())?;
         let removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: stable.clone(),
             revision,
             actor: q_hex,

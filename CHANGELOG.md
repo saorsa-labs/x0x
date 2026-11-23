@@ -25,7 +25,11 @@ All notable changes to this project will be documented in this file.
   `receiver_upgrade_members`, and catches up after it upgrades. V1 is never
   sent instead. New statuses: `recovery_commit_failed` (a commit attempt
   failed and is retried) and, on the excluded creator's node,
-  `local_seat.state: "excluded_by_owner_recovery"`. A 0.49.x node applies
+  `local_seat.state: "excluded_by_owner_recovery"`; on that node
+  `DELETE /groups/:id` drops only the local copy, and after an admin removes
+  the seat a fresh invite seats the agent again. `MemberRemoved` gains the
+  optional `target_key_package_b64` for the roster-only removal (older
+  receivers ignore it). A 0.49.x node applies
   nothing from a V2 frame and refuses a roster-only removal of a seated
   member; an author downgraded to 0.49.x after committing V2 can resend the
   V2 frame to bit-7 members, which apply nothing. Limits: a creator not yet

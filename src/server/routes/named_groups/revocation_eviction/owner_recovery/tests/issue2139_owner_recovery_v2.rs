@@ -407,7 +407,7 @@ struct V2Fixture {
     creator: AgentId,
     creator_tree: TreeKemMlsGroup,
     tolerated: AgentId,
-    tolerated_tree: TreeKemMlsGroup,
+    tolerated_tree: Option<TreeKemMlsGroup>,
     survivors: Vec<(AgentId, TreeKemMlsGroup)>,
 }
 
@@ -417,6 +417,9 @@ struct Shape<'a> {
     creator: Option<&'a x0x::identity::AgentKeypair>,
     admin_leaf: bool,
     creator_leafless: bool,
+    /// T commits a KeyPackage but was never added to the tree, so its own
+    /// eviction is roster-only and keeps the epoch.
+    tolerated_leafless: bool,
 }
 
 fn member_seat(
@@ -468,10 +471,18 @@ async fn v2_fixture(shape: Shape<'_>) -> V2Fixture {
         tree.add_member(admin_id, &kp).unwrap();
         packages.push((admin_hex.clone(), kp));
     }
-    let joiners: Vec<&x0x::identity::AgentKeypair> = [creator, &tolerated]
+    let joiners: Vec<&x0x::identity::AgentKeypair> = [creator]
         .into_iter()
+        .chain((!shape.tolerated_leafless).then_some(&tolerated))
         .chain(shape.survivors.iter().copied())
         .collect();
+    if shape.tolerated_leafless {
+        let kp = TreeKemMlsGroup::prepare_member(tolerated.agent_id(), &[0x7F; 32])
+            .unwrap()
+            .key_package_bytes()
+            .to_vec();
+        packages.push((hex::encode(tolerated.agent_id().as_bytes()), kp));
+    }
     for (n, joiner) in joiners.iter().enumerate() {
         let id = joiner.agent_id();
         let prepared = TreeKemMlsGroup::prepare_member(id, &[0xC0 + n as u8; 32]).unwrap();
@@ -535,7 +546,7 @@ async fn v2_fixture(shape: Shape<'_>) -> V2Fixture {
         .insert(stable.clone(), Arc::clone(&tree));
     let mut trees = trees.into_iter();
     let creator_tree = trees.next().unwrap();
-    let tolerated_tree = trees.next().unwrap();
+    let tolerated_tree = (!shape.tolerated_leafless).then(|| trees.next().unwrap());
     V2Fixture {
         _dir: dir,
         state,
@@ -749,10 +760,11 @@ async fn v2_commits_and_the_creator_gets_no_keys() {
     }
     let mut tree = f.tree.lock().await;
     assert!(!tree.tracks_member(&f.creator));
-    f.tolerated_tree.process_commit(&commits[0]).unwrap();
+    let tolerated_tree = f.tolerated_tree.as_mut().unwrap();
+    tolerated_tree.process_commit(&commits[0]).unwrap();
     let ciphertext = tree.encrypt_message(b"recovery epoch").unwrap();
     assert_eq!(
-        f.tolerated_tree.decrypt_message(&ciphertext).unwrap(),
+        tolerated_tree.decrypt_message(&ciphertext).unwrap(),
         b"recovery epoch"
     );
     let _ = f.creator_tree.process_commit(&commits[0]);
@@ -1005,7 +1017,7 @@ async fn the_excluded_creator_shows_a_typed_state() {
     );
     assert_eq!(
         status["local_seat"]["remedy"],
-        "admin_removes_and_reinvites"
+        "admin_removes_then_local_leave_and_new_invite"
     );
     assert_eq!(
         creator_node.named_groups.read().await[&f.stable].state_hash,
@@ -1034,6 +1046,7 @@ async fn last_roster_only_removal(
     let commit = info.commit_log.last().unwrap().commit.clone();
     assert_eq!(commit.state_hash, info.state_hash);
     crate::server::NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: f.stable.clone(),
         revision: info.roster_revision,
         actor: hex::encode(f.state.agent.agent_id().as_bytes()),
@@ -1059,6 +1072,7 @@ async fn an_admin_removes_the_leafless_creator_roster_only() {
     let s_keypair = x0x::identity::AgentKeypair::generate().unwrap();
     let mut f = v2_fixture(Shape {
         survivors: &[&s_keypair, r_keypair],
+        tolerated_leafless: true,
         ..Shape::default()
     })
     .await;
@@ -1164,6 +1178,7 @@ async fn an_admin_removes_the_leafless_creator_roster_only() {
         .seal_commit_evicting(f.state.agent.identity().agent_keypair(), 9_000)
         .unwrap();
     let forged_event = crate::server::NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: f.stable.clone(),
         revision: forged.roster_revision,
         actor: local_hex.clone(),
@@ -1288,5 +1303,444 @@ fn a_leafless_seat_does_not_hide_a_removed_members_leaf() {
     assert_eq!(committer.member_count(), 2, "the committer and the leaver");
     assert!(
         crate::server::routes::named_groups::tree_has_leaf_outside_active_roster(&info, &committer)
+    );
+}
+
+// ─── #2197 round 2: hash-only receivers, fail-closed proof, the gates, ─────
+// ─── and the excluded creator's own way back ──────────────────────────────
+
+use crate::server::routes::named_groups as ng;
+use axum::extract::{Path, State};
+use axum::response::IntoResponse;
+
+/// A V2-committed author and a receiver R that applied the frame, after the
+/// S4 eviction of T. Returns the fixture, R's state, R's tree and the roster
+/// both hold.
+async fn excluded_pair(
+    survivors: &[&x0x::identity::AgentKeypair],
+    receiver: &Arc<AppState>,
+) -> (
+    V2Fixture,
+    Arc<tokio::sync::Mutex<TreeKemMlsGroup>>,
+    GroupInfo,
+) {
+    let mut f = v2_fixture(Shape {
+        survivors,
+        tolerated_leafless: true,
+        ..Shape::default()
+    })
+    .await;
+    let r_tree = receiver_for(&mut f, receiver).await;
+    attempt(&f).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let bytes = frame.unwrap();
+    let commit = orc::decode_frame(&bytes)
+        .ok()
+        .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+        .unwrap();
+    let author = f.state.agent.agent_id();
+    assert_eq!(
+        receive_commit(receiver, author, commit, &bytes).await,
+        ReceiveOutcome::Applied
+    );
+    let local_hex = hex::encode(author.as_bytes());
+    // The S4 eviction of T; the held creator stays pending, so the seal
+    // answers a retryable conflict after committing T's eviction.
+    let _ = ng::owner_certified_seal_with_eviction(&f.state, &f.stable, &local_hex).await;
+    assert!(!f.state.named_groups.read().await[&f.stable]
+        .has_active_member(&hex::encode(f.tolerated.as_bytes())));
+    let roster = f.state.named_groups.read().await[&f.stable].clone();
+    receiver
+        .named_groups
+        .write()
+        .await
+        .insert(f.stable.clone(), roster.clone());
+    (f, r_tree, roster)
+}
+
+/// R holds only the creator's KeyPackage hash (as a member that joined after
+/// the exclusion does: Welcome and invite rosters carry hashes only).
+async fn strip_bytes(state: &AppState, stable: &str, seat: &AgentId) {
+    let mut groups = state.named_groups.write().await;
+    let info = groups.get_mut(stable).unwrap();
+    let member = info
+        .members_v2
+        .get_mut(&hex::encode(seat.as_bytes()))
+        .unwrap();
+    assert!(member.treekem_key_package_hash.is_some());
+    member.treekem_key_package_b64 = None;
+}
+
+/// A hash-only receiver applies the creator's roster-only removal by the
+/// KeyPackage the event carries, hash-checked against its row, and reaches
+/// the author's head. The same event without the KeyPackage is refused:
+/// missing bytes are never read as no leaf. Red on dffc8f3f (the removal
+/// carried no KeyPackage and the receiver refused it for good).
+#[tokio::test]
+async fn a_hash_only_receiver_applies_the_creators_roster_only_removal() {
+    let (_rdir, receiver, _, _) = recovery_fixture().await;
+    let r_keypair = receiver.agent.identity().agent_keypair();
+    let (f, _r_tree, _) = excluded_pair(&[r_keypair], &receiver).await;
+    let creator_hex = hex::encode(f.creator.as_bytes());
+    let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+    strip_bytes(&receiver, &f.stable, &f.creator).await;
+    let (status, Json(body)) = ng::remove_treekem_named_group_member(
+        Arc::clone(&f.state),
+        f.stable.clone(),
+        creator_hex.clone(),
+        local_hex,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let author_head = f.state.named_groups.read().await[&f.stable].clone();
+    let mut event = last_roster_only_removal(&f, &creator_hex).await;
+    let carried = author_head.members_v2[&creator_hex]
+        .treekem_key_package_b64
+        .clone();
+    assert!(
+        carried.is_some(),
+        "the author keeps the removed row's KeyPackage"
+    );
+    let bare = event.clone();
+    let refused =
+        ng::apply_named_group_metadata_event(&receiver, bare, f.state.agent.agent_id(), true, None)
+            .await;
+    assert!(
+        !refused.accepted,
+        "no KeyPackage bytes: refused, fail closed"
+    );
+    if let crate::server::NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64,
+        ..
+    } = &mut event
+    {
+        *target_key_package_b64 = carried;
+    }
+    let applied = ng::apply_named_group_metadata_event(
+        &receiver,
+        event,
+        f.state.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(applied.accepted, "{applied:?}");
+    assert_eq!(
+        receiver.named_groups.read().await[&f.stable].state_hash,
+        author_head.state_hash
+    );
+}
+
+/// The same for the ban: a hash-only receiver applies the roster-only ban
+/// of the leafless creator by the KeyPackage the ban carries. Red on
+/// dffc8f3f (the seated-leafless arm read only the row's bytes).
+#[tokio::test]
+async fn a_hash_only_receiver_applies_the_creators_roster_only_ban() {
+    let (_rdir, receiver, _, _) = recovery_fixture().await;
+    let r_keypair = receiver.agent.identity().agent_keypair();
+    let (f, _r_tree, before) = excluded_pair(&[r_keypair], &receiver).await;
+    let creator_hex = hex::encode(f.creator.as_bytes());
+    let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+    strip_bytes(&receiver, &f.stable, &f.creator).await;
+    let (status, Json(body)) = ng::ban_treekem_group_member(
+        Arc::clone(&f.state),
+        f.stable.clone(),
+        creator_hex.clone(),
+        local_hex.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = f.state.named_groups.read().await[&f.stable].clone();
+    let commit = after.commit_log.last().unwrap().commit.clone();
+    let event = crate::server::NamedGroupMetadataEvent::MemberBanned {
+        group_id: f.stable.clone(),
+        revision: after.roster_revision,
+        actor: local_hex,
+        agent_id: creator_hex.clone(),
+        secret_epoch: None,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        commit: Some(commit),
+        target_key_package_b64: ng::roster_only_ban_key_package(&before, &creator_hex),
+    };
+    let applied = ng::apply_named_group_metadata_event(
+        &receiver,
+        event,
+        f.state.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(applied.accepted, "{applied:?}");
+    assert_eq!(
+        receiver.named_groups.read().await[&f.stable].state_hash,
+        after.state_hash
+    );
+}
+
+/// The proof is fail-closed. A seat whose KeyPackage bytes are missing is
+/// `MissingBytes`, never leafless, even when its leaf is gone; a seat that
+/// holds a leaf is never leafless; no loaded tree, or a tree at another
+/// epoch than the roster, proves nothing.
+#[tokio::test]
+async fn the_leafless_proof_fails_closed() {
+    let (_rdir, receiver, _, _) = recovery_fixture().await;
+    let r_keypair = receiver.agent.identity().agent_keypair();
+    let s_keypair = x0x::identity::AgentKeypair::generate().unwrap();
+    let (f, _r_tree, roster) = excluded_pair(&[&s_keypair, r_keypair], &receiver).await;
+    let creator_hex = hex::encode(f.creator.as_bytes());
+    let s_hex = hex::encode(s_keypair.agent_id().as_bytes());
+    let leaf = |info: GroupInfo, seat: String, carried: Option<String>| {
+        let receiver = Arc::clone(&receiver);
+        let stable = f.stable.clone();
+        async move { ng::treekem_seat_leaf(&receiver, &stable, &info, &seat, carried.as_deref()).await }
+    };
+    assert_eq!(
+        leaf(roster.clone(), creator_hex.clone(), None).await,
+        ng::SeatLeaf::Absent
+    );
+    assert_eq!(
+        leaf(roster.clone(), s_hex.clone(), None).await,
+        ng::SeatLeaf::NotAbsent,
+        "a seat with a leaf"
+    );
+    let mut stripped = roster.clone();
+    for seat in [&creator_hex, &s_hex] {
+        stripped
+            .members_v2
+            .get_mut(seat)
+            .unwrap()
+            .treekem_key_package_b64 = None;
+    }
+    assert_eq!(
+        leaf(stripped.clone(), creator_hex.clone(), None).await,
+        ng::SeatLeaf::MissingBytes,
+        "missing bytes are never no leaf"
+    );
+    assert_eq!(
+        leaf(stripped.clone(), s_hex.clone(), None).await,
+        ng::SeatLeaf::MissingBytes,
+        "a stripped seat that still holds a leaf is never leafless"
+    );
+    assert_eq!(
+        leaf(
+            stripped,
+            creator_hex.clone(),
+            Some("bm90LXRoZS1wYWNrYWdl".into())
+        )
+        .await,
+        ng::SeatLeaf::MissingBytes,
+        "carried bytes that do not hash to the row are ignored"
+    );
+    let mut later = roster.clone();
+    later.secret_epoch += 1;
+    assert_eq!(
+        leaf(later, creator_hex.clone(), None).await,
+        ng::SeatLeaf::NotAbsent,
+        "a tree at another epoch than the roster"
+    );
+    receiver.treekem_groups.write().await.remove(&f.stable);
+    assert_eq!(
+        leaf(roster, creator_hex, None).await,
+        ng::SeatLeaf::NotAbsent,
+        "no loaded tree"
+    );
+}
+
+/// The bit-23 gate (D76) also holds the roster-only ban and eviction of the
+/// leafless creator while a member's current advert lacks the bit.
+#[tokio::test]
+async fn the_bit_23_gate_holds_the_ban_and_the_eviction() {
+    let r = x0x::identity::AgentKeypair::generate().unwrap();
+    let f = v2_fixture(Shape {
+        survivors: &[&r],
+        ..Shape::default()
+    })
+    .await;
+    attempt(&f).await;
+    let creator_hex = hex::encode(f.creator.as_bytes());
+    let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+    let _ = ng::owner_certified_seal_with_eviction(&f.state, &f.stable, &local_hex).await;
+    advertise(
+        &f.state,
+        r.agent_id(),
+        bits_without_v2(),
+        x0x::dm::now_unix_ms(),
+    );
+    let (status, Json(body)) = ng::ban_treekem_group_member(
+        Arc::clone(&f.state),
+        f.stable.clone(),
+        creator_hex.clone(),
+        local_hex.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["capability"], "owner_recovery_v2");
+    revoke_agent(&f.state, f.creator_keys.as_ref().unwrap()).await;
+    let outcome = ng::owner_certified_seal_with_eviction(&f.state, &f.stable, &local_hex)
+        .await
+        .expect("an owner-certified group");
+    let Err((status, Json(body))) = outcome else {
+        panic!("the eviction is held");
+    };
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["capability"], "owner_recovery_v2");
+    assert!(f.state.named_groups.read().await[&f.stable].has_active_member(&creator_hex));
+}
+
+/// The excluded creator's own way back, end to end on two daemons. The
+/// creator's node verifies the V2 frame and shows `excluded_by_owner_recovery`.
+/// An admin removes its seat (roster-only). The creator's node leaves
+/// locally (`DELETE /groups/:id`): only its local copy is dropped, no
+/// commit is sealed (before this, the self-leave seal answered 500). A
+/// fresh invite then
+/// starts an ordinary join (no "already seated" answer). Its re-admission
+/// adds a fresh leaf: the creator reads traffic after it, and not the
+/// traffic sent while it was out.
+#[tokio::test]
+async fn the_excluded_creator_leaves_locally_and_rejoins_by_invite() {
+    let (_cdir, creator_node, _, _) = recovery_fixture().await;
+    let creator_keys = creator_node.agent.identity().agent_keypair();
+    let f = v2_fixture(Shape {
+        creator: Some(creator_keys),
+        tolerated_leafless: true,
+        ..Shape::default()
+    })
+    .await;
+    let records = f.state.agent.revocation_set().read().await.all_records();
+    for record in records {
+        let _ = creator_node
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None);
+    }
+    creator_node
+        .named_groups
+        .write()
+        .await
+        .insert(f.stable.clone(), f.info.clone());
+    creator_node.treekem_groups.write().await.insert(
+        f.stable.clone(),
+        Arc::new(tokio::sync::Mutex::new(f.creator_tree)),
+    );
+    attempt_on(&f.state, &f.stable, &f.info).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let bytes = frame.unwrap();
+    let commit = orc::decode_frame(&bytes)
+        .ok()
+        .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+        .unwrap();
+    assert_eq!(
+        receive_commit(&creator_node, f.state.agent.agent_id(), commit, &bytes).await,
+        ReceiveOutcome::NotApplicable
+    );
+    // Traffic while the creator is out.
+    let while_out = f.tree.lock().await.encrypt_message(b"while out").unwrap();
+
+    // The admin removes the creator's seat (T is evicted first).
+    let creator_hex = hex::encode(f.creator.as_bytes());
+    let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+    // The S4 eviction of T; the held creator stays pending, so the seal
+    // answers a retryable conflict after committing T's eviction.
+    let _ = ng::owner_certified_seal_with_eviction(&f.state, &f.stable, &local_hex).await;
+    assert!(!f.state.named_groups.read().await[&f.stable]
+        .has_active_member(&hex::encode(f.tolerated.as_bytes())));
+    let (status, Json(body)) = ng::remove_treekem_named_group_member(
+        Arc::clone(&f.state),
+        f.stable.clone(),
+        creator_hex.clone(),
+        local_hex,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let response = ng::leave_group(
+        State(Arc::clone(&creator_node)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(f.stable.clone()),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["local_only"], true);
+    assert_eq!(body["excluded_by_owner_recovery"], true);
+    assert!(!creator_node
+        .named_groups
+        .read()
+        .await
+        .contains_key(&f.stable));
+
+    // A fresh invite starts an ordinary join on the creator's node.
+    let (_invite, link) = ng::mint_invite_transaction(
+        &f.state,
+        &f.stable,
+        3_600,
+        Some(f.creator),
+        x0x::groups::InviteOrigin::Explicit,
+        true,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("mint invite: {e:?}"));
+    let response = ng::join_group_via_invite(
+        State(Arc::clone(&creator_node)),
+        Json(ng::JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            // An owner-certified group is joined in Home mode, pinned to its
+            // owner.
+            mode: Some("home".to_string()),
+            expected_owner_user_id: Some(hex::encode(
+                f.state
+                    .agent
+                    .identity()
+                    .user_keypair()
+                    .unwrap()
+                    .user_id()
+                    .as_bytes(),
+            )),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap_or(serde_json::Value::Null);
+    assert!(
+        status.is_success() && body["join_state"] != "active",
+        "an ordinary join starts, not an already-seated answer: {status} {body}"
+    );
+
+    // The re-admission's TreeKEM add gives the creator a fresh leaf.
+    let prepared = TreeKemMlsGroup::prepare_member(f.creator, &[0xE1; 32]).unwrap();
+    let added = f
+        .tree
+        .lock()
+        .await
+        .add_member(f.creator, prepared.key_package_bytes())
+        .unwrap();
+    let mut rejoined = TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome).unwrap();
+    let after = f
+        .tree
+        .lock()
+        .await
+        .encrypt_message(b"after rejoin")
+        .unwrap();
+    assert_eq!(rejoined.decrypt_message(&after).unwrap(), b"after rejoin");
+    assert!(
+        rejoined.decrypt_message(&while_out).is_err(),
+        "nothing sent while it was out"
     );
 }

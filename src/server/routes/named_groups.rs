@@ -2520,6 +2520,13 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         secret_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
+        /// #2197: the target's committed TreeKEM KeyPackage, carried by the
+        /// roster-only removal of a seated member that provably holds no
+        /// leaf, so a receiver that holds only the KeyPackage hash can
+        /// check its own tree with the same evidence. Receivers accept the
+        /// bytes only when they hash to the target's committed hash.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_key_package_b64: Option<String>,
     },
     GroupDeleted {
         group_id: String,
@@ -17975,6 +17982,7 @@ pub(in crate::server) fn park_pending_gss_removal_for_test(
         signature: String::new(),
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: info.stable_group_id().to_string(),
         revision: info.roster_revision.saturating_add(1),
         actor: String::new(),
@@ -19659,6 +19667,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             treekem_epoch,
             secret_epoch,
             commit,
+            target_key_package_b64,
             ..
         } => {
             let Some(commit) = commit else {
@@ -19696,11 +19705,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         // that provably holds no leaf in this node's tree.
                         (None, None)
                             if secret_epoch.is_none()
-                                && treekem_seat_is_provably_leafless(
+                                && receiver_seat_is_provably_leafless(
                                     state,
                                     &resolved_group_key,
                                     &info,
                                     &agent_id,
+                                    target_key_package_b64.as_deref(),
                                 )
                                 .await =>
                         {
@@ -20287,11 +20297,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             target_key_package_b64.as_deref(),
                         )
                         .await
-                            || treekem_seat_is_provably_leafless(
+                            || receiver_seat_is_provably_leafless(
                                 state,
                                 &resolved_group_key,
                                 &info,
                                 &agent_id,
+                                target_key_package_b64.as_deref(),
                             )
                             .await =>
                     {
@@ -29650,6 +29661,7 @@ pub(in crate::server) async fn remove_named_group_member(
         let delivery_roster = next.clone();
         drop(named_groups);
         let event = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: event_group_id,
             revision,
             actor: local_agent_hex.clone(),
@@ -33135,6 +33147,7 @@ async fn commit_treekem_self_leave_rekey_from(
         return SelfLeaveRekeyStep::Deferred;
     }
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: event_group_id,
         revision,
         actor: local_agent_hex,
@@ -33520,6 +33533,7 @@ async fn leave_treekem_group(
     listener_lifecycle::reconcile_named_group_listeners(&state, &id, Some(&event_group_id)).await;
 
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: event_group_id,
         revision,
         actor: local_agent_hex.clone(),
@@ -33742,6 +33756,7 @@ async fn remove_treekem_named_group_member(
         }
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: event_group_id,
         revision,
         actor: local_agent_hex,
@@ -34346,6 +34361,7 @@ async fn owner_certified_seal_with_eviction(
                     return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
                 }
                 let event = NamedGroupMetadataEvent::MemberRemoved {
+                    target_key_package_b64: roster_only_ban_key_package(info, &evict_hex),
                     group_id: next.stable_group_id().to_string(),
                     revision,
                     actor: local_hex.to_string(),
@@ -34515,6 +34531,7 @@ async fn owner_certified_seal_with_eviction(
                     return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
                 }
                 let event = NamedGroupMetadataEvent::MemberRemoved {
+                    target_key_package_b64: None,
                     group_id: next.stable_group_id().to_string(),
                     revision,
                     actor: local_hex.to_string(),
@@ -34648,6 +34665,7 @@ async fn owner_certified_seal_with_eviction(
                 return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
             }
             let event = NamedGroupMetadataEvent::MemberRemoved {
+                target_key_package_b64: None,
                 group_id: next.stable_group_id().to_string(),
                 revision,
                 actor: local_hex.to_string(),
@@ -34997,6 +35015,42 @@ pub(in crate::server) async fn leave_group(
         Err(resp) => return resp,
     };
 
+    // #2197: a node whose own seat an owner recovery V2 excluded holds the
+    // group at the parent head with no usable keys, and cannot seal a
+    // self-leave there (ADR-0038). It drops its local copy only; nothing is
+    // published and the group's roster is unchanged. An admin's removal
+    // ends the seat for the group, and a fresh invite then seats this agent
+    // again as an ordinary join.
+    let stable_id = info.stable_group_id().to_string();
+    if revocation_eviction::owner_recovery::local_seat_excluded(&state, &stable_id).await {
+        let name = info.name.clone();
+        drop(groups);
+        if !drop_local_named_group_state(
+            &state,
+            &id,
+            Some(&stable_id),
+            "excluded_by_owner_recovery",
+        )
+        .await
+        {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named-group state is not directory-durable",
+            );
+        }
+        revocation_eviction::owner_recovery::clear_local_seat_excluded(&state, &stable_id).await;
+        refresh_group_rosters_for_gossip(&state).await;
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "left": name,
+                "local_only": true,
+                "excluded_by_owner_recovery": true,
+            })),
+        );
+    }
+
     // #369 / PR #370 review item 4: the ONE self-leave routing decision,
     // computed before the plane dispatch so GSS and TreeKEM groups share it.
     // SoleMemberDelete runs the same terminal withdrawal flow as
@@ -35079,6 +35133,7 @@ pub(in crate::server) async fn leave_group(
         }
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: event_group_id,
         revision,
         actor: local_agent_hex.clone(),
@@ -37690,40 +37745,60 @@ pub(in crate::server) fn roster_only_ban_key_package(
         .and_then(current_member_treekem_key_package)
 }
 
+/// #2197: what this node's own tree proves about a seated member's leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum SeatLeaf {
+    /// The seat's committed KeyPackage names no live leaf in this node's
+    /// tree, and the tree is at the roster's epoch.
+    Absent,
+    /// No proof: no Active seat, no committed hash, a leaf is present, or
+    /// the tree is missing or at another epoch.
+    NotAbsent,
+    /// The seat commits a KeyPackage hash, but this node holds no bytes that
+    /// match it (none on its row and none carried by the event).
+    MissingBytes,
+}
+
 /// #2197 (David, 23 Nov 2026: build the exit first): whether
 /// `agent_id_hex` holds an Active seat on `info` that provably holds no
-/// TreeKEM leaf. The proof is the tree: the seat's committed KeyPackage
-/// (bytes whose hash the row commits) names no live leaf in this node's
-/// tree. A seat with no KeyPackage bytes, a hash mismatch or no loaded tree
-/// is never read as leafless. Such a seat is the creator that an
-/// `OwnerRecoveryV2` excluded (#2139); it has no TreeKEM removal, so it
-/// leaves the roster with a roster-only removal, ban or eviction.
-pub(in crate::server) async fn treekem_seat_is_provably_leafless(
+/// TreeKEM leaf. The proof is this node's tree at the roster's epoch: the
+/// seat's committed KeyPackage names no live leaf. The KeyPackage bytes
+/// come from the seat's row or, for a receiver that holds only the hash,
+/// from the event (`carried`); either way they must hash to the committed
+/// `treekem_key_package_hash`. Missing bytes, a missing hash, no loaded
+/// tree or a tree at another epoch are never read as leafless. Such a seat
+/// is the creator that an `OwnerRecoveryV2` excluded (#2139); it has no
+/// TreeKEM removal, so it leaves the roster with a roster-only removal,
+/// ban or eviction.
+pub(in crate::server) async fn treekem_seat_leaf(
     state: &AppState,
     group_id: &str,
     info: &x0x::groups::GroupInfo,
     agent_id_hex: &str,
-) -> bool {
+    carried: Option<&str>,
+) -> SeatLeaf {
     if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
-        return false;
+        return SeatLeaf::NotAbsent;
     }
     let Some(member) = info
         .members_v2
         .get(agent_id_hex)
         .filter(|member| member.state == x0x::groups::GroupMemberState::Active)
     else {
-        return false;
+        return SeatLeaf::NotAbsent;
     };
-    let Some(kp_b64) = current_member_treekem_key_package(member) else {
-        return false;
+    let Some(expected) = member.treekem_key_package_hash.as_deref() else {
+        return SeatLeaf::NotAbsent;
     };
-    if let Some(expected) = member.treekem_key_package_hash.as_deref() {
-        if blake3::hash(kp_b64.as_bytes()).to_hex().as_str() != expected {
-            return false;
-        }
-    }
+    let matches = |kp_b64: &str| blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected;
+    let kp_b64 = current_member_treekem_key_package(member)
+        .filter(|kp_b64| matches(kp_b64))
+        .or_else(|| carried.filter(|kp_b64| matches(kp_b64)).map(str::to_string));
+    let Some(kp_b64) = kp_b64 else {
+        return SeatLeaf::MissingBytes;
+    };
     let (Ok(target), Ok(kp)) = (parse_agent_id_hex(agent_id_hex), BASE64.decode(&kp_b64)) else {
-        return false;
+        return SeatLeaf::NotAbsent;
     };
     let tree = {
         let map = state.treekem_groups.read().await;
@@ -37733,10 +37808,49 @@ pub(in crate::server) async fn treekem_seat_is_provably_leafless(
             .cloned()
     };
     let Some(tree) = tree else {
-        return false;
+        return SeatLeaf::NotAbsent;
     };
-    let present = tree.lock().await.member_leaf_present(&target, Some(&kp));
-    present == Some(false)
+    let tree = tree.lock().await;
+    if tree.epoch() != info.secret_epoch {
+        return SeatLeaf::NotAbsent;
+    }
+    if tree.member_leaf_present(&target, Some(&kp)) == Some(false) {
+        SeatLeaf::Absent
+    } else {
+        SeatLeaf::NotAbsent
+    }
+}
+
+/// [`treekem_seat_leaf`] is [`SeatLeaf::Absent`], with the seat's own row
+/// as the only KeyPackage source (the author's view).
+pub(in crate::server) async fn treekem_seat_is_provably_leafless(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    agent_id_hex: &str,
+) -> bool {
+    treekem_seat_leaf(state, group_id, info, agent_id_hex, None).await == SeatLeaf::Absent
+}
+
+/// #2197: a receiver's check of a roster-only removal or ban of a seated
+/// member. Missing KeyPackage bytes are never read as leafless; the node
+/// asks the members that witnessed the join for them, and the sender's
+/// redelivery or a catch-up brings the event again.
+async fn receiver_seat_is_provably_leafless(
+    state: &Arc<AppState>,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    agent_id_hex: &str,
+    carried: Option<&str>,
+) -> bool {
+    match treekem_seat_leaf(state, group_id, info, agent_id_hex, carried).await {
+        SeatLeaf::Absent => true,
+        SeatLeaf::MissingBytes => {
+            request_missing_leaf_evidence(state, group_id, agent_id_hex);
+            false
+        }
+        SeatLeaf::NotAbsent => false,
+    }
 }
 
 /// #2197: the members whose current verified advert lacks
@@ -37804,6 +37918,7 @@ async fn remove_treekem_leafless_seat(
         return leafless_seat_upgrade_wait(lacking);
     }
     let signing_kp = state.agent.identity().agent_keypair();
+    let before_removal = next.clone();
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
     next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
@@ -37818,6 +37933,7 @@ async fn remove_treekem_leafless_seat(
             }
         };
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: roster_only_ban_key_package(&before_removal, &agent_id_hex),
         group_id: event_group_id,
         revision,
         actor: local_agent_hex,
@@ -61853,6 +61969,7 @@ pub(in crate::server) mod tests {
         committed.remove_member(&leaver_hex, Some(leaver_hex.clone()));
         let commit = seal_commit_owner_certified(state, &mut committed, leaver, 2_000).await?;
         Ok(NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.to_string(),
             revision,
             actor: leaver_hex,
@@ -63044,6 +63161,7 @@ pub(in crate::server) mod tests {
         assert!(commit.withdrawn);
 
         let event = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: parent.stable_group_id().to_string(),
             revision: 1,
             actor: admin_hex.clone(),
@@ -63697,6 +63815,7 @@ pub(in crate::server) mod tests {
         scratch.remove_member(&admin_hex, Some(admin_hex.clone()));
         let commit = sign_metadata_terminality_commit(&parent, &scratch, &state, 2_000);
         let leave_event = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: parent.stable_group_id().to_string(),
             revision: parent.state_revision.saturating_add(1),
             actor: admin_hex.clone(),
@@ -65146,6 +65265,7 @@ pub(in crate::server) mod tests {
         };
 
         let remove_event = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: stable_group_id,
             revision: roster_revision,
             actor: admin_hex.clone(),
@@ -66367,6 +66487,7 @@ pub(in crate::server) mod tests {
         let leave_commit =
             seal_commit_owner_certified(&f.state, &mut left, &f.bystander_kp, 2_000).await?;
         let self_leave = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: f.committed.stable_group_id().to_string(),
             revision: leave_revision,
             actor: f.bystander_hex.clone(),
@@ -66513,6 +66634,7 @@ pub(in crate::server) mod tests {
         let removal_commit =
             seal_commit_owner_certified(&f.state, &mut removed, &f.admin_kp, 2_000).await?;
         let plain_removal = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: f.committed.stable_group_id().to_string(),
             revision: removal_revision,
             actor: admin_hex.clone(),
@@ -66606,6 +66728,7 @@ pub(in crate::server) mod tests {
         let b_commit =
             seal_commit_owner_certified(&f.state, &mut rotated, &f.promotee_kp, 3_000).await?;
         let b_removal = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: stable.clone(),
             revision: b_revision,
             actor: promotee_hex.clone(),
@@ -66678,6 +66801,7 @@ pub(in crate::server) mod tests {
         let b_commit =
             seal_commit_owner_certified(&f.state, &mut rotated, &f.promotee_kp, 3_000).await?;
         let b_removal = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: stable.clone(),
             revision: b_revision,
             actor: promotee_hex.clone(),
@@ -66804,6 +66928,7 @@ pub(in crate::server) mod tests {
             .cloned()
             .context("group")?;
         let removal = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: info.stable_group_id().to_string(),
             revision: info.roster_revision.saturating_add(1),
             actor: String::new(),
@@ -66881,6 +67006,7 @@ pub(in crate::server) mod tests {
             .cloned()
             .context("group")?;
         let removal = |at: usize, epoch: u64| NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: info.stable_group_id().to_string(),
             revision: info.roster_revision.saturating_add(1),
             actor: String::new(),
@@ -70601,6 +70727,7 @@ pub(in crate::server) mod tests {
     #[test]
     fn treekem_metadata_event_phase3_classifier_allows_group_delete() {
         let event = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: "aa".repeat(16),
             revision: 1,
             actor: "11".repeat(32),
@@ -70727,6 +70854,7 @@ pub(in crate::server) mod tests {
         ));
 
         let self_leave = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.clone(),
             revision: 3,
             actor: member_hex.clone(),
@@ -70749,6 +70877,7 @@ pub(in crate::server) mod tests {
         ));
 
         let admin_remove_without_treekem = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.clone(),
             revision: 4,
             actor: creator_hex.clone(),
@@ -70765,6 +70894,7 @@ pub(in crate::server) mod tests {
         ));
 
         let admin_remove_with_treekem = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.clone(),
             revision: 5,
             actor: admin_hex.clone(),

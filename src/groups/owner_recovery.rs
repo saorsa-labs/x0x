@@ -1420,7 +1420,23 @@ fn validate_sibling_transition(
                         .roster
                         .get(&hex::encode(seat.agent))
                         .and_then(|snapshot| snapshot.certificate.as_ref())
-                        .is_none_or(|cert| cert.is_expired(v2.exclusion_anchor_unix))
+                        .is_none_or(|cert| {
+                            // The parent rule's check
+                            // (`creator_expired_certificate_hold`): the
+                            // certificate chains to the owner and is
+                            // expired, skew included, at the anchor.
+                            current.policy.admission.owner_certified_user_id().is_some_and(
+                                |owner| {
+                                    crate::groups::owner_cert::verify_cert_against_owner(
+                                        owner,
+                                        &hex::encode(seat.agent),
+                                        cert,
+                                        false,
+                                        v2.exclusion_anchor_unix,
+                                    ) == Err(crate::groups::owner_cert::OwnerCertFailure::Expired)
+                                },
+                            )
+                        })
                 })
         }
         (
@@ -2522,6 +2538,37 @@ mod tests {
         wrong.excluded[0].leaf_key_package_hash = "other".to_string();
         assert_eq!(
             validate_sibling_v2(&wrong, &ours, &f.revocations, NOW),
+            Err(OwnerRecoveryRefusal::RecoveryProofInvalid)
+        );
+    }
+
+    /// The V2 sibling rule reads the retained certificate as the parent rule
+    /// does: a certificate that does not chain to the owner is no expired
+    /// owner certificate, so the exclusion is no valid sibling even though
+    /// the bytes are past their `not_after`.
+    #[test]
+    fn a_v2_sibling_uses_the_parent_rules_certificate_check() {
+        let mut f = v2_fixture();
+        let stranger = UserKeypair::generate().expect("user");
+        let foreign =
+            AgentCertificate::issue_with_expiry(&stranger, &f.other, Some(CREATOR_NOT_AFTER))
+                .expect("cert");
+        let other_hex = hex::encode(f.other.agent_id().as_bytes());
+        let seat = f.info.members_v2.get_mut(&other_hex).expect("seat");
+        seat.certificate_digest = Some(crate::groups::owner_cert::certificate_digest_hex(&foreign));
+        seat.certificate = Some(foreign);
+        f.info.security_binding = Some("treekem:epoch=3".to_string());
+        f.info
+            .seal_commit_evicting(&f.admin, 500)
+            .expect("seal parent");
+        let theirs = commit_v2_for(&f, excluded_creator(&f), NOW, 3, |_, _| {});
+        let ours = own_branch(&f, &theirs.core);
+        assert!(ours.commit_log.iter().any(|retained| retained
+            .roster
+            .get(&other_hex)
+            .is_some_and(|snapshot| snapshot.certificate.is_some())));
+        assert_eq!(
+            validate_sibling_v2(&theirs, &ours, &f.revocations, NOW),
             Err(OwnerRecoveryRefusal::RecoveryProofInvalid)
         );
     }

@@ -714,7 +714,9 @@ the 21 Nov 2026 #2139 paragraph above.
   gap revision). When it upgrades, the delivery round or a catch-up request
   writes it the frame from the catch-up log, and it applies it. The write set
   is the same set the hold reads, so a revoked or expiry-due seat that is
-  never written the frame never holds it.
+  never written the frame never holds it. The excluded seats are left out of
+  the set explicitly as well; an excluded creator is always expiry-due at the
+  anchor, so the egress guard already leaves it out.
 - **Typed waits.** A commit attempt that fails after its checks (no tree
   loaded, a TreeKEM or seal failure, a frame that is not durable or too
   large) shows `recovery_commit_failed` and retries, instead of the bare
@@ -725,8 +727,8 @@ the 21 Nov 2026 #2139 paragraph above.
   leaf), stays at the parent head and shows `local_seat:
   {"state": "excluded_by_owner_recovery", "remedy":
   "admin_removes_and_reinvites"}`. The state is in memory; after a restart it
-  shows again only when the frame reaches the node again (the author does not
-  resend the notice; a catch-up request can bring it).
+  is in memory, and the received frame is durable: after a restart the node
+  receives the frame again from its own held log and records the state again.
 - **The exit for a leafless seat (#2197, removal half).** A seat is provably
   leafless when it is Active and its committed KeyPackage (bytes whose hash
   the row commits) names no live leaf in the node's own tree; a missing
@@ -735,14 +737,35 @@ the 21 Nov 2026 #2139 paragraph above.
   signed `MemberRemoved` or `MemberBanned` carries no TreeKEM commit and
   changes no epoch or binding, because no path secret reaches a seat without a
   leaf and no key changes. Receivers accept it only by the same proof on their
-  own tree; a roster-only removal of a seat with a leaf is refused. Under the
-  D76 rule a member whose current advert lacks bit 23 holds it (409
+  own tree at the roster's epoch; a roster-only removal of a seat with a leaf
+  is refused. The event carries the target's committed KeyPackage
+  (`target_key_package_b64`, new on `MemberRemoved`, already on
+  `MemberBanned` since #1540), so a member that holds only the KeyPackage hash
+  (one that joined after the exclusion: Welcome and invite rosters carry
+  hashes) checks the same bytes; it accepts them only when they hash to the
+  target's committed hash. A receiver with no matching bytes never reads the
+  seat as leafless: it refuses the event, asks the members that witnessed the
+  join for the KeyPackage, and the sender's redelivery or a catch-up brings
+  the event again. A tree at another epoch than the roster proves nothing.
+  Under the D76 rule a member whose current advert lacks bit 23 holds it (409
   `waiting_for_receiver_upgrade`, `capability: owner_recovery_v2`); a member
   with no current advert is stranded. After the removal, ordinary seals work
-  again, and the agent can be invited again like any removed member. An
-  owner-certified seal still refuses while a revoked or expired member other
-  than the held creator is seated (ADR-0038), so such a member is evicted
-  first.
+  again. An owner-certified seal still refuses while a revoked or expired
+  member other than the held creator is seated (ADR-0038), so such a member is
+  evicted first. Two admins' roster-only removals of the same seat from one
+  parent give the same state hash (the roster root leaves out Removed rows);
+  no key material differs between them, so this is a duplicate, not a silent
+  key fork.
+- **The excluded creator's way back.** Its node cannot apply the removal (it
+  is at the parent head) and cannot seal a self-leave there (ADR-0038). In
+  the `excluded_by_owner_recovery` state, `DELETE /groups/:id` drops only the
+  node's local copy of the group (`"local_only": true,
+  "excluded_by_owner_recovery": true`); nothing is sealed or published and
+  the group's roster does not change. After an admin's removal of the seat, a
+  fresh invite then starts an ordinary join, and its re-admission gives the
+  agent a fresh leaf: it reads traffic after the re-admission and not the
+  traffic sent while it was out. The remedy the status names is
+  `admin_removes_then_local_leave_and_new_invite`.
 - **Old nodes.** An upgraded author does not address a V2 frame to a member
   whose current advert lacks bit 23. If one reaches a 0.49.x node anyway, its
   direct listener hands only `X0XORC1` payloads to owner recovery, so the
@@ -765,7 +788,9 @@ the 21 Nov 2026 #2139 paragraph above.
   the V2 rule, so V1/V2 and V2/V2 recoveries on one retained parent are fork
   evidence on either replica (the existing `fork_quarantine` path). The V2
   sibling rule checks the exclusion's structure, and the expiry at the anchor
-  only when the retained projection still carries the certificate bytes.
+  only when the retained projection still carries the certificate bytes; it
+  uses the parent rule's check (the certificate chains to the owner and is
+  expired, skew included, at the anchor).
 - **Responsive rekey check.** `tree_has_leaf_outside_active_roster` now
   counts only Active seats that are not provably leafless, so a leafless seat
   no longer hides a removed member's leaf.
@@ -782,11 +807,15 @@ the 21 Nov 2026 #2139 paragraph above.
 Tests: `issue2139_owner_recovery_v2` (real TreeKEM trees, the receiver's set
 rule, the D76 hold and the stranded catch-up, restart, the second recovery,
 the typed failure wait, the excluded seat's state, the roster-only removal,
-ban and eviction, and the leaf-count check) and the `owner_recovery` library
+ban and eviction with their bit-23 gates, hash-only receivers, the
+fail-closed leaf proof, the excluded creator's local leave and re-join, and
+the leaf-count check) and the `owner_recovery` library
 tests (prefixes, the 0.49 decoder, the V2 body rules, two receivers with
 clocks 400 s apart, V2 siblings through the dispatch). Wire: the `X0XORC2`
-frame, capability bit 23, and roster-only `MemberRemoved`/`MemberBanned` of a
-seated leafless member. Status: `capability` on the promoted member's wait
+frame, capability bit 23, roster-only `MemberRemoved`/`MemberBanned` of a
+seated leafless member, and the optional `target_key_package_b64` on
+`MemberRemoved` (older receivers ignore it). Route: `DELETE /groups/:id`
+drops only the local copy in the `excluded_by_owner_recovery` state. Status: `capability` on the promoted member's wait
 and on stranded members, `recovery_commit_failed`, `local_seat`.
 
 ## Security claims
