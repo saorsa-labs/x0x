@@ -2423,9 +2423,12 @@ every wait. A wait always names its cause; it does not stop silently.
     and seals nothing. After an admin's removal of the seat, a fresh invite
     starts an ordinary join; the admission is the existing join path, and
     the owner must re-certify the creator first (an owner-certified add
-    needs a valid certificate). `POST /groups/:id/invite` for an agent whose
-    seat is still Active with no leaf answers 409 `{"ok": false, "error":
-    "remove_leafless_seat_first", "agent_id"}`.
+    needs a valid certificate). A named invite (`POST /groups/:id/invite`
+    whose intended joiner is an agent whose seat is still Active with no
+    leaf) answers 409 `{"ok": false, "error": "remove_leafless_seat_first",
+    "agent_id"}`. An open invite mints normally; the creator's join on it
+    before the removal meets the inviter's existing already-a-member
+    refusal, and it can join again after the removal.
 
 **New status codes.**
 

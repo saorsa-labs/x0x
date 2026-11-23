@@ -183,9 +183,10 @@ pub(super) struct OrcState {
     /// authored and the received frames are durable ([`replay_log`]).
     log: replay_log::HeldLog<ORC_LOG_PER_GROUP, true>,
     /// #2139: groups in which a verified V2 recovery excluded this node's
-    /// own seat (its leaf is gone), with that recovery's result head. In
-    /// memory only: a restart learns it again from the next frame.
-    excluded_local: HashMap<String, String>,
+    /// own seat (its leaf is gone), with that recovery's result head and
+    /// parent head. In memory; a restart rebuilds it from the durable frame
+    /// ([`ensure_restored`]).
+    excluded_local: HashMap<String, (String, String)>,
 }
 
 /// #2197: whether a verified V2 recovery excluded this node's own seat in
@@ -206,6 +207,23 @@ pub(in crate::server) async fn local_seat_excluded(
         .orc
         .excluded_local
         .contains_key(stable_group_id)
+}
+
+/// #2197: the parent head of the V2 recovery that excluded this node's
+/// seat in `stable_group_id`, if it did. Reads memory only.
+pub(in crate::server) async fn local_seat_excluded_at(
+    state: &AppState,
+    stable_group_id: &str,
+) -> Option<String> {
+    state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .excluded_local
+        .get(stable_group_id)
+        .map(|(_, parent_head)| parent_head.clone())
 }
 
 /// #2197: forget the `excluded_by_owner_recovery` state after the local
@@ -608,7 +626,7 @@ async fn ensure_restored(state: &AppState) {
         .values()
         .map(|info| (info.stable_group_id().to_string(), info.state_hash.clone()))
         .collect();
-    let mut excluded: Vec<(String, String)> = Vec::new();
+    let mut excluded: Vec<(String, (String, String))> = Vec::new();
     let mut received = Vec::new();
     for bytes in restored.received {
         let excludes_local = orc::decode_frame(&bytes)
@@ -619,7 +637,12 @@ async fn ensure_restored(state: &AppState) {
                 let core = &v2.core;
                 (v2.excluded.iter().any(|seat| seat.agent == local)
                     && heads.get(&core.stable_group_id) == Some(&core.prior_head))
-                .then(|| (core.stable_group_id.clone(), core.commit.state_hash.clone()))
+                .then(|| {
+                    (
+                        core.stable_group_id.clone(),
+                        (core.commit.state_hash.clone(), core.prior_head.clone()),
+                    )
+                })
             });
         match excludes_local {
             Some(entry) => excluded.push(entry),
@@ -4132,7 +4155,10 @@ async fn receive_commit(
             .await
             .orc
             .excluded_local
-            .insert(body.stable_group_id.clone(), body.commit.state_hash.clone());
+            .insert(
+                body.stable_group_id.clone(),
+                (body.commit.state_hash.clone(), body.prior_head.clone()),
+            );
         tracing::warn!(
             group_id = %ng::LogHexId::group(&group_key),
             "ADR 0110 S4: an owner recovery excluded this node's seat; an admin removes it, then leave locally and accept a new invite"
@@ -4645,7 +4671,7 @@ pub(super) async fn status_json(state: &AppState, stable_group_id: &str) -> serd
         .orc
         .excluded_local
         .get(stable_group_id)
-        .map(|result_head| {
+        .map(|(result_head, _)| {
             serde_json::json!({
                 "state": EXCLUDED_BY_OWNER_RECOVERY,
                 "result_head": result_head,

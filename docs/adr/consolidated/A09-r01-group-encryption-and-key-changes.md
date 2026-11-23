@@ -775,9 +775,16 @@ the 21 Nov 2026 #2139 paragraph above.
   agent a fresh leaf: it reads traffic after the re-admission and not the
   traffic sent while it was out. The admission is the existing join path,
   and the owner must re-certify the creator first, because an
-  owner-certified add needs a valid certificate. An invite for that agent
-  minted before the admin's removal is refused (`remove_leafless_seat_first`).
-  The route reads the state before it takes any lock and replays nothing. The remedy the status names is
+  owner-certified add needs a valid certificate. A named invite (one whose
+  intended joiner is that agent) minted before the admin's removal is
+  refused (`remove_leafless_seat_first`). Known limit: an open invite mints
+  normally; the creator's join on it, after its local leave, meets the
+  inviter's existing refusal of a requester that is already a member, and
+  it can join again after the removal. The route reads the state before it
+  takes any lock and replays nothing, and under its locks re-checks that the
+  node is still excluded and its copy is still at the excluding frame's
+  parent head; otherwise the ordinary leave rules apply. The remedy the
+  status names is
   `admin_removes_then_local_leave_and_new_invite`.
 - **Old nodes.** An upgraded author does not address a V2 frame to a member
   whose current advert lacks bit 23. If one reaches a 0.49.x node anyway, its

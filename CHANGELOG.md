@@ -29,9 +29,10 @@ All notable changes to this project will be documented in this file.
   `DELETE /groups/:id` drops only the local copy, and after an admin removes
   the seat a fresh invite starts an ordinary join (the admission is the
   existing join path, and the owner must re-certify the creator first,
-  because an owner-certified add needs a valid certificate). An invite
-  minted for that agent before the removal is refused
-  (`remove_leafless_seat_first`). `MemberRemoved` gains the
+  because an owner-certified add needs a valid certificate). A named invite
+  for that agent minted before the removal is refused
+  (`remove_leafless_seat_first`); an open invite is not checked, and a join
+  on it before the removal is refused as already a member. `MemberRemoved` gains the
   optional `target_key_package_b64` for the roster-only removal (older
   receivers ignore it). A 0.49.x node applies
   nothing from a V2 frame and refuses a roster-only removal of a seated

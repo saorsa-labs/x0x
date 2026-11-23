@@ -1938,7 +1938,9 @@ async fn a_replayed_v2_frame_records_no_exclusion() {
 /// which records no state.
 #[tokio::test]
 async fn a_bogus_v2_commit_records_no_exclusion() {
-    let (_cdir, creator_node, _, _) = recovery_fixture().await;
+    use super::super::super::rebind::restart_tests::{hold_persisted, offline_daemon};
+    let cdir = tempfile::tempdir().unwrap();
+    let creator_node = offline_daemon(cdir.path(), None).await.unwrap();
     let creator_keys = creator_node.agent.identity().agent_keypair();
     let f = v2_fixture(Shape {
         creator: Some(creator_keys),
@@ -1954,11 +1956,7 @@ async fn a_bogus_v2_commit_records_no_exclusion() {
             .await
             .verify_and_insert(record, None);
     }
-    creator_node
-        .named_groups
-        .write()
-        .await
-        .insert(f.stable.clone(), f.info.clone());
+    hold_persisted(&creator_node, &f.info).await.unwrap();
     creator_node.treekem_groups.write().await.insert(
         f.stable.clone(),
         Arc::new(tokio::sync::Mutex::new(f.creator_tree)),
@@ -2012,4 +2010,165 @@ async fn a_bogus_v2_commit_records_no_exclusion() {
         ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid)
     );
     assert!(status_json(&creator_node, &f.stable).await["local_seat"].is_null());
+    // Nothing durable either: a restart rebuilds no exclusion.
+    creator_node.agent.shutdown().await;
+    drop(creator_node);
+    let restarted = offline_daemon(cdir.path(), None).await.unwrap();
+    assert!(
+        !local_seat_excluded(&restarted, &f.stable).await,
+        "a refused frame is never rebuilt as an exclusion"
+    );
+}
+
+/// The excluded creator's node, durable, with the exclusion recorded; the
+/// node is shut down. Returns its directory handle, the fixture's stable
+/// id, the author and the author's head after T's eviction.
+async fn excluded_then_stopped(
+    dir: &std::path::Path,
+) -> (String, Arc<AppState>, GroupInfo, GroupInfo) {
+    use super::super::super::rebind::restart_tests::{hold_persisted, offline_daemon};
+    let first = offline_daemon(dir, None).await.unwrap();
+    let f = v2_fixture(Shape {
+        creator: Some(first.agent.identity().agent_keypair()),
+        tolerated_leafless: true,
+        ..Shape::default()
+    })
+    .await;
+    for record in f.state.agent.revocation_set().read().await.all_records() {
+        let _ = first
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None);
+    }
+    hold_persisted(&first, &f.info).await.unwrap();
+    first.treekem_groups.write().await.insert(
+        f.stable.clone(),
+        Arc::new(tokio::sync::Mutex::new(f.creator_tree)),
+    );
+    attempt_on(&f.state, &f.stable, &f.info).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let bytes = frame.unwrap();
+    let commit = orc::decode_frame(&bytes)
+        .ok()
+        .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+        .unwrap();
+    assert_eq!(
+        receive_commit(&first, f.state.agent.agent_id(), commit, &bytes).await,
+        ReceiveOutcome::NotApplicable
+    );
+    assert!(local_seat_excluded(&first, &f.stable).await);
+    let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+    let _ = ng::owner_certified_seal_with_eviction(&f.state, &f.stable, &local_hex).await;
+    let later = f.state.named_groups.read().await[&f.stable].clone();
+    assert_ne!(later.state_hash, f.info.state_hash);
+    first.agent.shutdown().await;
+    drop(first);
+    (f.stable, f.state, later, f.info)
+}
+
+async fn leave(state: &Arc<AppState>, stable: &str) -> (StatusCode, serde_json::Value) {
+    let response = ng::leave_group(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(stable.to_string()),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+/// A restart with the node's copy at another head than the excluding
+/// frame's parent rebuilds no exclusion.
+#[tokio::test]
+async fn a_restart_on_a_moved_head_rebuilds_no_exclusion() {
+    use super::super::super::rebind::restart_tests::{hold_persisted, offline_daemon};
+    let dir = tempfile::tempdir().unwrap();
+    let (stable, _author, _later, parent) = excluded_then_stopped(dir.path()).await;
+    // A copy at the parent's revision with another state hash (a sibling
+    // head): the frame is still above the loaded head, so only the head
+    // check stops the rebuild.
+    let mut sibling = parent.clone();
+    sibling.description = "a sibling head".to_string();
+    sibling.recompute_state_hash();
+    assert_ne!(sibling.state_hash, parent.state_hash);
+    {
+        let moved = offline_daemon(dir.path(), None).await.unwrap();
+        hold_persisted(&moved, &sibling).await.unwrap();
+        moved.agent.shutdown().await;
+    }
+    let restarted = offline_daemon(dir.path(), None).await.unwrap();
+    assert!(!local_seat_excluded(&restarted, &stable).await);
+}
+
+/// The leave re-checks under its locks: when the node's copy moved off the
+/// excluding frame's parent head after the state was recorded, the
+/// ordinary leave rules apply, not the local-only drop.
+#[tokio::test]
+async fn the_local_leave_rechecks_the_head_under_the_lock() {
+    use super::super::super::rebind::restart_tests::offline_daemon;
+    let dir = tempfile::tempdir().unwrap();
+    let (stable, _author, later, _parent) = excluded_then_stopped(dir.path()).await;
+    let restarted = offline_daemon(dir.path(), None).await.unwrap();
+    assert!(local_seat_excluded(&restarted, &stable).await);
+    restarted
+        .named_groups
+        .write()
+        .await
+        .insert(stable.clone(), later);
+    let (_status, body) = leave(&restarted, &stable).await;
+    assert!(
+        body.get("excluded_by_owner_recovery").is_none(),
+        "a moved head takes the ordinary leave, not the local-only drop: {body}"
+    );
+}
+
+/// The exclusion state is read before the leave takes the group's
+/// membership lock. With that lock held elsewhere, the leave's read still
+/// rebuilds the state from the durable frame (visible in the status), and
+/// the leave completes once the lock is released. A leave that read the
+/// state only after taking its locks would show nothing while it waits.
+#[tokio::test]
+async fn the_local_leave_reads_the_exclusion_before_its_locks() {
+    use super::super::super::rebind::restart_tests::offline_daemon;
+    let dir = tempfile::tempdir().unwrap();
+    let (stable, _author, _later, _parent) = excluded_then_stopped(dir.path()).await;
+    let restarted = offline_daemon(dir.path(), None).await.unwrap();
+    let lock = ng::group_membership_lock(&restarted, &stable).await;
+    let held = lock.lock().await;
+    let task = {
+        let state = Arc::clone(&restarted);
+        let stable = stable.clone();
+        tokio::spawn(async move { leave(&state, &stable).await })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if !status_json(&restarted, &stable).await["local_seat"].is_null() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the leave did not read the exclusion before the lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !task.is_finished(),
+        "the leave waits for the membership lock"
+    );
+    drop(held);
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(20), task)
+        .await
+        .expect("the leave completes")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["excluded_by_owner_recovery"], true);
 }

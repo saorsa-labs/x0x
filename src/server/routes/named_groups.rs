@@ -35046,6 +35046,15 @@ pub(in crate::server) async fn leave_group(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
+    // The exclusion's parent head, read under the membership lock but
+    // before the `named_groups` read (no inner lock is taken while that read
+    // guard is held).
+    let excluded_parent = match excluded_stable.as_deref() {
+        Some(stable) => {
+            revocation_eviction::owner_recovery::local_seat_excluded_at(&state, stable).await
+        }
+        None => None,
+    };
     let groups = state.named_groups.read().await;
     // #1166 S3: lookup 404 → withdrawn 409 → the ACTIVE-seat gate run
     // in the group-access core (`admit_self_leave`), under this lock
@@ -35073,7 +35082,12 @@ pub(in crate::server) async fn leave_group(
     // ends the seat for the group, and a fresh invite then seats this agent
     // again as an ordinary join.
     let stable_id = info.stable_group_id().to_string();
-    if excluded_stable.as_deref() == Some(stable_id.as_str()) {
+    // Re-checked under the locks: the node is still excluded and its copy is
+    // still at the excluding frame's parent head. A head that moved since
+    // the read above takes the ordinary leave rules.
+    let still_excluded = excluded_stable.as_deref() == Some(stable_id.as_str())
+        && excluded_parent.as_deref() == Some(info.state_hash.as_str());
+    if still_excluded {
         let name = info.name.clone();
         drop(groups);
         if !drop_local_named_group_state(
