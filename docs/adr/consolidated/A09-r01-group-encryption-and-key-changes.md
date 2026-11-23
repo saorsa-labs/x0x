@@ -715,20 +715,27 @@ the 21 Nov 2026 #2139 paragraph above.
   writes it the frame from the catch-up log, and it applies it. The write set
   is the same set the hold reads, so a revoked or expiry-due seat that is
   never written the frame never holds it. The excluded seats are left out of
-  the set explicitly as well; an excluded creator is always expiry-due at the
-  anchor, so the egress guard already leaves it out.
+  the set explicitly as well; the guard reads the signed anchor as its clock,
+  and an excluded creator is expiry-due at the anchor, so the guard already
+  leaves it out.
 - **Typed waits.** A commit attempt that fails after its checks (no tree
   loaded, a TreeKEM or seal failure, a frame that is not durable or too
   large) shows `recovery_commit_failed` and retries, instead of the bare
   `mandate_received`.
 - **The excluded seat's own node.** The author writes the V2 frame once to
   each excluded seat as a notice; the commit holds no key material for it.
-  That node verifies the frame, does not apply it (the commit removes its own
-  leaf), stays at the parent head and shows `local_seat:
+  That node runs every check a survivor runs before the apply (signatures,
+  mandate, parent head, exclusion rule, and on its own tree the removal
+  list, which must name its own leaf); only the commit's processing cannot
+  be checked there. So only the owner-mandated actor can put a node in this
+  state. The node does not apply the frame, stays at the parent head and
+  shows `local_seat:
   {"state": "excluded_by_owner_recovery", "remedy":
   "admin_removes_and_reinvites"}`. The state is in memory; after a restart it
-  is in memory, and the received frame is durable: after a restart the node
-  receives the frame again from its own held log and records the state again.
+  is in memory; the frame is made durable after the checks pass, and after a
+  restart the state is rebuilt from it (without replaying it) while the
+  group is still at the frame's parent head. A frame replayed after the
+  local leave, or on a later head, records nothing.
 - **The exit for a leafless seat (#2197, removal half).** A seat is provably
   leafless when it is Active and its committed KeyPackage (bytes whose hash
   the row commits) names no live leaf in the node's own tree; a missing
@@ -743,7 +750,7 @@ the 21 Nov 2026 #2139 paragraph above.
   `MemberBanned` since #1540), so a member that holds only the KeyPackage hash
   (one that joined after the exclusion: Welcome and invite rosters carry
   hashes) checks the same bytes; it accepts them only when they hash to the
-  target's committed hash. A receiver with no matching bytes never reads the
+  target's committed hash (at most 32 KiB). A receiver with no matching bytes never reads the
   seat as leafless: it refuses the event, asks the members that witnessed the
   join for the KeyPackage, and the sender's redelivery or a catch-up brings
   the event again. A tree at another epoch than the roster proves nothing.
@@ -752,7 +759,9 @@ the 21 Nov 2026 #2139 paragraph above.
   with no current advert is stranded. After the removal, ordinary seals work
   again. An owner-certified seal still refuses while a revoked or expired
   member other than the held creator is seated (ADR-0038), so such a member is
-  evicted first. Two admins' roster-only removals of the same seat from one
+  evicted first. The roster-only removal and eviction are kept in the
+  author's catch-up log and resent, so a receiver that refused one gets it
+  again from the author. Two admins' roster-only removals of the same seat from one
   parent give the same state hash (the roster root leaves out Removed rows);
   no key material differs between them, so this is a duplicate, not a silent
   key fork.
@@ -764,7 +773,11 @@ the 21 Nov 2026 #2139 paragraph above.
   the group's roster does not change. After an admin's removal of the seat, a
   fresh invite then starts an ordinary join, and its re-admission gives the
   agent a fresh leaf: it reads traffic after the re-admission and not the
-  traffic sent while it was out. The remedy the status names is
+  traffic sent while it was out. The admission is the existing join path,
+  and the owner must re-certify the creator first, because an
+  owner-certified add needs a valid certificate. An invite for that agent
+  minted before the admin's removal is refused (`remove_leafless_seat_first`).
+  The route reads the state before it takes any lock and replays nothing. The remedy the status names is
   `admin_removes_then_local_leave_and_new_invite`.
 - **Old nodes.** An upgraded author does not address a V2 frame to a member
   whose current advert lacks bit 23. If one reaches a 0.49.x node anyway, its

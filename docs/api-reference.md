@@ -2420,7 +2420,12 @@ every wait. A wait always names its cause; it does not stop silently.
     (restored after a restart from the durable received frame). In that
     state `DELETE /groups/:id` answers `{"ok": true, "left", "local_only":
     true, "excluded_by_owner_recovery": true}`: it drops only the local copy
-    and seals nothing; a fresh invite then joins the agent again.
+    and seals nothing. After an admin's removal of the seat, a fresh invite
+    starts an ordinary join; the admission is the existing join path, and
+    the owner must re-certify the creator first (an owner-certified add
+    needs a valid certificate). `POST /groups/:id/invite` for an agent whose
+    seat is still Active with no leaf answers 409 `{"ok": false, "error":
+    "remove_leafless_seat_first", "agent_id"}`.
 
 **New status codes.**
 

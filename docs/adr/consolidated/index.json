@@ -68,7 +68,7 @@
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "0b571b4f6edaed8fc2a57d709a043ccfc7551212776b120130da6d0450d5ef68"
+      "sha256": "6b72401b6d9f5fe4f4c44d1f1f089b388013ca0069f4c7f37d3ee381e1b88b92"
     },
     {
       "id": "A10",
@@ -110,7 +110,7 @@
       "revision": 1,
       "path": "A15-r01-compatibility-validation-and-decision-rules.md",
       "title": "Compatibility Validation and Decision Rules",
-      "sha256": "5acf3885d760f45dd4e4ea76a00c10f76b166c0cd2dede76e8abaa928620547d"
+      "sha256": "de794573f5d7ef81674feb999254d92d5e01dc29cc00da0bff857e343b3a3853"
     }
   ]
 }

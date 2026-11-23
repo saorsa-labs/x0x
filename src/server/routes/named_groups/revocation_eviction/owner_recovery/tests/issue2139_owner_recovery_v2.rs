@@ -1266,6 +1266,17 @@ async fn a_revoked_leafless_creator_is_evicted_roster_only() {
             .err()
             .map(|(status, Json(body))| (*status, body.clone()))
     );
+    // The roster-only eviction is logged for catch-up with the creator's
+    // KeyPackage, and resent.
+    let logged = logged_removal(&f.state, &f.stable, &creator_hex).await;
+    assert!(matches!(
+        logged,
+        crate::server::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: Some(_),
+            treekem_commit_b64: None,
+            ..
+        }
+    ));
     // T (revoked, with a leaf) is evicted in the same operation with its
     // own TreeKEM commit; the creator's eviction adds none.
     assert!(!after.has_active_member(&hex::encode(f.tolerated.as_bytes())));
@@ -1393,15 +1404,27 @@ async fn a_hash_only_receiver_applies_the_creators_roster_only_removal() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let author_head = f.state.named_groups.read().await[&f.stable].clone();
-    let mut event = last_roster_only_removal(&f, &creator_hex).await;
-    let carried = author_head.members_v2[&creator_hex]
-        .treekem_key_package_b64
-        .clone();
+    // The event the route emitted, from the author's catch-up log: it
+    // carries the creator's committed KeyPackage.
+    let event = logged_removal(&f.state, &f.stable, &creator_hex).await;
     assert!(
-        carried.is_some(),
-        "the author keeps the removed row's KeyPackage"
+        matches!(
+            &event,
+            crate::server::NamedGroupMetadataEvent::MemberRemoved {
+                target_key_package_b64: Some(_),
+                ..
+            }
+        ),
+        "the route carries the KeyPackage"
     );
-    let bare = event.clone();
+    let mut bare = event.clone();
+    if let crate::server::NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64,
+        ..
+    } = &mut bare
+    {
+        *target_key_package_b64 = None;
+    }
     let refused =
         ng::apply_named_group_metadata_event(&receiver, bare, f.state.agent.agent_id(), true, None)
             .await;
@@ -1409,13 +1432,6 @@ async fn a_hash_only_receiver_applies_the_creators_roster_only_removal() {
         !refused.accepted,
         "no KeyPackage bytes: refused, fail closed"
     );
-    if let crate::server::NamedGroupMetadataEvent::MemberRemoved {
-        target_key_package_b64,
-        ..
-    } = &mut event
-    {
-        *target_key_package_b64 = carried;
-    }
     let applied = ng::apply_named_group_metadata_event(
         &receiver,
         event,
@@ -1639,6 +1655,21 @@ async fn the_excluded_creator_leaves_locally_and_rejoins_by_invite() {
     // Traffic while the creator is out.
     let while_out = f.tree.lock().await.encrypt_message(b"while out").unwrap();
 
+    // An invite for the creator before the admin's removal is refused with
+    // a typed answer: the seat must be removed first.
+    let early = ng::mint_invite_transaction(
+        &f.state,
+        &f.stable,
+        3_600,
+        Some(f.creator),
+        x0x::groups::InviteOrigin::Explicit,
+        true,
+    )
+    .await;
+    assert!(matches!(
+        early,
+        Err(ng::MintInviteRefusal::LeaflessSeatNotRemoved { .. })
+    ));
     // The admin removes the creator's seat (T is evicted first).
     let creator_hex = hex::encode(f.creator.as_bytes());
     let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
@@ -1743,4 +1774,242 @@ async fn the_excluded_creator_leaves_locally_and_rejoins_by_invite() {
         rejoined.decrypt_message(&while_out).is_err(),
         "nothing sent while it was out"
     );
+}
+
+/// The `MemberRemoved` of `target` in this node's catch-up log.
+async fn logged_removal(
+    state: &AppState,
+    stable: &str,
+    target: &str,
+) -> crate::server::NamedGroupMetadataEvent {
+    state.treekem_event_log.read().await[stable]
+        .iter()
+        .find(|event| {
+            matches!(
+                event,
+                crate::server::NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+                    if agent_id == target
+            )
+        })
+        .cloned()
+        .expect("the removal is logged for catch-up")
+}
+
+/// Restart-shaped state: the creator's node recorded the exclusion, its
+/// frame is durable, and the node restarts. `DELETE /groups/:id` answers
+/// within the timeout with the local-only leave: the state is rebuilt from
+/// the durable frame before the route takes any lock, and nothing is
+/// replayed under it. Red on e7bd0514, where the route replayed the stash
+/// under the group's membership lock and hung.
+#[tokio::test]
+async fn a_restarted_excluded_creator_leaves_locally_without_a_deadlock() {
+    use super::super::super::rebind::restart_tests::{hold_persisted, offline_daemon};
+    let dir = tempfile::tempdir().unwrap();
+    let first = offline_daemon(dir.path(), None).await.unwrap();
+    let f = v2_fixture(Shape {
+        creator: Some(first.agent.identity().agent_keypair()),
+        tolerated_leafless: true,
+        ..Shape::default()
+    })
+    .await;
+    for record in f.state.agent.revocation_set().read().await.all_records() {
+        let _ = first
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None);
+    }
+    hold_persisted(&first, &f.info).await.unwrap();
+    first.treekem_groups.write().await.insert(
+        f.stable.clone(),
+        Arc::new(tokio::sync::Mutex::new(f.creator_tree)),
+    );
+    attempt_on(&f.state, &f.stable, &f.info).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let bytes = frame.unwrap();
+    let commit = orc::decode_frame(&bytes)
+        .ok()
+        .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+        .unwrap();
+    assert_eq!(
+        receive_commit(&first, f.state.agent.agent_id(), commit, &bytes).await,
+        ReceiveOutcome::NotApplicable
+    );
+    assert_eq!(
+        status_json(&first, &f.stable).await["local_seat"]["state"],
+        EXCLUDED_BY_OWNER_RECOVERY
+    );
+    first.agent.shutdown().await;
+    drop(first);
+
+    let restarted = offline_daemon(dir.path(), None).await.unwrap();
+    assert!(restarted.named_groups.read().await.contains_key(&f.stable));
+    let leave = ng::leave_group(
+        State(Arc::clone(&restarted)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(f.stable.clone()),
+    );
+    let response = tokio::time::timeout(std::time::Duration::from_secs(20), leave)
+        .await
+        .expect("the local leave does not hang")
+        .into_response();
+    let status = response.status();
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["excluded_by_owner_recovery"], true);
+    assert!(!restarted.named_groups.read().await.contains_key(&f.stable));
+}
+
+/// A V2 frame replayed after the excluded node left locally, or once the
+/// node holds a later head (as after a re-join), records no state: the
+/// exclusion is recorded only after every check a survivor makes on the
+/// frame has passed here.
+#[tokio::test]
+async fn a_replayed_v2_frame_records_no_exclusion() {
+    let (_cdir, creator_node, _, _) = recovery_fixture().await;
+    let creator_keys = creator_node.agent.identity().agent_keypair();
+    let f = v2_fixture(Shape {
+        creator: Some(creator_keys),
+        tolerated_leafless: true,
+        ..Shape::default()
+    })
+    .await;
+    for record in f.state.agent.revocation_set().read().await.all_records() {
+        let _ = creator_node
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None);
+    }
+    attempt_on(&f.state, &f.stable, &f.info).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let bytes = frame.unwrap();
+    let author = f.state.agent.agent_id();
+    let decode = || {
+        orc::decode_frame(&bytes)
+            .ok()
+            .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+            .unwrap()
+    };
+    // No local copy (after the local leave).
+    creator_node.named_groups.write().await.remove(&f.stable);
+    assert_eq!(
+        receive_commit(&creator_node, author, decode(), &bytes).await,
+        ReceiveOutcome::NotApplicable
+    );
+    assert!(status_json(&creator_node, &f.stable).await.is_null());
+    // A later head: the author's head after the recovery and T's eviction
+    // (as a re-joined node holds). The frame no longer chains there.
+    let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+    let _ = ng::owner_certified_seal_with_eviction(&f.state, &f.stable, &local_hex).await;
+    let later = f.state.named_groups.read().await[&f.stable].clone();
+    assert_ne!(
+        later.state_revision,
+        f.info.state_revision + 1,
+        "the head moved past the recovery"
+    );
+    creator_node
+        .named_groups
+        .write()
+        .await
+        .insert(f.stable.clone(), later);
+    creator_node.treekem_groups.write().await.insert(
+        f.stable.clone(),
+        Arc::new(tokio::sync::Mutex::new(f.creator_tree)),
+    );
+    let outcome = receive_commit(&creator_node, author, decode(), &bytes).await;
+    assert_ne!(outcome, ReceiveOutcome::Applied);
+    assert!(
+        status_json(&creator_node, &f.stable).await["local_seat"].is_null(),
+        "no exclusion on a later head: {outcome:?}"
+    );
+}
+
+/// A V2 frame that passes the signature, mandate, parent and exclusion
+/// checks but whose commit does not remove the excluded node's leaf (the
+/// mandated actor sent a bogus commit) is refused on the excluded node,
+/// which records no state.
+#[tokio::test]
+async fn a_bogus_v2_commit_records_no_exclusion() {
+    let (_cdir, creator_node, _, _) = recovery_fixture().await;
+    let creator_keys = creator_node.agent.identity().agent_keypair();
+    let f = v2_fixture(Shape {
+        creator: Some(creator_keys),
+        tolerated_leafless: true,
+        ..Shape::default()
+    })
+    .await;
+    for record in f.state.agent.revocation_set().read().await.all_records() {
+        let _ = creator_node
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None);
+    }
+    creator_node
+        .named_groups
+        .write()
+        .await
+        .insert(f.stable.clone(), f.info.clone());
+    creator_node.treekem_groups.write().await.insert(
+        f.stable.clone(),
+        Arc::new(tokio::sync::Mutex::new(f.creator_tree)),
+    );
+    attempt_on(&f.state, &f.stable, &f.info).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let Ok(orc::OwnerRecoveryFrameV1::CommitV2(signed)) = orc::decode_frame(&frame.unwrap()) else {
+        panic!("V2");
+    };
+    // A real commit of another tree that removes another leaf index than
+    // the creator's (the creator holds leaf 1 here; this removes leaf 2).
+    // A commit that removed leaf 1 would pass every check this node can
+    // make; only processing it, which the excluded node cannot do, would
+    // show it is foreign.
+    let (mut other, seats) = in_step(
+        b"2139-bogus",
+        agent(0xB0),
+        &[(agent(0xB1), 0xB1), (agent(0xB2), 0xB2)],
+    );
+    let bogus = other
+        .remove_members_verified(&[(seats[1].id, seats[1].kp.as_slice())])
+        .unwrap();
+    let mut body = signed.body.clone();
+    let orc::OwnerRecoveryCryptoV1::TreeKem { next_epoch, .. } = body.core.crypto else {
+        panic!("TreeKEM");
+    };
+    body.core.crypto = orc::OwnerRecoveryCryptoV1::TreeKem {
+        commits: vec![bogus.clone()],
+        next_epoch,
+    };
+    let mut next = f.info.clone();
+    next.roster_revision = body.core.roster_revision;
+    orc::apply_roster_change(&mut next, &body.core);
+    next.secret_epoch = next_epoch;
+    next.security_binding = Some(orc::treekem_binding_v2(next_epoch, &bogus));
+    let keys = f.state.agent.identity().agent_keypair();
+    body.core.commit = x0x::groups::crypto_exclusion::CommitHeaderV1::from(
+        &next
+            .seal_commit_evicting(keys, x0x::dm::now_unix_ms())
+            .unwrap(),
+    );
+    let forged = orc::sign_commit_v2(body, keys).unwrap();
+    let bytes = orc::encode_frame(&orc::OwnerRecoveryFrameV1::CommitV2(Box::new(forged))).unwrap();
+    let commit = orc::decode_frame(&bytes)
+        .ok()
+        .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+        .unwrap();
+    let outcome = receive_commit(&creator_node, f.state.agent.agent_id(), commit, &bytes).await;
+    assert_eq!(
+        outcome,
+        ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid)
+    );
+    assert!(status_json(&creator_node, &f.stable).await["local_seat"].is_null());
 }

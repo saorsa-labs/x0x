@@ -26282,6 +26282,11 @@ pub(in crate::server) enum MintInviteRefusal {
     /// the secret was NOT handed out (rolled back, or visible-but-not-
     /// durable with the durability-retry flag set).
     NotDurable,
+    /// #2197: the intended joiner still holds an Active seat with no
+    /// TreeKEM leaf (a creator an owner recovery V2 excluded). Its join
+    /// would be refused as already a member; an admin removes the seat
+    /// first.
+    LeaflessSeatNotRemoved { agent_id: String },
 }
 
 /// r4 (Codex r3 addendum item 6): the SINGLE actor-aware MINT
@@ -26324,6 +26329,16 @@ pub(in crate::server) async fn mint_invite_transaction(
         .get(group_key)
         .cloned()
         .ok_or(MintInviteRefusal::NotDurable)?;
+    // #2197: an invite for an agent whose seat is Active with no leaf
+    // cannot seat it; the seat must be removed first.
+    if let Some(joiner) = intended_joiner {
+        let joiner_hex = hex::encode(joiner.as_bytes());
+        if treekem_seat_is_provably_leafless(state, group_key, &info, &joiner_hex).await {
+            return Err(MintInviteRefusal::LeaflessSeatNotRemoved {
+                agent_id: joiner_hex,
+            });
+        }
+    }
     let mut next = info;
     // r3 Fable 1 fence (same axis as `home_mutation_requires_durable`):
     // a countersigned owner-axis link is a device-admission credential.
@@ -26404,6 +26419,15 @@ fn mint_refusal_response(
     refusal: MintInviteRefusal,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match refusal {
+        MintInviteRefusal::LeaflessSeatNotRemoved { agent_id } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "remove_leafless_seat_first",
+                "agent_id": agent_id,
+                "detail": "this agent's seat is Active with no TreeKEM leaf (excluded by an owner recovery); remove the seat, then invite it again",
+            })),
+        ),
         MintInviteRefusal::CapReached { limit } => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
@@ -34394,6 +34418,17 @@ async fn owner_certified_seal_with_eviction(
                     std::slice::from_ref(&evict_hex),
                 );
             }
+            // As the roster-only removal route: the author keeps the event
+            // for catch-up and resends it, so a receiver that refused it
+            // (no KeyPackage yet) gets it again from this node.
+            remember_treekem_membership_event(state, &event).await;
+            spawn_group_control_event_redelivery(
+                state,
+                &metadata_topic,
+                &delivery_roster,
+                &event,
+                std::slice::from_ref(&evict_hex),
+            );
             evicted_total.push(evict_hex.clone());
             last_commit = Some(commit);
             continue;
@@ -34989,6 +35024,22 @@ pub(in crate::server) async fn leave_group(
     let local_agent_hex = hex::encode(local_agent.as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    // #2197: read the `excluded_by_owner_recovery` state before any lock.
+    // Its read restores the state from the durable frame after a restart
+    // and replays nothing, so it takes no membership or `named_groups`
+    // write lock.
+    let excluded_stable = {
+        let stable = state
+            .named_groups
+            .read()
+            .await
+            .get(&id)
+            .map(|info| info.stable_group_id().to_string())
+            .unwrap_or_else(|| id.clone());
+        revocation_eviction::owner_recovery::local_seat_excluded(&state, &stable)
+            .await
+            .then_some(stable)
+    };
 
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
@@ -35022,7 +35073,7 @@ pub(in crate::server) async fn leave_group(
     // ends the seat for the group, and a fresh invite then seats this agent
     // again as an ordinary join.
     let stable_id = info.stable_group_id().to_string();
-    if revocation_eviction::owner_recovery::local_seat_excluded(&state, &stable_id).await {
+    if excluded_stable.as_deref() == Some(stable_id.as_str()) {
         let name = info.name.clone();
         drop(groups);
         if !drop_local_named_group_state(
@@ -37745,6 +37796,10 @@ pub(in crate::server) fn roster_only_ban_key_package(
         .and_then(current_member_treekem_key_package)
 }
 
+/// #2197: a carried KeyPackage longer than this (base64) is ignored. A
+/// TreeKEM KeyPackage is a few KiB.
+const MAX_CARRIED_KEY_PACKAGE_B64: usize = 32 * 1024;
+
 /// #2197: what this node's own tree proves about a seated member's leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum SeatLeaf {
@@ -37790,7 +37845,10 @@ pub(in crate::server) async fn treekem_seat_leaf(
     let Some(expected) = member.treekem_key_package_hash.as_deref() else {
         return SeatLeaf::NotAbsent;
     };
-    let matches = |kp_b64: &str| blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected;
+    let matches = |kp_b64: &str| {
+        kp_b64.len() <= MAX_CARRIED_KEY_PACKAGE_B64
+            && blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
+    };
     let kp_b64 = current_member_treekem_key_package(member)
         .filter(|kp_b64| matches(kp_b64))
         .or_else(|| carried.filter(|kp_b64| matches(kp_b64)).map(str::to_string));

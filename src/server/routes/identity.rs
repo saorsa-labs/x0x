@@ -839,6 +839,9 @@ pub(in crate::server) async fn get_agent_card(
                         crate::server::routes::named_groups::MintInviteRefusal::NotDurable => {
                             "card_invite_omitted_not_durable"
                         }
+                        crate::server::routes::named_groups::MintInviteRefusal::LeaflessSeatNotRemoved {
+                            ..
+                        } => "card_invite_omitted_leafless_seat_not_removed",
                         crate::server::routes::named_groups::MintInviteRefusal::TooLarge { .. }
                         | crate::server::routes::named_groups::MintInviteRefusal::TooLargeBytes {
                             ..

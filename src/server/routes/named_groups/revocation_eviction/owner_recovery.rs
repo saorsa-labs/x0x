@@ -191,14 +191,13 @@ pub(super) struct OrcState {
 /// #2197: whether a verified V2 recovery excluded this node's own seat in
 /// `stable_group_id` (the `excluded_by_owner_recovery` state).
 pub(in crate::server) async fn local_seat_excluded(
-    state: &Arc<AppState>,
+    state: &AppState,
     stable_group_id: &str,
 ) -> bool {
     // After a restart the state comes back from the durable received
-    // frame: the restore puts it in the stash, and its receipt records the
-    // state again.
+    // frame ([`ensure_restored`]). Nothing here replays a frame: a route
+    // that calls this may then take the group's membership lock.
     ensure_restored(state).await;
-    retry_stash(state).await;
     state
         .revocation_evictions
         .inner
@@ -598,8 +597,38 @@ async fn ensure_restored(state: &AppState) {
     restore_mandates(state).await;
     let restored = replay_log::ensure_restored(state, replay_log::RECOVERY_EXTENSION, held).await;
     let local = *state.agent.agent_id().as_bytes();
-    let mut inner = state.revocation_evictions.inner.lock().await;
+    // #2197: a received V2 frame that excludes this node was written only
+    // after its exclusion proof passed ([`receive_commit`]). Its state is
+    // rebuilt from it while the group is still at the frame's parent head;
+    // the frame is not replayed.
+    let heads: HashMap<String, String> = state
+        .named_groups
+        .read()
+        .await
+        .values()
+        .map(|info| (info.stable_group_id().to_string(), info.state_hash.clone()))
+        .collect();
+    let mut excluded: Vec<(String, String)> = Vec::new();
+    let mut received = Vec::new();
     for bytes in restored.received {
+        let excludes_local = orc::decode_frame(&bytes)
+            .ok()
+            .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+            .and_then(|commit| {
+                let v2 = commit.v2()?;
+                let core = &v2.core;
+                (v2.excluded.iter().any(|seat| seat.agent == local)
+                    && heads.get(&core.stable_group_id) == Some(&core.prior_head))
+                .then(|| (core.stable_group_id.clone(), core.commit.state_hash.clone()))
+            });
+        match excludes_local {
+            Some(entry) => excluded.push(entry),
+            None => received.push(bytes),
+        }
+    }
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner.orc.excluded_local.extend(excluded);
+    for bytes in received {
         // The frame is self-authenticating; its actor is the sender. It
         // passed every receiver check before it was written.
         let Some(commit) = orc::decode_frame(&bytes)
@@ -1019,8 +1048,23 @@ async fn drive_mandates(state: &Arc<AppState>) {
 /// commit, the only carrier of that epoch's path secrets, must never be
 /// written to it. A seat whose expiry is not yet due is served as before.
 async fn recovery_write_allowed(state: &AppState, info: &GroupInfo, agent: &AgentId) -> bool {
-    !recipient_expiry_due(info, agent, x0x::groups::owner_cert::restore_clock_now())
-        && write_allowed(state, agent).await
+    recovery_write_allowed_at(
+        state,
+        info,
+        agent,
+        x0x::groups::owner_cert::restore_clock_now(),
+    )
+    .await
+}
+
+/// [`recovery_write_allowed`] at the clock value `now_unix`.
+async fn recovery_write_allowed_at(
+    state: &AppState,
+    info: &GroupInfo,
+    agent: &AgentId,
+    now_unix: u64,
+) -> bool {
+    !recipient_expiry_due(info, agent, now_unix) && write_allowed(state, agent).await
 }
 
 /// #2139: a received TreeKEM recovery may remove the revoked seats' leaves
@@ -1611,7 +1655,9 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
     let capabilities = state.agent.capability_store();
     let mut written = Vec::new();
     for id in survivors(&info, &local, &skip) {
-        if recovery_write_allowed(state, &info, &AgentId(id)).await {
+        // The guard reads the same clock value as the exclusion (the
+        // signed anchor), so an excluded seat is also expiry-due here.
+        if recovery_write_allowed_at(state, &info, &AgentId(id), anchor).await {
             written.push(id);
         }
     }
@@ -4042,20 +4088,41 @@ async fn receive_commit(
     let ext = replay_log::RECOVERY_EXTENSION;
     let stable = body.stable_group_id.clone();
     let at = (body.next_revision, body.commit.state_hash.as_str());
-    if !replay_log::write_received(state, ext, held, &stable, at, &frame_bytes).await {
-        return ReceiveOutcome::Retained { verified: true };
-    }
-    // #2139: a verified V2 recovery that excludes this node's own seat
-    // cannot apply here (the commit removes this node's leaf). The node
-    // records the typed state and stays at the parent head. The frame is
-    // durable above, so a restart restores the state from it. The exit:
-    // an admin removes the seat, this node drops its local copy
-    // (`DELETE /groups/:id`), and a fresh invite seats it again.
+    // #2139/#2197: a V2 recovery that excludes this node's own seat cannot
+    // apply here (its commit removes this node's leaf). Everything a
+    // survivor checks before the apply has passed above (signatures, the
+    // mandate, the parent head, the exclusion rule), and the commit's
+    // removal list is checked on this node's own tree here: it must remove
+    // exactly the targets' leaves, this node's among them. Only the
+    // commit's processing cannot be checked on this node. So only the
+    // owner-mandated actor can put a node in this state. The frame is made
+    // durable after the proof, so a restart restores the state from it
+    // ([`ensure_restored`]). The node stays at the parent head; its exit is
+    // an admin's removal of the seat, a local leave (`DELETE /groups/:id`)
+    // and a new invitation.
     let local = *state.agent.agent_id().as_bytes();
-    if frame
+    if let Some(v2) = frame
         .v2()
-        .is_some_and(|v2| v2.excluded.iter().any(|seat| seat.agent == local))
+        .filter(|v2| v2.excluded.iter().any(|seat| seat.agent == local))
     {
+        let Some(tree) = guard.as_ref() else {
+            return ReceiveOutcome::NotApplicable;
+        };
+        match v2_removal_proof(tree, &info, v2) {
+            V2RemovalProof::Exact(targets) if targets.contains(&hex::encode(local)) => {}
+            V2RemovalProof::Unproven(seats) => {
+                for seat in seats {
+                    ng::request_missing_leaf_evidence(state, &group_key, &seat);
+                }
+                return ReceiveOutcome::Retained { verified: true };
+            }
+            _ => {
+                return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
+            }
+        }
+        if !replay_log::write_received(state, ext, held, &stable, at, &frame_bytes).await {
+            return ReceiveOutcome::Retained { verified: true };
+        }
         drop(guard);
         drop(membership_guard);
         state
@@ -4068,9 +4135,12 @@ async fn receive_commit(
             .insert(body.stable_group_id.clone(), body.commit.state_hash.clone());
         tracing::warn!(
             group_id = %ng::LogHexId::group(&group_key),
-            "ADR 0110 S4: an owner recovery excluded this node's seat; ask an admin to remove it and invite this agent again"
+            "ADR 0110 S4: an owner recovery excluded this node's seat; an admin removes it, then leave locally and accept a new invite"
         );
         return ReceiveOutcome::NotApplicable;
+    }
+    if !replay_log::write_received(state, ext, held, &stable, at, &frame_bytes).await {
+        return ReceiveOutcome::Retained { verified: true };
     }
     // #1508 rc12 (Codex P1): a GSS recovery installs only with its new
     // secret, as a GSS crypto-only exclusion does. The installed head is
