@@ -642,15 +642,19 @@ pub fn treekem_binding_v2(next_epoch: u64, commit: &[u8]) -> String {
 /// `anchor_unix`. Only the group's creator qualifies, and only while it is
 /// held on its own expired committed certificate at the anchor
 /// ([`GroupInfo::creator_expired_certificate_hold`]), is Active, is neither
-/// the actor nor a removed seat, and commits a TreeKEM key-package hash.
+/// the actor nor a removed seat, commits a TreeKEM key-package hash, and
+/// `has_live_leaf` says its committed KeyPackage names a live leaf on the
+/// author's tree. A creator that an earlier V2 already left without a leaf
+/// is not excluded again: a commit cannot remove a blank leaf.
 /// A non-creator seat with an expired certificate is left to its own S4
-/// expiry row, which needs its leaf to remove it.
+/// expiry row.
 #[must_use]
 pub fn recovery_exclusions(
     info: &GroupInfo,
     actor: &[u8; 32],
     removed: &BTreeSet<[u8; 32]>,
     anchor_unix: u64,
+    has_live_leaf: impl Fn(&[u8; 32]) -> bool,
 ) -> Vec<ExcludedSeatV2> {
     let creator = *info.creator.as_bytes();
     let creator_hex = hex::encode(creator);
@@ -659,6 +663,7 @@ pub fn recovery_exclusions(
         || removed.contains(&creator)
         || !info.has_active_member(&creator_hex)
         || !info.creator_expired_certificate_hold(&creator_hex, anchor_unix)
+        || !has_live_leaf(&creator)
     {
         return Vec::new();
     }
@@ -686,21 +691,6 @@ pub fn recovery_needs_v2(removed: &[RemovedSeatV1], excluded: &[ExcludedSeatV2])
             .filter(|seat| seat.leaf_key_package_hash.is_some())
             .count()
             >= 2
-}
-
-/// #2139: the survivors that hold a V2 recovery, in raw-ID order: every
-/// one for which `ready` is false. `ready` is the sticky rule
-/// ([`crate::dm_capability::CapabilityStore::registry_bit_ready`] for
-/// `owner_recovery_v2`), so a survivor never seen with the bit holds it.
-#[must_use]
-pub fn v2_receiver_holders(
-    survivors: impl IntoIterator<Item = [u8; 32]>,
-    ready: impl Fn(&[u8; 32]) -> bool,
-) -> Vec<[u8; 32]> {
-    let mut holders: Vec<[u8; 32]> = survivors.into_iter().filter(|id| !ready(id)).collect();
-    holders.sort_unstable();
-    holders.dedup();
-    holders
 }
 
 /// The TreeKEM security binding the commit must sign: the final epoch and
@@ -1256,8 +1246,9 @@ pub fn validate_sibling(
 
 /// [`validate_sibling`] for a V2 body (#2139): the same checks on
 /// `body.core`, with the V2 transition (one commit at the parent's epoch
-/// plus one, the commit-bound binding) and the structural exclusion rule
-/// against the retained parent roster. A V2 recovery and a V1 or V2
+/// plus one, the commit-bound binding) and the exclusion rule against the
+/// retained parent roster: structural always, and the expiry at the anchor
+/// when the retained projection carries the certificate bytes. A V2 recovery and a V1 or V2
 /// recovery on the same parent are therefore fork evidence for each other.
 ///
 /// # Errors
@@ -1419,6 +1410,17 @@ fn validate_sibling_transition(
                         .get(&hex::encode(agent))
                         .filter(|seat| seat.state == GroupMemberState::Active)
                         .and_then(|seat| seat.treekem_key_package_hash.clone())
+                })
+                // The expiry at the anchor is checked when the retained
+                // projection still carries the certificate bytes (only the
+                // newest retained links do); without them the check is
+                // structural.
+                && v2.excluded.iter().all(|seat| {
+                    parent
+                        .roster
+                        .get(&hex::encode(seat.agent))
+                        .and_then(|snapshot| snapshot.certificate.as_ref())
+                        .is_none_or(|cert| cert.is_expired(v2.exclusion_anchor_unix))
                 })
         }
         (
@@ -2459,21 +2461,27 @@ mod tests {
         let f = v2_fixture();
         let actor = *f.promoted.agent_id().as_bytes();
         let removed = BTreeSet::from([*f.admin.agent_id().as_bytes()]);
+        let live = |_: &[u8; 32]| true;
         assert_eq!(
-            recovery_exclusions(&f.info, &actor, &removed, NOW),
+            recovery_exclusions(&f.info, &actor, &removed, NOW, live),
             excluded_creator(&f)
         );
         assert!(
-            recovery_exclusions(&f.info, &actor, &removed, CREATOR_NOT_AFTER - 1).is_empty(),
+            recovery_exclusions(&f.info, &actor, &removed, NOW, |_| false).is_empty(),
+            "a creator with no live leaf is not excluded again"
+        );
+        assert!(
+            recovery_exclusions(&f.info, &actor, &removed, CREATOR_NOT_AFTER - 1, live).is_empty(),
             "not expired at the anchor"
         );
         assert!(
-            recovery_exclusions(&f.info, f.other.agent_id().as_bytes(), &removed, NOW).is_empty(),
+            recovery_exclusions(&f.info, f.other.agent_id().as_bytes(), &removed, NOW, live)
+                .is_empty(),
             "the creator is the actor"
         );
         let plain = treekem();
         assert!(
-            recovery_exclusions(&plain.info, &actor, &removed, NOW).is_empty(),
+            recovery_exclusions(&plain.info, &actor, &removed, NOW, live).is_empty(),
             "a creator with a valid certificate"
         );
         let leafed = |n: u8| RemovedSeatV1 {
@@ -2487,10 +2495,6 @@ mod tests {
         assert!(!recovery_needs_v2(&[leafed(1), leafless.clone()], &[]));
         assert!(recovery_needs_v2(&[leafed(1), leafed(2)], &[]));
         assert!(recovery_needs_v2(&[leafless], &excluded_creator(&f)));
-        assert_eq!(
-            v2_receiver_holders([[3u8; 32], [1u8; 32], [2u8; 32]], |id| id == &[2u8; 32]),
-            vec![[1u8; 32], [3u8; 32]]
-        );
     }
 
     /// A V2 recovery and a V1 recovery on the same retained parent are fork
@@ -2519,6 +2523,51 @@ mod tests {
         assert_eq!(
             validate_sibling_v2(&wrong, &ours, &f.revocations, NOW),
             Err(OwnerRecoveryRefusal::RecoveryProofInvalid)
+        );
+    }
+
+    /// Two V2 recoveries on one parent, checked through the production
+    /// dispatch ([`OwnerRecoveryCommit::validate_sibling`]): each is fork
+    /// evidence on the replica that installed the other, in either order.
+    #[test]
+    fn two_v2_recoveries_on_one_parent_are_fork_evidence_in_either_order() {
+        let mut f = v2_fixture();
+        f.info.security_binding = Some("treekem:epoch=3".to_string());
+        f.info
+            .seal_commit_evicting(&f.admin, 500)
+            .expect("seal parent");
+        let with_commit = |bytes: Vec<u8>| {
+            commit_v2_for(&f, excluded_creator(&f), NOW, 3, |core, next| {
+                next.security_binding = Some(treekem_binding_v2(4, &bytes));
+                core.crypto = OwnerRecoveryCryptoV1::TreeKem {
+                    commits: vec![bytes],
+                    next_epoch: 4,
+                };
+            })
+        };
+        let a = with_commit(vec![0xA1; 40]);
+        let b = with_commit(vec![0xB2; 40]);
+        assert_ne!(a.core.commit.state_hash, b.core.commit.state_hash);
+        let installed = |body: &OwnerRecoveryBodyV2| {
+            let mut next = f.info.clone();
+            apply_roster_change(&mut next, &body.core);
+            next.security_binding = body.core.commit.security_binding.clone();
+            next.seal_commit_evicting(&f.promoted, 3_000).expect("seal");
+            next
+        };
+        let dispatch = |body: &OwnerRecoveryBodyV2| {
+            OwnerRecoveryCommit::V2(SignedOwnerRecoveryV2 {
+                body: body.clone(),
+                signature: Vec::new(),
+            })
+        };
+        assert_eq!(
+            dispatch(&b).validate_sibling(&installed(&a), &f.revocations, NOW),
+            Ok(())
+        );
+        assert_eq!(
+            dispatch(&a).validate_sibling(&installed(&b), &f.revocations, NOW),
+            Ok(())
         );
     }
 

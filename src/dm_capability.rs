@@ -354,8 +354,7 @@ pub struct CapabilityStore {
 /// its verified advert expires. A gate that must not fall back while a peer
 /// is only offline or withholding its advert reads them through
 /// [`CapabilityStore::registry_bit_ready`].
-pub const STICKY_REGISTRY_BITS: u64 = crate::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1
-    | crate::dm::CapabilityRegistry::OWNER_RECOVERY_V2;
+pub const STICKY_REGISTRY_BITS: u64 = crate::dm::CapabilityRegistry::REMOVAL_COMMIT_BINDING_V1;
 
 /// #2135: one agent's sticky registry bits and the signed timestamp of the
 /// verified advert that last set them.

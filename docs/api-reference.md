@@ -2383,14 +2383,16 @@ every wait. A wait always names its cause; it does not stop silently.
     `{"state": "waiting_for_recovery_member" | "waiting_for_receiver_upgrade", "promoted_member", "mandate_id", "parent_head", "advert"}`
     until the promoted member commits. On the promoted member,
     `promoted_member` is `{"state", "named", "parent_head"}`; `state` is
-    `mandate_received`, `waiting_for_receiver_upgrade` (with
-    `"capability": "owner_recovery_v1"`: the D76 hold, `named` lists each
-    Active member whose current advert lacks bit 7; with
-    `"capability": "owner_recovery_v2"` (#2139): the recovery needs the V2
-    body, because it excludes the held creator's leaf or removes two or more
-    leaves, and `named` lists each survivor not ready for bit 23, meaning no
-    current verified advert with the bit and no sticky record of it. Nothing
-    is committed while it holds, and V1 is never sent instead),
+    `mandate_received`, `waiting_for_receiver_upgrade` (the D76 hold:
+    `named` lists each member the frame will be written to whose current
+    advert lacks the frame's bit, and `capability` is `owner_recovery_v1`,
+    or `owner_recovery_v2` when the recovery needs the V2 body because it
+    excludes the held creator's leaf or removes two or more leaves; #2139.
+    Revoked and expiry-due seats are never written the frame and never hold
+    it. Nothing is committed while it holds, and V1 is never sent instead of
+    a needed V2), `recovery_commit_failed` (#2139: an attempt failed after
+    its checks, for example no TreeKEM group loaded or a seal failure; it is
+    retried and the daemon log names the cause),
     `waiting_for_member_key_package`, `waiting_for_member_eviction`
     (#1973: the recovery seal was refused),
     `waiting_for_creator_certificate_renewal` (#2120: the creator's own
@@ -2409,7 +2411,13 @@ every wait. A wait always names its cause; it does not stop silently.
     `named` still lists the failing seats, not the hold. The wait
     clears when the hold ends. After the commit,
     `receiver_upgrade_members` lists the stranded members with
-    `gap_revision`.
+    `gap_revision`, `advert` (`lacking` or `unknown`) and `capability` (the
+    frame's bit). A member with no current advert is stranded, not a hold:
+    when it upgrades, the delivery round or its catch-up request writes it
+    the frame. On a node whose own seat a V2 recovery excluded,
+    `owner_recovery.local_seat` is `{"state": "excluded_by_owner_recovery",
+    "result_head", "remedy": "admin_removes_and_reinvites"}` (in memory; it
+    shows again when the frame reaches the node again).
 
 **New status codes.**
 
@@ -2417,6 +2425,7 @@ every wait. A wait always names its cause; it does not stop silently.
 |---|---|---|
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
+| `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id` (TreeKEM group, a seated target whose committed KeyPackage provably names no leaf in this node's tree, such as a creator an owner recovery V2 excluded; #2197) | `200 OK` / `409 Conflict` | The removal or ban is roster-only: no TreeKEM commit, no epoch or binding change. The removal answers the usual body with `"roster_only": true` and no `epoch`; the ban answers `{"ok": true, "revision", "roster_only": true}`. While another Active or Pending member's current verified advert lacks bit 23 (`owner_recovery_v2`) it answers 409 `{"ok": false, "error": "waiting_for_receiver_upgrade", "capability": "owner_recovery_v2", "members": [...]}`; a member with no current advert does not hold it. The explicit seal's eviction of such a seat is roster-only too. |
 | `POST /groups/:id/ban/:agent_id` (TreeKEM group, target with no seat and no leaf) | `200 OK` / `409 Conflict` | #1540: the ban is roster-only — no TreeKEM commit, no epoch change — and answers `{"ok": true, "revision", "roster_only": true}`. While another Active member's current verified advert lacks application bit 17 (`roster_only_ban_v1`) it answers 409 `{"ok": false, "error": "waiting_for_receiver_upgrade", "capability": "roster_only_ban_v1", "members": [<agent hex>...]}` and changes nothing. |
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` (TreeKEM group) | `500 Internal Server Error` | #2135: `{"ok": false, "error": "treekem_rollback_failed", "detail"}`. The TreeKEM commit was made, the seal was refused, and the tree could not be restored. The daemon unloads the group's tree before it answers, so later TreeKEM operations on the group answer 424 "TreeKEM group not loaded" until the durable tree, which never held the commit, is reloaded (a daemon restart or the next rebind). This reply and an error log are the only places that name the failure. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
@@ -2666,6 +2675,22 @@ legacy-decoded container:
   `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
   member holds the commit while a known Active member's current advert
   lacks bit 7 (D76).
+
+- `X0XORC2` — owner recovery V2 (#2139, bit 23 `owner_recovery_v2`). The
+  same postcard frame type; only its third variant, `CommitV2`, travels
+  under this prefix, and `CommitV2` under `X0XORC1` (or another variant
+  under `X0XORC2`) is `malformed`. The body is a complete V1 body plus the
+  excluded seats and the author's exclusion anchor, signed in domain
+  `x0x.owner-recovery.commit.v2`; its one TreeKEM commit removes the leafed
+  revoked admins' and the excluded creator's leaves together, with the
+  binding `treekem:epoch=<n>:commit=<blake3>`. The receiver checks the
+  removed leaves as a set against those seats' leaves on its own tree. The
+  same typed refusals apply, plus `recovery_exclusion_unproven`: the anchor
+  is more than 300 s ahead of the receiver's clock, or the receiver lacks an
+  excluded seat's certificate bytes (it asks for them); the frame is kept
+  and retried, not refused. A 0.49.x node does not route this prefix to
+  owner recovery and applies nothing; an author downgraded to 0.49.x can
+  resend a saved V2 frame to bit-7 members.
 
 DM history does not record these frames: they are protocol traffic. A user
 message that only starts with the same letters stays history.

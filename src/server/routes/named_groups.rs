@@ -19690,13 +19690,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                     None
                 } else {
-                    let Some(commit_b64) = treekem_commit_b64 else {
-                        return ApplyMetadataResult::REJECTED;
-                    };
-                    let Some(epoch) = treekem_epoch else {
-                        return ApplyMetadataResult::REJECTED;
-                    };
-                    Some((commit_b64, epoch))
+                    match (treekem_commit_b64, treekem_epoch) {
+                        (Some(commit_b64), Some(epoch)) => Some((commit_b64, epoch)),
+                        // #2197: the roster-only removal of a seated member
+                        // that provably holds no leaf in this node's tree.
+                        (None, None)
+                            if secret_epoch.is_none()
+                                && treekem_seat_is_provably_leafless(
+                                    state,
+                                    &resolved_group_key,
+                                    &info,
+                                    &agent_id,
+                                )
+                                .await =>
+                        {
+                            None
+                        }
+                        _ => return ApplyMetadataResult::REJECTED,
+                    }
                 }
             } else {
                 None
@@ -20275,7 +20286,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             &agent_id,
                             target_key_package_b64.as_deref(),
                         )
-                        .await =>
+                        .await
+                            || treekem_seat_is_provably_leafless(
+                                state,
+                                &resolved_group_key,
+                                &info,
+                                &agent_id,
+                            )
+                            .await =>
                     {
                         None
                     }
@@ -32765,10 +32783,14 @@ fn tree_has_leaf_outside_active_roster(
     info: &x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> bool {
+    // #2139: an Active seat that provably holds no leaf (an excluded
+    // creator) owns none of the tree's leaves, so it must not hide a leaf
+    // that a removed member still holds.
     let active = info
         .members_v2
         .values()
         .filter(|member| member.is_active())
+        .filter(|member| member_treekem_leaf_present(group, member) != Some(false))
         .count() as u32;
     group.member_count() > active
 }
@@ -33579,6 +33601,19 @@ async fn remove_treekem_named_group_member(
             info.stable_group_id().to_string(),
         )
     };
+    // #2197: a seat that provably holds no leaf has no TreeKEM removal.
+    if treekem_seat_is_provably_leafless(&state, &id, &next, &agent_id_hex).await {
+        return remove_treekem_leafless_seat(
+            state,
+            id,
+            next,
+            metadata_topic,
+            event_group_id,
+            agent_id_hex,
+            local_agent_hex,
+        )
+        .await;
+    }
     // Issue #205: resolve the target's TreeKEM KeyPackage, recovering it on
     // demand (local cache, then async member-keyed catch-up) when the roster
     // lacks it. Mirror it onto the cloned snapshot so a later write-back never
@@ -34271,6 +34306,82 @@ async fn owner_certified_seal_with_eviction(
                 .is_some_and(|info| info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem)
         };
 
+        let leafless = if is_treekem {
+            let info = state.named_groups.read().await.get(id).cloned();
+            match info {
+                Some(info) => treekem_seat_is_provably_leafless(state, id, &info, &evict_hex).await,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if leafless {
+            // #2197: the target provably holds no leaf (an excluded
+            // creator), so its eviction is roster-only: no TreeKEM commit,
+            // no epoch or binding change.
+            let now_ms = now_millis_u64();
+            let (commit, event, metadata_topic, delivery_roster) = {
+                let groups = state.named_groups.read().await;
+                let Some(info) = groups.get(id) else {
+                    return Some(Err(not_found("group not found")));
+                };
+                let lacking = leafless_seat_removal_lacking(state, info, &[local_hex, &evict_hex]);
+                if !lacking.is_empty() {
+                    return Some(Err(leafless_seat_upgrade_wait(lacking)));
+                }
+                let mut next = info.clone();
+                next.roster_revision = next.roster_revision.saturating_add(1);
+                let revision = next.roster_revision;
+                next.remove_member(&evict_hex, Some(local_hex.to_string()));
+                let commit = match next.seal_commit_evicting(signing_kp, now_ms) {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        return Some(Err(api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("seal failed: {e}"),
+                        )));
+                    }
+                };
+                if !group_recovery::local_seal_admitted(state, info, &commit).await {
+                    return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
+                }
+                let event = NamedGroupMetadataEvent::MemberRemoved {
+                    group_id: next.stable_group_id().to_string(),
+                    revision,
+                    actor: local_hex.to_string(),
+                    agent_id: evict_hex.clone(),
+                    treekem_commit_b64: None,
+                    treekem_epoch: None,
+                    secret_epoch: None,
+                    commit: Some(commit.clone()),
+                };
+                let metadata_topic = next.metadata_topic.clone();
+                let delivery_roster = next.clone();
+                drop(groups);
+                quiesce_member_join_egress(state, id, &evict_hex).await;
+                let persisted = persist_named_group_info(state, id, next).await;
+                purge_join_artifacts_if_ineligible(state, id, &evict_hex).await;
+                if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
+                    return Some(Err(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named-group state is not directory-durable",
+                    )));
+                }
+                (commit, event, metadata_topic, delivery_roster)
+            };
+            if !drop_initial_volley(&event) {
+                publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+                spawn_named_group_event_delivery_to_active_members(
+                    state,
+                    &delivery_roster,
+                    &event,
+                    std::slice::from_ref(&evict_hex),
+                );
+            }
+            evicted_total.push(evict_hex.clone());
+            last_commit = Some(commit);
+            continue;
+        }
         if is_treekem {
             // Cryptographic eviction (review B4): resolve the target's
             // KeyPackage, remove the roster leaf AND the ratchet leaf in one
@@ -37300,14 +37411,25 @@ async fn ban_treekem_group_member(
     };
     // #1540: a target with no seat and no leaf is banned roster-only: no
     // TreeKEM removal exists for it, and the ban still closes its rejoin.
-    if treekem_ban_is_roster_only(
-        &state,
-        &id,
-        &next,
-        &agent_id_hex,
-        roster_only_ban_key_package(&next, &agent_id_hex).as_deref(),
-    )
-    .await
+    // #2197: so is a seated target that provably holds no leaf; its
+    // receivers need `owner_recovery_v2` too.
+    let seated_leafless =
+        treekem_seat_is_provably_leafless(&state, &id, &next, &agent_id_hex).await;
+    if seated_leafless {
+        let lacking = leafless_seat_removal_lacking(&state, &next, &[&caller_hex, &agent_id_hex]);
+        if !lacking.is_empty() {
+            return leafless_seat_upgrade_wait(lacking);
+        }
+    }
+    if seated_leafless
+        || treekem_ban_is_roster_only(
+            &state,
+            &id,
+            &next,
+            &agent_id_hex,
+            roster_only_ban_key_package(&next, &agent_id_hex).as_deref(),
+        )
+        .await
     {
         return ban_treekem_member_roster_only(
             state,
@@ -37317,6 +37439,7 @@ async fn ban_treekem_group_member(
             event_group_id,
             agent_id_hex,
             caller_hex,
+            seated_leafless,
         )
         .await;
     }
@@ -37567,6 +37690,206 @@ pub(in crate::server) fn roster_only_ban_key_package(
         .and_then(current_member_treekem_key_package)
 }
 
+/// #2197 (David, 23 Nov 2026: build the exit first): whether
+/// `agent_id_hex` holds an Active seat on `info` that provably holds no
+/// TreeKEM leaf. The proof is the tree: the seat's committed KeyPackage
+/// (bytes whose hash the row commits) names no live leaf in this node's
+/// tree. A seat with no KeyPackage bytes, a hash mismatch or no loaded tree
+/// is never read as leafless. Such a seat is the creator that an
+/// `OwnerRecoveryV2` excluded (#2139); it has no TreeKEM removal, so it
+/// leaves the roster with a roster-only removal, ban or eviction.
+pub(in crate::server) async fn treekem_seat_is_provably_leafless(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    agent_id_hex: &str,
+) -> bool {
+    if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+        return false;
+    }
+    let Some(member) = info
+        .members_v2
+        .get(agent_id_hex)
+        .filter(|member| member.state == x0x::groups::GroupMemberState::Active)
+    else {
+        return false;
+    };
+    let Some(kp_b64) = current_member_treekem_key_package(member) else {
+        return false;
+    };
+    if let Some(expected) = member.treekem_key_package_hash.as_deref() {
+        if blake3::hash(kp_b64.as_bytes()).to_hex().as_str() != expected {
+            return false;
+        }
+    }
+    let (Ok(target), Ok(kp)) = (parse_agent_id_hex(agent_id_hex), BASE64.decode(&kp_b64)) else {
+        return false;
+    };
+    let tree = {
+        let map = state.treekem_groups.read().await;
+        map.get(group_id)
+            .or_else(|| map.get(&info.mls_group_id))
+            .or_else(|| map.get(info.stable_group_id()))
+            .cloned()
+    };
+    let Some(tree) = tree else {
+        return false;
+    };
+    let present = tree.lock().await.member_leaf_present(&target, Some(&kp));
+    present == Some(false)
+}
+
+/// #2197: the members whose current verified advert lacks
+/// `owner_recovery_v2`, the bit of the receivers that accept a roster-only
+/// removal or ban of a seated leafless member. The D76 rule of ADR 0110:
+/// a known lacking advert holds the change; an unknown, expired or offline
+/// member does not hold it and is stranded until it upgrades. `skip` are the
+/// actor and the target.
+fn leafless_seat_removal_lacking(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    skip: &[&str],
+) -> Vec<String> {
+    let capabilities = state.agent.capability_store();
+    info.members_v2
+        .values()
+        .filter(|member| {
+            matches!(
+                member.state,
+                x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Pending
+            )
+        })
+        .filter(|member| !skip.contains(&member.agent_id.as_str()))
+        .filter(|member| {
+            parse_agent_id_hex(&member.agent_id).is_ok_and(|agent| {
+                capabilities.verified_registry_supports(
+                    &agent,
+                    x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V2,
+                ) == Some(false)
+            })
+        })
+        .map(|member| member.agent_id.clone())
+        .collect()
+}
+
+fn leafless_seat_upgrade_wait(lacking: Vec<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": ROSTER_ONLY_BAN_UPGRADE_WAIT,
+            "capability": "owner_recovery_v2",
+            "members": lacking,
+        })),
+    )
+}
+
+/// #2197: the admin removal of a seated member that provably holds no
+/// TreeKEM leaf ([`treekem_seat_is_provably_leafless`]). The signed
+/// `MemberRemoved` carries no TreeKEM commit and changes no epoch or
+/// binding: the seat has no leaf, so no path secret reaches it and no key
+/// changes. Everything else is the ordinary removal: the S4 barrier, the
+/// join-egress quiesce, delivery and redelivery.
+async fn remove_treekem_leafless_seat(
+    state: Arc<AppState>,
+    id: String,
+    mut next: x0x::groups::GroupInfo,
+    metadata_topic: String,
+    event_group_id: String,
+    agent_id_hex: String,
+    local_agent_hex: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let lacking = leafless_seat_removal_lacking(&state, &next, &[&local_agent_hex, &agent_id_hex]);
+    if !lacking.is_empty() {
+        return leafless_seat_upgrade_wait(lacking);
+    }
+    let signing_kp = state.agent.identity().agent_keypair();
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
+    let commit =
+        match seal_commit_owner_certified(&state, &mut next, signing_kp, now_millis_u64()).await {
+            Ok(commit) => commit,
+            Err(e) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("seal failed: {e}"),
+                );
+            }
+        };
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: event_group_id,
+        revision,
+        actor: local_agent_hex,
+        agent_id: agent_id_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit),
+    };
+    let barrier = match revocation_eviction::removal_journal::RemovalBarrier::prepare(
+        &state,
+        &next,
+        &agent_id_hex,
+        &event,
+    )
+    .await
+    {
+        Ok(barrier) => barrier,
+        Err(resp) => return resp,
+    };
+    quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+    let persisted = persist_named_group_info(&state, &id, next.clone()).await;
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
+        let installed = matches!(persisted, Ok(AtomicWriteOutcome::ReplacedNotDurable));
+        let _ = barrier
+            .persist_failed(&state, &next, &agent_id_hex, &event, installed)
+            .await;
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
+    if let Err(resp) = barrier
+        .committed(&state, &next, &agent_id_hex, &event)
+        .await
+    {
+        return resp;
+    }
+    if !drop_initial_volley(&event) {
+        publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    }
+    remember_treekem_membership_event(&state, &event).await;
+    if !drop_initial_volley(&event) {
+        spawn_named_group_event_delivery_to_active_members(
+            &state,
+            &next,
+            &event,
+            std::slice::from_ref(&agent_id_hex),
+        );
+    }
+    spawn_group_control_event_redelivery(
+        &state,
+        &metadata_topic,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": id,
+            "removed_member": agent_id_hex,
+            "roster_only": true,
+            "member_count": named_group_member_values(&state, &next).len(),
+            "members": named_group_member_values(&state, &next),
+        })),
+    )
+}
+
 /// #1540: whether a TreeKEM ban of `agent_id_hex` may be roster-only, with
 /// `key_package_b64` as the evidence: the sender passes the row's
 /// committed KeyPackage ([`roster_only_ban_key_package`]), a receiver the
@@ -37643,6 +37966,7 @@ pub(in crate::server) fn apply_roster_only_ban_row(
 /// otherwise 409 `waiting_for_receiver_upgrade` names the members whose
 /// advert lacks it (a released receiver refuses the event). The caller
 /// holds the group's membership lock.
+#[allow(clippy::too_many_arguments)]
 async fn ban_treekem_member_roster_only(
     state: Arc<AppState>,
     id: String,
@@ -37651,9 +37975,12 @@ async fn ban_treekem_member_roster_only(
     event_group_id: String,
     agent_id_hex: String,
     caller_hex: String,
+    seated_leafless: bool,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let capabilities = state.agent.capability_store();
     // Pending seats receive membership events too, so they count.
+    // #2197: a seated leafless target was gated on `owner_recovery_v2`
+    // (the D76 rule) by the caller; that bit implies this one.
     let lacking: Vec<String> = next
         .members_v2
         .values()
@@ -37665,6 +37992,7 @@ async fn ban_treekem_member_roster_only(
         })
         .map(|member| member.agent_id.clone())
         .filter(|member| *member != caller_hex && *member != agent_id_hex)
+        .filter(|_| !seated_leafless)
         .filter(|member| {
             parse_agent_id_hex(member).map_or(true, |agent| {
                 capabilities.verified_registry_supports(

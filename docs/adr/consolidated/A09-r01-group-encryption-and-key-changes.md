@@ -634,12 +634,18 @@ Wire: capability bit 22 and the commit-bound binding on two event kinds
 behind it. Storage: the new `sticky-capabilities.json`. No route change.
 
 Amendment of 23 Nov 2026 ([#2139](https://github.com/saorsa-labs/x0x/issues/2139)
-stage 2). **Decision by David, 22 Nov 2026: fix the TreeKEM gap with a
-saorsa-mls multi-remove and a new recovery body version.** The prefix, the
-capability bit, the hold, the clock rule and the choice of excluded seat were
-set by the orchestrator session under A15 on 22 and 23 Nov 2026. ADR 0110
-stays Accepted and unchanged. This amendment updates limits (i) and (ii) of
-the 20 Nov 2026 TreeKEM bullet and the 21 Nov 2026 #2139 paragraph above.
+stage 2 and the removal half of [#2197](https://github.com/saorsa-labs/x0x/issues/2197)).
+**Decisions by David: 22 Nov 2026, fix the TreeKEM gap with a saorsa-mls
+multi-remove and a new recovery body version; 23 Nov 2026, "build the exit
+first".** The prefix, the capability bit, the clock rule and the choice of
+excluded seat were set by the orchestrator session under A15 on 22 and 23 Nov
+2026. That session's ruling that the author holds until every survivor is
+ready and never sends V1 was **withdrawn** on 23 Nov 2026: holding on a
+survivor's last advert conflicts with Accepted ADR 0110 (D76: such a hold lets
+"a dead device block removal"; §4b(1) strands unknown members). The rollout
+rule below follows ADR 0110. ADR 0110 stays Accepted and unchanged. This
+amendment updates limits (i) and (ii) of the 20 Nov 2026 TreeKEM bullet and
+the 21 Nov 2026 #2139 paragraph above.
 - **The fault.** An `OwnerRecoveryV1` TreeKEM recovery makes one commit per
   leafed revoked admin, and the path secrets of each commit reach every leaf
   still in the tree. So the held creator's leaf got the recovery epoch (limit
@@ -651,118 +657,137 @@ the 20 Nov 2026 TreeKEM bullet and the 21 Nov 2026 #2139 paragraph above.
   agent ID) and `exclusion_anchor_unix` (the author's clock). `core` carries
   exactly one TreeKEM commit, made by saorsa-mls 0.3.10 `remove_members`. It
   removes the leaves of every leafed revoked admin and every excluded seat
-  together, and saorsa-mls blanks each of those leaves before it seals the
-  path, so no removed leaf gets key material from the commit. The binding is
-  the commit-bound `treekem:epoch=<n>:commit=<blake3>`. The outer signature is
-  in domain `x0x.owner-recovery.commit.v2`. The frame is the appended
-  `CommitV2` variant (postcard index 2) and travels only under the new prefix
-  `X0XORC2`. `X0XORC1` maps to `owner_recovery_v1` in the carrier's
-  capability check, so a V2 frame under it would pass the bit-7 gate; the
-  decoder refuses `CommitV2` under `X0XORC1`, and any other variant under
-  `X0XORC2`, as `malformed`.
+  together; saorsa-mls blanks those leaves before it seals the path, so no
+  removed leaf gets key material from the commit. The binding is the
+  commit-bound `treekem:epoch=<n>:commit=<blake3>`; the outer signature is in
+  domain `x0x.owner-recovery.commit.v2`. The frame is the appended
+  `CommitV2` variant (postcard index 2) under the new prefix `X0XORC2`.
+  `X0XORC1` maps to `owner_recovery_v1` in the carrier's capability check, so
+  a V2 frame under it would pass the bit-7 gate; the decoder refuses
+  `CommitV2` under `X0XORC1`, and any other variant under `X0XORC2`, as
+  `malformed`.
 - **Which seat is excluded.** Only the group's creator, when it is held on its
   own expired committed certificate at the anchor
   (`creator_expired_certificate_hold`: past `not_after` plus the 300 s skew),
-  is Active, is not the actor and is not a removed seat, and commits a leaf
-  hash. It stays seated with no leaf. A non-creator seat with an expired
-  certificate is not excluded: its own S4 expiry row removes it with a
-  TreeKEM `MemberRemoved`, which needs its leaf. This narrows the design note
-  of 22 Nov 2026, which also named every seat whose expiry is due.
+  is Active, is not the actor or a removed seat, and its committed KeyPackage
+  names a live leaf on the author's tree. A creator that an earlier V2
+  already left without a leaf is not excluded again, so a second recovery
+  commits. A non-creator seat with an expired certificate is not excluded; its
+  own S4 expiry row evicts it.
 - **When V2 is used.** A TreeKEM recovery uses V2 when it excludes a seat or
-  removes two or more leaves. Every other recovery (one leafed admin and no
-  exclusion, GSS, `SignedPublic`) is V1, unchanged.
+  removes two or more leaves; it never sends V1 then. Every other recovery
+  (one leafed admin and no exclusion, GSS, `SignedPublic`) is V1, unchanged.
 - **Receive rule.** Every V1 check runs on `core`, except the TreeKEM
-  transition. It must be one commit at the current epoch plus one, with the
-  commit-bound binding and at least one leaf to remove. Each excluded seat is
-  listed once in ascending order, is the creator, is Active on the parent
-  with the committed leaf hash, is not the actor or a removed seat, and is
-  held on its expired certificate at the anchor. On its tree, before the
-  commit applies, the receiver checks that the commit adds no leaf, that
+  transition: one commit at the current epoch plus one, the commit-bound
+  binding, at least one leaf to remove, and the exclusion rule (listed once in
+  ascending order, the creator, Active on the parent with the committed leaf
+  hash, not the actor or a removed seat, expired at the anchor). On its tree,
+  before the apply, the receiver checks that the commit adds no leaf, that
   saorsa-mls `check_commit_removals` accepts its list (no duplicate, no
   out-of-range or blank leaf, not the committer's leaf), that each target's
   committed KeyPackage names a live leaf, and that the removed leaves, as a
-  set, are exactly those leaves. The signed order is not checked. After the
-  apply, the leaf count must fall by the number of targets, and every other
-  leaf that was present must still be present. Any other result is
-  `recovery_proof_invalid`, with the tree rolled back. A target whose
-  KeyPackage this node does not hold keeps the frame, and the node asks for
-  it. The V1 rule of 21 Nov 2026 stays for V1 frames.
-- **Clock rule.** The expiry of an excluded seat is read at the signed anchor,
-  not at the receiver's clock, so every receiver decides it the same way. A
-  rule on the receiver's own clock (`not_after` + τ) could make two honest
-  survivors near the boundary disagree for good, which splits the group. The
-  receiver reads its clock only to bound the anchor: an anchor more than 300 s
-  ahead of its clock is `recovery_exclusion_unproven`, and so is an excluded
-  seat whose certificate bytes it lacks. That result keeps the frame and
-  retries it; it is not a refusal. The cost: an author whose clock runs fast
-  delays the recovery on slower receivers until their clocks are within 300 s
-  of its anchor. The anchor is signed by the mandated actor, who can set it
-  up to 300 s ahead of the receivers and so exclude a creator up to 300 s
-  early; the creator's certificate is expired in either case.
-- **Rollout and hold.** New capability bit 23, `owner_recovery_v2`. The
-  author makes V2 only when every survivor (every Active seat other than
-  itself, the removed seats and the excluded seats) is ready by the sticky
-  rule of bit 22: its current verified advert sets bit 23, or the sticky
-  record holds it. The record now keeps bits 22 and 23, in the same file and
-  scope. A survivor never seen with bit 23 is not ready. Otherwise the
-  attempt holds: the promoted member's status shows
-  `waiting_for_receiver_upgrade`, names the survivors that are not ready and
-  adds `capability: owner_recovery_v2`; nothing is committed and no frame is
-  written. The author never sends V1 when V2 is needed, because V1 gives the
-  removed leaves the new epoch. The held mandate is durable, so a restart
-  holds again. **Liveness cost:** one survivor that is never seen with bit 23
-  blocks the recovery for as long as it is an Active member. No admin exists
-  to remove it, so the exits are that the survivor upgrades and is online
-  once with a fresh advert, or that it leaves the group. This hold differs
-  from the D76 rule of ADR 0110 §4b(1), which strands unknown members for
-  `OwnerRecoveryV1`; V2 is a separate commit kind and the D76 rule still
-  governs V1.
-- **Delivery.** The carrier gates each frame on the bit its prefix names, for
-  the live delivery and for catch-up, so a V2 frame reaches only a receiver
-  whose current verified advert sets bit 23. Excluded seats are not
-  recipients: they cannot apply a commit that removes their own leaf.
-- **Old nodes.** An upgraded author never addresses a V2 frame to a 0.49.x
-  node, because its advert lacks bit 23. If one reaches it anyway, its direct
-  listener hands only `X0XORC1` payloads to owner recovery, so the `X0XORC2`
-  bytes stay on the generic direct-message path, as any unrouted payload
-  does; no metadata parser accepts them and nothing is applied. Under the old
-  prefix its decoder cannot read variant 2 and returns `malformed`. The node
-  stays at the parent head, and upgraded members see it as a stranded
-  survivor.
+  set, are exactly those leaves; the signed order is not checked. After the
+  apply the leaf count must fall by the number of targets and every other
+  present leaf must still be present. Anything else is `recovery_proof_invalid`
+  with the tree rolled back. A target whose KeyPackage this node lacks keeps
+  the frame, and the node asks for it. The V1 rule of 21 Nov 2026 stays for V1
+  frames.
+- **Clock rule.** An excluded seat's expiry is read at the signed anchor, so
+  every receiver decides it the same way; a rule on the receiver's clock could
+  refuse the frame for good on one honest survivor and accept it on another.
+  The receiver reads its clock only to bound the anchor: an anchor more than
+  300 s ahead, or an excluded seat whose certificate bytes it lacks, is
+  `recovery_exclusion_unproven`. That keeps the frame and retries it; for
+  missing bytes the receiver also asks for the committed certificate. The
+  mandated actor can set the anchor up to 300 s ahead of a receiver and so
+  exclude a creator up to 300 s early.
+- **Rollout (ADR 0110 D76).** New capability bit 23, `owner_recovery_v2`.
+  The write set is every Active seat other than the actor, the removed seats
+  and the excluded seats that passes the recovery egress guard (not revoked,
+  expiry not due). While a member of the write set has a current verified
+  advert that lacks the frame's bit, the attempt holds: the promoted member
+  shows `waiting_for_receiver_upgrade` naming those members, with `capability`
+  (`owner_recovery_v1` or `owner_recovery_v2`). A member with no current
+  advert does not hold it: the author commits, the frame is not written to
+  that member, and the author's status lists it under
+  `receiver_upgrade_members` (`advert: "unknown"`, with `capability` and the
+  gap revision). When it upgrades, the delivery round or a catch-up request
+  writes it the frame from the catch-up log, and it applies it. The write set
+  is the same set the hold reads, so a revoked or expiry-due seat that is
+  never written the frame never holds it.
+- **Typed waits.** A commit attempt that fails after its checks (no tree
+  loaded, a TreeKEM or seal failure, a frame that is not durable or too
+  large) shows `recovery_commit_failed` and retries, instead of the bare
+  `mandate_received`.
+- **The excluded seat's own node.** The author writes the V2 frame once to
+  each excluded seat as a notice; the commit holds no key material for it.
+  That node verifies the frame, does not apply it (the commit removes its own
+  leaf), stays at the parent head and shows `local_seat:
+  {"state": "excluded_by_owner_recovery", "remedy":
+  "admin_removes_and_reinvites"}`. The state is in memory; after a restart it
+  shows again only when the frame reaches the node again (the author does not
+  resend the notice; a catch-up request can bring it).
+- **The exit for a leafless seat (#2197, removal half).** A seat is provably
+  leafless when it is Active and its committed KeyPackage (bytes whose hash
+  the row commits) names no live leaf in the node's own tree; a missing
+  KeyPackage or tree is never read as leafless. An admin's removal, ban, and
+  the owner-certified seal's eviction of such a seat are roster-only: the
+  signed `MemberRemoved` or `MemberBanned` carries no TreeKEM commit and
+  changes no epoch or binding, because no path secret reaches a seat without a
+  leaf and no key changes. Receivers accept it only by the same proof on their
+  own tree; a roster-only removal of a seat with a leaf is refused. Under the
+  D76 rule a member whose current advert lacks bit 23 holds it (409
+  `waiting_for_receiver_upgrade`, `capability: owner_recovery_v2`); a member
+  with no current advert is stranded. After the removal, ordinary seals work
+  again, and the agent can be invited again like any removed member. An
+  owner-certified seal still refuses while a revoked or expired member other
+  than the held creator is seated (ADR-0038), so such a member is evicted
+  first.
+- **Old nodes.** An upgraded author does not address a V2 frame to a member
+  whose current advert lacks bit 23. If one reaches a 0.49.x node anyway, its
+  direct listener hands only `X0XORC1` payloads to owner recovery, so the
+  `X0XORC2` bytes stay on the generic direct-message path as any unrouted
+  payload does; nothing is applied. Under the old prefix its decoder cannot
+  read variant 2 (`malformed`). One case does send it: an author that commits
+  V2 and is then downgraded to 0.49.x resumes the delivery of the saved frame
+  with only the bit-7 gate, so a bit-7 member can be written the `X0XORC2`
+  bytes; that member applies nothing, as above. A 0.49.x node refuses a
+  roster-only removal of a seated member (it needs a TreeKEM commit) and stays
+  behind; such a node with a current advert holds that removal.
 - **Bits 22 and 23.** They are separate markers, each checked by itself. Bit
   22 governs only the binding of an admin's `MemberRemoved` and
-  `MemberBanned`; bit 23 governs the owner-recovery body. A V1 recovery
-  already binds its commits (`owner-recovery=<blake3>`) whatever bit 22 says,
-  and a V2 recovery always uses the commit-bound form, which its receivers
-  check in the owner-recovery code. So: neither bit, or bit 22 only, gives V1
-  where V2 is not needed and a hold where it is; bit 23 with or without bit
-  22 gives V2 where it is needed. Every release that sets bit 23 also sets
-  bit 22.
-- **Competing recoveries.** A V2 recovery on a retained parent is checked as
-  a sibling by the V2 rule, so a V1 and a V2 recovery, or two V2
-  recoveries, on the same parent are fork evidence and take the existing
-  `fork_quarantine` path (ADR 0110 §2). The commit-bound binding makes two V2
-  recoveries on one parent differ in state hash.
-- **Known limits.** (1) Limit (iii) stays: a creator whose certificate is not
-  yet expired at the anchor (inside the skew, or expiring later) keeps its
-  leaf. (2) Nothing restores the excluded creator's leaf automatically after
-  the owner re-certifies it. The orchestrator's ruling named a self re-join
-  through ADR 0109's re-seat path, but that path is an admin's manual
-  re-seat; the self re-join is
-  [#2197](https://github.com/saorsa-labs/x0x/issues/2197). (3) An admin's
-  TreeKEM removal of the excluded creator needs its leaf, so it fails while
-  the creator has none (#2197). (4) A revoked non-admin seat that the
-  recovery tolerates still gets the recovery epoch until its own S4 row
-  evicts it (#1973). (5) The multi-target crypto-only exclusion is
+  `MemberBanned`; bit 23 governs the owner-recovery body and the roster-only
+  removal of a leafless seat. A V1 recovery already binds its commits
+  (`owner-recovery=<blake3>`) whatever bit 22 says, and a V2 recovery always
+  uses the commit-bound form, checked by the owner-recovery code. Every
+  release that sets bit 23 also sets bit 22.
+- **Competing recoveries.** The production dispatch checks a V2 sibling by
+  the V2 rule, so V1/V2 and V2/V2 recoveries on one retained parent are fork
+  evidence on either replica (the existing `fork_quarantine` path). The V2
+  sibling rule checks the exclusion's structure, and the expiry at the anchor
+  only when the retained projection still carries the certificate bytes.
+- **Responsive rekey check.** `tree_has_leaf_outside_active_roster` now
+  counts only Active seats that are not provably leafless, so a leafless seat
+  no longer hides a removed member's leaf.
+- **Known limits.** (1) Limit (iii) stays: a creator not yet expired at the
+  anchor keeps its leaf. (2) Restoring a leaf to a still-Active creator after
+  the owner re-certifies it is not built (#2197 stays open); meanwhile the
+  operator has an admin remove the creator (roster-only) and invite it again.
+  (3) The exclusion reads only the committed certificate: a creator whose
+  renewal is announced but not committed is still excluded. (4) A revoked
+  non-admin seat that the recovery tolerates gets the recovery epoch until its
+  own S4 row evicts it (#1973). (5) The multi-target crypto-only exclusion is
   [#2196](https://github.com/saorsa-labs/x0x/issues/2196).
 
 Tests: `issue2139_owner_recovery_v2` (real TreeKEM trees, the receiver's set
-rule, and the daemon-level hold, restart, V2 commit and receive) and the
-`owner_recovery` library tests (prefixes, the 0.49 decoder, the V2 body
-rules, two receivers with clocks 400 s apart). Wire: the `X0XORC2` frame and
-capability bit 23. Storage: bit 23 joins the sticky record; the file format
-does not change. Status: the promoted member's wait gains a `capability`
-field.
+rule, the D76 hold and the stranded catch-up, restart, the second recovery,
+the typed failure wait, the excluded seat's state, the roster-only removal,
+ban and eviction, and the leaf-count check) and the `owner_recovery` library
+tests (prefixes, the 0.49 decoder, the V2 body rules, two receivers with
+clocks 400 s apart, V2 siblings through the dispatch). Wire: the `X0XORC2`
+frame, capability bit 23, and roster-only `MemberRemoved`/`MemberBanned` of a
+seated leafless member. Status: `capability` on the promoted member's wait
+and on stranded members, `recovery_commit_failed`, `local_seat`.
 
 ## Security claims
 

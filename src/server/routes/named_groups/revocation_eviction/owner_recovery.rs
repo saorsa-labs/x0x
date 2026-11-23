@@ -53,6 +53,12 @@ use super::rebind::replay_log;
 /// The owner node's typed state until the promoted member commits.
 pub(in crate::server) const WAITING_FOR_RECOVERY_MEMBER: &str = "waiting_for_recovery_member";
 
+/// #2139: the promoted member's typed wait when a commit attempt failed
+/// after its checks passed (no tree loaded, a TreeKEM or seal failure, a
+/// survivor without a KEM key, a frame that is not durable or too large).
+/// The attempt is retried; the log names the cause.
+pub(in crate::server) const RECOVERY_COMMIT_FAILED: &str = "recovery_commit_failed";
+
 /// A send round runs no more often than this per mandate or commit.
 const ORC_RESEND_INTERVAL: Duration = Duration::from_secs(5);
 /// A stashed frame, held commit or parked share is dropped after this
@@ -176,7 +182,14 @@ pub(super) struct OrcState {
     /// Authored and installed recovery commits, for catch-up serving; the
     /// authored and the received frames are durable ([`replay_log`]).
     log: replay_log::HeldLog<ORC_LOG_PER_GROUP, true>,
+    /// #2139: groups in which a verified V2 recovery excluded this node's
+    /// own seat (its leaf is gone), with that recovery's result head. In
+    /// memory only: a restart learns it again from the next frame.
+    excluded_local: HashMap<String, String>,
 }
+
+/// #2139: the typed state of a node whose own seat a V2 recovery excluded.
+pub(in crate::server) const EXCLUDED_BY_OWNER_RECOVERY: &str = "excluded_by_owner_recovery";
 
 impl OrcState {
     /// #1660 (Claude round 5): the stable group IDs of the live commit
@@ -1102,6 +1115,36 @@ fn recovery_v2_kept_every_other_leaf(
             .all(|(seat, _)| presence_after.get(seat) == Some(&Some(true)))
 }
 
+/// #2139: whether `seat_hex`'s committed KeyPackage names a live leaf on
+/// this node's tree. No KeyPackage bytes or no tree is not a live leaf.
+async fn seat_has_live_leaf(
+    state: &AppState,
+    group_key: &str,
+    info: &GroupInfo,
+    seat_hex: &str,
+) -> bool {
+    use base64::Engine as _;
+    let Some(package) = info
+        .members_v2
+        .get(seat_hex)
+        .and_then(super::super::current_member_treekem_key_package)
+        .and_then(|b64| super::super::BASE64.decode(b64).ok())
+    else {
+        return false;
+    };
+    let tree = {
+        let map = state.treekem_groups.read().await;
+        map.get(group_key)
+            .or_else(|| map.get(&info.mls_group_id))
+            .or_else(|| map.get(info.stable_group_id()))
+            .cloned()
+    };
+    match tree {
+        Some(tree) => tree.lock().await.has_key_package_leaf(&package),
+        None => false,
+    }
+}
+
 fn recipient_expiry_due(info: &GroupInfo, agent: &AgentId, now_unix: u64) -> bool {
     info.members_v2
         .get(&hex::encode(agent.as_bytes()))
@@ -1472,23 +1515,6 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
         .iter()
         .map(|admin| admin.agent)
         .collect();
-    // D76: hold while a known Active member's current verified advert
-    // lacks `owner_recovery_v1`; unknown or offline members are stranded.
-    let capabilities = state.agent.capability_store();
-    let holders =
-        orc::receiver_upgrade_holders(survivors(&info, &local, &named).into_iter().map(|id| {
-            (
-                id,
-                capabilities.verified_registry_supports(
-                    &AgentId(id),
-                    x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
-                ),
-            )
-        }));
-    if !holders.is_empty() {
-        set_upgrade_wait(state, stable, holders, "owner_recovery_v1").await;
-        return;
-    }
     let kind = orc::crypto_kind(&info);
     let removed: Vec<orc::RemovedSeatV1> = pending
         .mandate
@@ -1508,29 +1534,62 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
         .collect();
     // #2139: a TreeKEM recovery that excludes the held creator, or removes
     // two or more leaves, needs the V2 body (one commit, no removed leaf
-    // gets its path secrets). It goes out only when every survivor is ready
-    // by the sticky rule; otherwise the attempt holds, and it never falls
-    // back to V1, which would give those leaves the new epoch.
+    // gets its path secrets). It never falls back to V1, which would give
+    // those leaves the new epoch. Only a creator whose committed KeyPackage
+    // names a live leaf on this node's tree is excluded.
     let anchor = now_unix();
-    let excluded = orc::recovery_exclusions(&info, &local, &named, anchor);
+    let creator_live = kind == orc::RecoveryCryptoKind::TreeKem
+        && seat_has_live_leaf(
+            state,
+            &group_key,
+            &info,
+            &hex::encode(info.creator.as_bytes()),
+        )
+        .await;
+    let excluded = orc::recovery_exclusions(&info, &local, &named, anchor, |_| creator_live);
     let v2 = orc::recovery_needs_v2(&removed, &excluded).then_some((excluded, anchor));
-    if let Some((excluded, _)) = &v2 {
-        let skip: BTreeSet<[u8; 32]> = excluded.iter().map(|seat| seat.agent).collect();
-        let holders = orc::v2_receiver_holders(
-            survivors(&info, &local, &named)
-                .into_iter()
-                .filter(|id| !skip.contains(id)),
-            |id| {
-                capabilities.registry_bit_ready(
-                    &AgentId(*id),
-                    x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V2,
-                )
-            },
-        );
-        if !holders.is_empty() {
-            set_upgrade_wait(state, stable, holders, "owner_recovery_v2").await;
-            return;
+    // D76 (ADR 0110 §4b(1), §6): hold while a survivor the frame will be
+    // written to has a current verified advert that lacks the frame's bit
+    // (`owner_recovery_v1`, or `owner_recovery_v2` for V2). A survivor with
+    // no current advert (unknown, expired or offline) does not hold it: it is
+    // stranded, named in the status, and catches up after it upgrades. The
+    // set is exactly the delivery's write set: survivors other than the
+    // removed and excluded seats that pass the recovery egress guard.
+    let skip: BTreeSet<[u8; 32]> = named
+        .iter()
+        .copied()
+        .chain(
+            v2.iter()
+                .flat_map(|(excluded, _)| excluded.iter().map(|seat| seat.agent)),
+        )
+        .collect();
+    let (bit, capability) = if v2.is_some() {
+        (
+            x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V2,
+            "owner_recovery_v2",
+        )
+    } else {
+        (
+            x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
+            "owner_recovery_v1",
+        )
+    };
+    let capabilities = state.agent.capability_store();
+    let mut written = Vec::new();
+    for id in survivors(&info, &local, &skip) {
+        if recovery_write_allowed(state, &info, &AgentId(id)).await {
+            written.push(id);
         }
+    }
+    let holders = orc::receiver_upgrade_holders(written.into_iter().map(|id| {
+        (
+            id,
+            capabilities.verified_registry_supports(&AgentId(id), bit),
+        )
+    }));
+    if !holders.is_empty() {
+        set_upgrade_wait(state, stable, holders, capability).await;
+        return;
     }
     // §2: a completed current catch-up round for this head and no
     // unresolved higher-head evidence, re-read under the membership lock
@@ -1606,7 +1665,7 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
                 }
                 let Some(kem) = member.kem_public_key_b64.as_deref() else {
                     tracing::warn!(group_id = %ng::LogHexId::group(&group_key), "ADR 0110 S4: owner recovery deferred: a survivor has no roster KEM key");
-                    set_wait(state, stable, None).await;
+                    set_wait(state, stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
                     return;
                 };
                 if ng::build_secure_share_event(
@@ -1619,7 +1678,7 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
                 )
                 .is_err()
                 {
-                    set_wait(state, stable, None).await;
+                    set_wait(state, stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
                     return;
                 }
             }
@@ -1688,7 +1747,7 @@ async fn commit_treekem(
             .cloned()
     };
     let Some(tree) = tree else {
-        set_wait(state, &stable, None).await;
+        set_wait(state, &stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
         return;
     };
     let mut guard = tree.lock().await;
@@ -1743,7 +1802,7 @@ async fn commit_treekem(
                     "owner_recovery_remove_failed",
                 );
                 tracing::warn!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: remove_members failed: {error}");
-                set_wait(state, &stable, None).await;
+                set_wait(state, &stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
                 return;
             }
         };
@@ -1814,7 +1873,7 @@ async fn commit_treekem(
                     "owner_recovery_remove_failed",
                 );
                 tracing::warn!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: remove_member failed: {error}");
-                set_wait(state, &stable, None).await;
+                set_wait(state, &stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
                 return;
             }
         }
@@ -1949,7 +2008,7 @@ async fn finish_commit(
     {
         rollback(&mut tree, &next, "owner_recovery_self_check_failed");
         tracing::warn!(group_id = %ng::LogHexId::group(group_key), reason = refusal.as_str(), "ADR 0110 S4: owner recovery self-check failed");
-        set_wait(state, &stable, None).await;
+        set_wait(state, &stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
         return false;
     }
     let removed: Vec<String> = signed
@@ -1981,7 +2040,7 @@ async fn finish_commit(
         // new carrier is invented.
         rollback(&mut tree, &next, "owner_recovery_oversized");
         tracing::warn!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: the frame exceeds the direct carrier limit");
-        set_wait(state, &stable, None).await;
+        set_wait(state, &stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
         return false;
     }
     // #1508 review: the exact frame is durable before the local commit, so
@@ -1993,7 +2052,7 @@ async fn finish_commit(
     if !replay_log::write_planned(state, ext, held, &stable, at, &bytes).await {
         rollback(&mut tree, &next, "owner_recovery_frame_not_durable");
         tracing::error!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: the frame is not durable");
-        set_wait(state, &stable, None).await;
+        set_wait(state, &stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
         return false;
     }
     for seat in &removed {
@@ -2051,7 +2110,7 @@ async fn finish_commit(
         replay_log::rewrite_without(state, ext, held, &stable, at).await;
         rollback(&mut tree, &next, "owner_recovery_persist_failed");
         tracing::error!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: persist failed");
-        set_wait(state, &stable, None).await;
+        set_wait(state, &stable, Some((RECOVERY_COMMIT_FAILED, Vec::new()))).await;
         return false;
     }
     for seat in &removed {
@@ -2059,7 +2118,20 @@ async fn finish_commit(
     }
     let local = *state.agent.agent_id().as_bytes();
     // #2139: an excluded seat cannot apply the commit that removes its own
-    // leaf, so it is neither a recipient nor a head holder.
+    // leaf, so it is neither a recipient nor a head holder. It gets the
+    // frame once as a notice (the commit holds no key material for it), so
+    // its node can show `excluded_by_owner_recovery`.
+    for seat in &excluded {
+        let task_state = Arc::clone(state);
+        let notice_stable = stable.clone();
+        let rule = HeadRule::Current(commit.state_hash.clone());
+        let notice = Arc::clone(&bytes);
+        let agent = AgentId(*seat);
+        let _spawned = state.spawn_detached(async move {
+            let _ =
+                send_guarded(&task_state, &notice_stable, &agent, rule, notice.as_slice()).await;
+        });
+    }
     let removed_ids: BTreeSet<[u8; 32]> = removed
         .iter()
         .filter_map(|id| agent_bytes(id))
@@ -3877,6 +3949,27 @@ async fn receive_commit(
             drop(guard);
             contain_sibling(state, &group_key, &info, &frame, &revocations).await;
         }
+        if refusal == orc::OwnerRecoveryRefusal::RecoveryExclusionUnproven {
+            // #2139: ask for the committed certificate bytes an excluded
+            // seat lacks here, as the rebind receiver does (§1a).
+            let missing: Vec<String> = frame
+                .v2()
+                .map(|v2| {
+                    v2.excluded
+                        .iter()
+                        .map(|seat| hex::encode(seat.agent))
+                        .filter(|seat| {
+                            info.members_v2
+                                .get(seat)
+                                .is_some_and(|member| member.certificate.is_none())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !missing.is_empty() {
+                ng::warranted_fetch_for_pending_seats(state, &info, &missing);
+            }
+        }
         // #2139: an exclusion this node cannot decide yet (its clock is
         // behind the anchor, or it lacks the certificate bytes) is kept and
         // retried, never refused, so receivers with different clocks end
@@ -3894,6 +3987,31 @@ async fn receive_commit(
         } else {
             ReceiveOutcome::Refused(refusal)
         };
+    }
+    // #2139: a verified V2 recovery that excludes this node's own seat
+    // cannot apply here (the commit removes this node's leaf). The node
+    // records the typed state and stays at the parent head; its exit is an
+    // admin's removal and a new invitation.
+    let local = *state.agent.agent_id().as_bytes();
+    if frame
+        .v2()
+        .is_some_and(|v2| v2.excluded.iter().any(|seat| seat.agent == local))
+    {
+        drop(guard);
+        drop(membership_guard);
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .excluded_local
+            .insert(body.stable_group_id.clone(), body.commit.state_hash.clone());
+        tracing::warn!(
+            group_id = %ng::LogHexId::group(&group_key),
+            "ADR 0110 S4: an owner recovery excluded this node's seat; ask an admin to remove it and invite this agent again"
+        );
+        return ReceiveOutcome::NotApplicable;
     }
     let commit = body.commit.to_commit();
     // ADR 0109 §2 "Conflict" (#1533 r6): the one conflict gate bounds
@@ -4411,19 +4529,35 @@ pub(super) async fn status_json(state: &AppState, stable_group_id: &str) -> serd
                         "agent_id": hex::encode(id),
                         "gap_revision": delivery.next_revision,
                         "advert": if *status == RecipientDelivery::Lacking { "lacking" } else { "unknown" },
+                        "capability": frame_capability(&delivery.bytes).1,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default();
-    if owner.is_none() && promoted.is_none() && stranded.is_empty() {
+    let local_seat = inner
+        .orc
+        .excluded_local
+        .get(stable_group_id)
+        .map(|result_head| {
+            serde_json::json!({
+                "state": EXCLUDED_BY_OWNER_RECOVERY,
+                "result_head": result_head,
+                "remedy": "admin_removes_and_reinvites",
+            })
+        });
+    if owner.is_none() && promoted.is_none() && stranded.is_empty() && local_seat.is_none() {
         return serde_json::Value::Null;
     }
-    serde_json::json!({
+    let mut status = serde_json::json!({
         "owner": owner,
         "promoted_member": promoted,
         "receiver_upgrade_members": stranded,
-    })
+    });
+    if let Some(local_seat) = local_seat {
+        status["local_seat"] = local_seat;
+    }
+    status
 }
 
 #[cfg(test)]

@@ -391,23 +391,32 @@ fn a_v2_commit_must_remove_exactly_the_target_leaves() {
 
 // ─── Daemon level ──────────────────────────────────────────────────────────
 
-/// The #2133 mixed case on TreeKEM (the stage-1 test
-/// `known_limit_2139_a_leafless_recovery_leaves_the_expired_creator_in_step`):
-/// the revoked admin holds no leaf, the creator C is a Member held on its
-/// own expired certificate with a leaf, and a revoked Member T with a leaf
-/// is tolerated. Returns the promoted member's state, the parent, the
-/// tree, C's in-step tree, and C's and T's IDs.
+/// The #2133 mixed case on TreeKEM: the promoted member P (this daemon),
+/// a revoked admin (a leaf only with `admin_leaf`), the creator C (a Member
+/// held on its own expired certificate, with a leaf unless
+/// `creator_leafless`, which models the state after an earlier V2), a
+/// revoked Member T with a leaf (tolerated), and `survivors` (unrevoked
+/// Members with a leaf). Every member's tree is in step.
 struct V2Fixture {
     _dir: tempfile::TempDir,
     state: Arc<AppState>,
     info: GroupInfo,
     stable: String,
     tree: Arc<tokio::sync::Mutex<TreeKemMlsGroup>>,
-    creator_tree: TreeKemMlsGroup,
+    creator_keys: Option<x0x::identity::AgentKeypair>,
     creator: AgentId,
+    creator_tree: TreeKemMlsGroup,
     tolerated: AgentId,
     tolerated_tree: TreeKemMlsGroup,
     survivors: Vec<(AgentId, TreeKemMlsGroup)>,
+}
+
+#[derive(Default)]
+struct Shape<'a> {
+    survivors: &'a [&'a x0x::identity::AgentKeypair],
+    creator: Option<&'a x0x::identity::AgentKeypair>,
+    admin_leaf: bool,
+    creator_leafless: bool,
 }
 
 fn member_seat(
@@ -427,28 +436,41 @@ fn member_seat(
     member
 }
 
-/// `survivors`: extra non-revoked Members with a leaf, added last.
-async fn v2_fixture(survivors: &[&x0x::identity::AgentKeypair]) -> V2Fixture {
+async fn v2_fixture(shape: Shape<'_>) -> V2Fixture {
     use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
     let (dir, state, mut info, admin_hex) = recovery_fixture().await;
     let owner = state.agent.identity().user_keypair().unwrap();
     let local = state.agent.agent_id();
-    let creator = x0x::identity::AgentKeypair::generate().unwrap();
+    let own_keys = match shape.creator {
+        Some(_) => None,
+        None => Some(x0x::identity::AgentKeypair::generate().unwrap()),
+    };
+    let creator: &x0x::identity::AgentKeypair = match (shape.creator, own_keys.as_ref()) {
+        (Some(keys), _) | (None, Some(keys)) => keys,
+        (None, None) => unreachable!(),
+    };
     let tolerated = x0x::identity::AgentKeypair::generate().unwrap();
     let group_id_bytes = hex::decode(&info.mls_group_id).unwrap();
     let mut tree = TreeKemMlsGroup::create(group_id_bytes, local, &[0x5A; 32]).unwrap();
-    let mut trees: Vec<TreeKemMlsGroup> = Vec::new();
     // The promoted member's own committed KeyPackage (the same seed names
     // the same leaf), so a receiver accounts for every leaf of the tree.
     let own_kp = TreeKemMlsGroup::prepare_member(local, &[0x5A; 32])
         .unwrap()
         .key_package_bytes()
         .to_vec();
-    assert!(tree.has_key_package_leaf(&own_kp));
     let mut packages: Vec<(String, Vec<u8>)> = vec![(hex::encode(local.as_bytes()), own_kp)];
-    let joiners: Vec<&x0x::identity::AgentKeypair> = [&creator, &tolerated]
+    let mut trees: Vec<TreeKemMlsGroup> = Vec::new();
+    if shape.admin_leaf {
+        let admin_id = AgentId(<[u8; 32]>::try_from(hex::decode(&admin_hex).unwrap()).unwrap());
+        let prepared = TreeKemMlsGroup::prepare_member(admin_id, &[0xAD; 32]).unwrap();
+        let kp = prepared.key_package_bytes().to_vec();
+        tree.add_member(admin_id, &kp).unwrap();
+        packages.push((admin_hex.clone(), kp));
+    }
+    let joiners: Vec<&x0x::identity::AgentKeypair> = [creator, &tolerated]
         .into_iter()
-        .chain(survivors.iter().copied())
+        .chain(shape.survivors.iter().copied())
         .collect();
     for (n, joiner) in joiners.iter().enumerate() {
         let id = joiner.agent_id();
@@ -461,27 +483,35 @@ async fn v2_fixture(survivors: &[&x0x::identity::AgentKeypair]) -> V2Fixture {
         trees.push(TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome).unwrap());
         packages.push((hex::encode(id.as_bytes()), kp));
     }
+    if shape.creator_leafless {
+        let creator_kp = packages
+            .iter()
+            .find(|(id, _)| *id == hex::encode(creator.agent_id().as_bytes()))
+            .unwrap()
+            .1
+            .clone();
+        let earlier = tree
+            .remove_members_verified(&[(creator.agent_id(), creator_kp.as_slice())])
+            .unwrap();
+        for member in trees.iter_mut().skip(1) {
+            member.process_commit(&earlier).unwrap();
+        }
+    }
     let epoch = tree.epoch();
     let now = x0x::groups::owner_cert::restore_clock_now();
     info.members_v2.insert(
         hex::encode(creator.agent_id().as_bytes()),
-        member_seat(owner, &creator, Some(now.saturating_sub(2 * 3_600))),
+        member_seat(owner, creator, Some(now.saturating_sub(2 * 3_600))),
     );
-    for keypair in std::iter::once(&tolerated).chain(survivors.iter().copied()) {
+    for keypair in std::iter::once(&tolerated).chain(shape.survivors.iter().copied()) {
         info.members_v2.insert(
             hex::encode(keypair.agent_id().as_bytes()),
             member_seat(owner, keypair, None),
         );
     }
     for (id_hex, kp) in &packages {
-        info.set_member_treekem_key_package(
-            id_hex,
-            base64::engine::general_purpose::STANDARD.encode(kp),
-        );
+        info.set_member_treekem_key_package(id_hex, b64.encode(kp));
     }
-    assert!(info.members_v2[&admin_hex]
-        .treekem_key_package_hash
-        .is_none());
     info.creator = creator.agent_id();
     info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
     info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
@@ -490,21 +520,7 @@ async fn v2_fixture(survivors: &[&x0x::identity::AgentKeypair]) -> V2Fixture {
     info.recompute_state_hash();
     let creator_hex = hex::encode(creator.agent_id().as_bytes());
     assert!(info.creator_expired_certificate_hold(&creator_hex, now));
-    let record = x0x::revocation::RevocationRecord::sign(
-        x0x::revocation::RevokedSubject::Agent(tolerated.agent_id()),
-        tolerated.public_key(),
-        tolerated.secret_key(),
-        1,
-        None,
-    )
-    .unwrap();
-    assert!(state
-        .agent
-        .revocation_set()
-        .write()
-        .await
-        .verify_and_insert(record, None)
-        .unwrap());
+    revoke_agent(&state, &tolerated).await;
     let stable = info.stable_group_id().to_string();
     state
         .named_groups
@@ -526,11 +542,13 @@ async fn v2_fixture(survivors: &[&x0x::identity::AgentKeypair]) -> V2Fixture {
         info,
         stable,
         tree,
-        creator_tree,
         creator: creator.agent_id(),
+        creator_keys: own_keys,
+        creator_tree,
         tolerated: tolerated.agent_id(),
         tolerated_tree,
-        survivors: survivors
+        survivors: shape
+            .survivors
             .iter()
             .map(|keypair| keypair.agent_id())
             .zip(trees)
@@ -538,17 +556,26 @@ async fn v2_fixture(survivors: &[&x0x::identity::AgentKeypair]) -> V2Fixture {
     }
 }
 
-/// The sticky record holds `owner_recovery_v2` for `agent` (a member of
-/// this node's groups) with no current advert.
-async fn sticky_v2(state: &AppState, agent: &AgentId) {
-    crate::server::sticky_capabilities::refresh_scope(state).await;
-    state.agent.capability_store().seed_sticky([(
-        *agent,
-        x0x::dm_capability::StickySeen {
-            bits: x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V2,
-            advert_created_at_unix_ms: 1,
-        },
-    )]);
+async fn revoke_agent(state: &AppState, agent: &x0x::identity::AgentKeypair) {
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(agent.agent_id()),
+        agent.public_key(),
+        agent.secret_key(),
+        1,
+        None,
+    )
+    .unwrap();
+    assert!(state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, None)
+        .unwrap());
+}
+
+fn bits_without_v2() -> u64 {
+    x0x::dm::CapabilityRegistry::current().bits & !x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V2
 }
 
 async fn attempt(f: &V2Fixture) {
@@ -578,13 +605,41 @@ async fn outbox(state: &AppState, stable: &str) -> (Option<Vec<u8>>, usize) {
     )
 }
 
-/// The V2 hold: T, a survivor never seen with `owner_recovery_v2`, holds
-/// the recovery. Nothing is committed and no frame (V1 or V2) is written;
-/// the held mandate shows `waiting_for_receiver_upgrade` naming T, with
-/// the capability. The creator keeps its leaf, so nothing reached it.
+/// The holder set is the delivery's write set. T is revoked, so the
+/// recovery frame is never written to it, and its advert that lacks bit 23
+/// does not hold the recovery: V2 commits. Red on 2f80bf60, where T held it.
 #[tokio::test]
-async fn a_survivor_not_ready_for_v2_holds_the_recovery_with_no_frame() {
-    let f = v2_fixture(&[]).await;
+async fn a_survivor_the_frame_is_not_written_to_never_holds_it() {
+    let f = v2_fixture(Shape::default()).await;
+    advertise(
+        &f.state,
+        f.tolerated,
+        bits_without_v2(),
+        x0x::dm::now_unix_ms(),
+    );
+    attempt(&f).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    assert!(frame.is_some_and(|bytes| bytes.starts_with(orc::OWNER_RECOVERY_V2_PREFIX)));
+}
+
+/// D76 (ADR 0110 §4b(1)): an unrevoked survivor R whose current verified
+/// advert lacks bit 23 holds the V2 recovery. Nothing is committed, no
+/// frame is written (no V1 either), and the status names R and the
+/// capability.
+#[tokio::test]
+async fn a_known_lacking_survivor_holds_v2_and_no_v1_is_sent() {
+    let r = x0x::identity::AgentKeypair::generate().unwrap();
+    let f = v2_fixture(Shape {
+        survivors: &[&r],
+        ..Shape::default()
+    })
+    .await;
+    advertise(
+        &f.state,
+        r.agent_id(),
+        bits_without_v2(),
+        x0x::dm::now_unix_ms(),
+    );
     attempt(&f).await;
     let head = f.state.named_groups.read().await[&f.stable].clone();
     assert_eq!(head.state_hash, f.info.state_hash, "nothing committed");
@@ -598,26 +653,23 @@ async fn a_survivor_not_ready_for_v2_holds_the_recovery_with_no_frame() {
     assert_eq!(status["promoted_member"]["capability"], "owner_recovery_v2");
     assert_eq!(
         status["promoted_member"]["named"],
-        serde_json::json!([hex::encode(f.tolerated.as_bytes())])
+        serde_json::json!([hex::encode(r.agent_id().as_bytes())])
     );
-    // A current advert that lacks bit 23 holds it too.
-    advertise(
-        &f.state,
-        f.tolerated,
-        x0x::dm::CapabilityRegistry::current().bits
-            & !x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V2,
-        x0x::dm::now_unix_ms(),
-    );
-    try_commit(&f.state, &f.stable).await;
-    assert_eq!(outbox(&f.state, &f.stable).await, (None, 0));
 }
 
 /// A restart in the middle of the hold: the held mandate is durable, so
-/// the next attempt after the restart holds again and still writes no
-/// frame; once T is ready, the same mandate commits V2.
+/// the next attempt holds again and writes no frame; once R's advert sets
+/// bit 23, the same mandate commits V2.
 #[tokio::test]
 async fn a_restart_mid_hold_resumes_the_hold() {
-    let f = v2_fixture(&[]).await;
+    let r = x0x::identity::AgentKeypair::generate().unwrap();
+    let f = v2_fixture(Shape {
+        survivors: &[&r],
+        ..Shape::default()
+    })
+    .await;
+    let at = x0x::dm::now_unix_ms();
+    advertise(&f.state, r.agent_id(), bits_without_v2(), at);
     attempt(&f).await;
     assert_eq!(outbox(&f.state, &f.stable).await, (None, 0));
     {
@@ -634,22 +686,24 @@ async fn a_restart_mid_hold_resumes_the_hold() {
         "the restored mandate holds again"
     );
     assert_eq!(outbox(&f.state, &f.stable).await, (None, 0));
-    sticky_v2(&f.state, &f.tolerated).await;
+    advertise(
+        &f.state,
+        r.agent_id(),
+        x0x::dm::CapabilityRegistry::current().bits,
+        at + 1,
+    );
     try_commit(&f.state, &f.stable).await;
     let (frame, _) = outbox(&f.state, &f.stable).await;
     assert!(frame.is_some_and(|bytes| bytes.starts_with(orc::OWNER_RECOVERY_V2_PREFIX)));
 }
 
-/// T has no current advert (offline) but the sticky record holds
-/// `owner_recovery_v2` for it: the author commits V2 at once. The frame is
-/// `X0XORC2`, its one commit removes the creator's leaf, the creator stays
-/// seated and is no recipient, and the creator's in-step tree can neither
-/// read the recovery epoch nor apply the next public commit (closing
-/// limits (i) and (ii) of #2133).
+/// V2 commits with T unknown (no advert). The frame is `X0XORC2`, its one
+/// commit removes the creator's leaf, the creator stays seated and is no
+/// recipient, and the creator's in-step tree can neither read the recovery
+/// epoch nor apply the next public commit (limits (i) and (ii) of #2133).
 #[tokio::test]
-async fn a_sticky_ready_offline_survivor_gets_v2_and_the_creator_gets_no_keys() {
-    let mut f = v2_fixture(&[]).await;
-    sticky_v2(&f.state, &f.tolerated).await;
+async fn v2_commits_and_the_creator_gets_no_keys() {
+    let mut f = v2_fixture(Shape::default()).await;
     attempt(&f).await;
     let committed = f.state.named_groups.read().await[&f.stable].clone();
     assert_eq!(committed.state_revision, f.info.state_revision + 1);
@@ -707,19 +761,49 @@ async fn a_sticky_ready_offline_survivor_gets_v2_and_the_creator_gets_no_keys() 
     assert!(f.creator_tree.process_commit(&eviction).is_err());
 }
 
-/// End to end: a second daemon (survivor R, sticky-ready) receives the V2
-/// frame the author wrote and applies it: its head and its TreeKEM epoch
-/// move, and its tree no longer holds the creator's leaf.
+/// A second owner recovery when an earlier V2 already left the creator
+/// without a leaf: the creator is not excluded again (its KeyPackage names
+/// no live leaf), so the recovery commits V1 for the one leafed revoked
+/// admin. Red on 2f80bf60: the creator was named again, `remove_members`
+/// failed on its blank leaf on every attempt, and the status stayed the
+/// bare `mandate_received`.
 #[tokio::test]
-async fn a_survivor_daemon_applies_the_v2_frame() {
-    let (_rdir, receiver, _, _) = recovery_fixture().await;
-    let r_keypair = receiver.agent.identity().agent_keypair();
-    let r_id = r_keypair.agent_id();
-    let mut f = v2_fixture(&[r_keypair]).await;
-    for agent in [f.tolerated, r_id] {
-        sticky_v2(&f.state, &agent).await;
-    }
-    // The receiver holds the same parent and the author's revocations.
+async fn a_second_recovery_with_a_leafless_creator_commits() {
+    let f = v2_fixture(Shape {
+        admin_leaf: true,
+        creator_leafless: true,
+        ..Shape::default()
+    })
+    .await;
+    attempt(&f).await;
+    let committed = f.state.named_groups.read().await[&f.stable].clone();
+    assert_eq!(
+        committed.state_revision,
+        f.info.state_revision + 1,
+        "it commits"
+    );
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    assert!(frame.is_some_and(|bytes| bytes.starts_with(orc::OWNER_RECOVERY_PREFIX)));
+}
+
+/// A commit attempt that fails after its checks shows a typed wait, not the
+/// bare `mandate_received`.
+#[tokio::test]
+async fn a_failed_commit_attempt_shows_a_typed_wait() {
+    let f = v2_fixture(Shape::default()).await;
+    f.state.treekem_groups.write().await.remove(&f.stable);
+    attempt(&f).await;
+    assert_eq!(
+        status_json(&f.state, &f.stable).await["promoted_member"]["state"],
+        RECOVERY_COMMIT_FAILED
+    );
+}
+
+/// The receiving side: a second daemon R. Returns R's state and its tree.
+async fn receiver_for(
+    f: &mut V2Fixture,
+    receiver: &Arc<AppState>,
+) -> Arc<tokio::sync::Mutex<TreeKemMlsGroup>> {
     let records = f.state.agent.revocation_set().read().await.all_records();
     for record in records {
         let _ = receiver
@@ -741,11 +825,81 @@ async fn a_survivor_daemon_applies_the_v2_frame() {
         .write()
         .await
         .insert(f.stable.clone(), Arc::clone(&r_tree));
+    r_tree
+}
 
+/// R has no advert when the author commits, so it is stranded: the frame is
+/// not written to it, and the status names it with the capability. Once R
+/// advertises bit 23, the gated carrier admits the frame (a bit-7-only
+/// advert is refused), and R applies the frame that the author's catch-up
+/// log serves: its head and epoch reach the V2 head and its tree no longer
+/// holds the creator's leaf.
+#[tokio::test]
+async fn an_unknown_survivor_is_stranded_and_catches_up_after_it_upgrades() {
+    let (_rdir, receiver, _, _) = recovery_fixture().await;
+    let r_keypair = receiver.agent.identity().agent_keypair();
+    let r_id = r_keypair.agent_id();
+    let mut f = v2_fixture(Shape {
+        survivors: &[r_keypair],
+        ..Shape::default()
+    })
+    .await;
+    let r_tree = receiver_for(&mut f, &receiver).await;
     attempt(&f).await;
     let author_head = f.state.named_groups.read().await[&f.stable].clone();
-    let (frame, _) = outbox(&f.state, &f.stable).await;
-    let bytes = frame.expect("the author committed V2");
+    assert_eq!(author_head.state_revision, f.info.state_revision + 1);
+    drive_deliveries(&f.state).await;
+    let status = status_json(&f.state, &f.stable).await;
+    let stranded = status["receiver_upgrade_members"].as_array().unwrap();
+    let r_row = stranded
+        .iter()
+        .find(|row| row["agent_id"] == hex::encode(r_id.as_bytes()))
+        .unwrap_or_else(|| panic!("R is named: {status}"));
+    assert_eq!(r_row["advert"], "unknown");
+    assert_eq!(r_row["capability"], "owner_recovery_v2");
+
+    let frames = f
+        .state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .log
+        .catchup_frames(std::slice::from_ref(&f.stable), f.info.state_revision);
+    let (_, head, bytes) = frames
+        .into_iter()
+        .next()
+        .expect("the catch-up log serves the frame");
+    // The carrier admission that `send_guarded` and the catch-up serve
+    // use, gated on the frame's own bit (23 for `X0XORC2`).
+    let admitted = || async {
+        guarded_admission_for(
+            &f.state,
+            &f.stable,
+            &r_id,
+            HeadRule::OnChain(head.clone()),
+            frame_capability(&bytes).0,
+        )()
+        .await
+        .is_some_and(|seam| seam())
+    };
+    let at = x0x::dm::now_unix_ms();
+    advertise(&f.state, r_id, bits_without_v2(), at.saturating_sub(1_000));
+    assert!(
+        !admitted().await,
+        "a bit-7-only receiver is not written the frame"
+    );
+    advertise(
+        &f.state,
+        r_id,
+        x0x::dm::CapabilityRegistry::current().bits,
+        at,
+    );
+    assert!(
+        admitted().await,
+        "an upgraded receiver is written the frame"
+    );
     let commit = orc::decode_frame(&bytes)
         .ok()
         .and_then(orc::OwnerRecoveryFrameV1::into_commit)
@@ -767,4 +921,372 @@ async fn a_survivor_daemon_applies_the_v2_frame() {
             .unwrap()
     };
     assert!(!tree.has_key_package_leaf(&creator_kp));
+}
+
+/// A receiver that lacks the excluded creator's certificate bytes keeps the
+/// V2 frame for a retry (`recovery_exclusion_unproven`); it does not refuse
+/// it.
+#[tokio::test]
+async fn a_receiver_without_the_certificate_bytes_keeps_the_frame() {
+    let (_rdir, receiver, _, _) = recovery_fixture().await;
+    let r_keypair = receiver.agent.identity().agent_keypair();
+    let mut f = v2_fixture(Shape {
+        survivors: &[r_keypair],
+        ..Shape::default()
+    })
+    .await;
+    let _r_tree = receiver_for(&mut f, &receiver).await;
+    attempt(&f).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let bytes = frame.unwrap();
+    {
+        let mut groups = receiver.named_groups.write().await;
+        let info = groups.get_mut(&f.stable).unwrap();
+        info.members_v2
+            .get_mut(&hex::encode(f.creator.as_bytes()))
+            .unwrap()
+            .certificate = None;
+    }
+    let commit = orc::decode_frame(&bytes)
+        .ok()
+        .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+        .unwrap();
+    let outcome = receive_commit(&receiver, f.state.agent.agent_id(), commit, &bytes).await;
+    assert!(
+        matches!(outcome, ReceiveOutcome::Retained { .. }),
+        "kept for a retry: {outcome:?}"
+    );
+}
+
+/// The excluded creator's own node: the V2 frame verifies, cannot apply
+/// (it removes this node's leaf), and the node shows the typed state
+/// `excluded_by_owner_recovery` with its remedy. Its head stays.
+#[tokio::test]
+async fn the_excluded_creator_shows_a_typed_state() {
+    let (_cdir, creator_node, _, _) = recovery_fixture().await;
+    let creator_keys = creator_node.agent.identity().agent_keypair();
+    let f = v2_fixture(Shape {
+        creator: Some(creator_keys),
+        ..Shape::default()
+    })
+    .await;
+    assert!(f.creator_keys.is_none());
+    let records = f.state.agent.revocation_set().read().await.all_records();
+    for record in records {
+        let _ = creator_node
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None);
+    }
+    creator_node
+        .named_groups
+        .write()
+        .await
+        .insert(f.stable.clone(), f.info.clone());
+    creator_node.treekem_groups.write().await.insert(
+        f.stable.clone(),
+        Arc::new(tokio::sync::Mutex::new(f.creator_tree)),
+    );
+    attempt_on(&f.state, &f.stable, &f.info).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let bytes = frame.unwrap();
+    let commit = orc::decode_frame(&bytes)
+        .ok()
+        .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+        .unwrap();
+    let outcome = receive_commit(&creator_node, f.state.agent.agent_id(), commit, &bytes).await;
+    assert_eq!(outcome, ReceiveOutcome::NotApplicable);
+    let status = status_json(&creator_node, &f.stable).await;
+    assert_eq!(
+        status["local_seat"]["state"], EXCLUDED_BY_OWNER_RECOVERY,
+        "{status}"
+    );
+    assert_eq!(
+        status["local_seat"]["remedy"],
+        "admin_removes_and_reinvites"
+    );
+    assert_eq!(
+        creator_node.named_groups.read().await[&f.stable].state_hash,
+        f.info.state_hash
+    );
+}
+
+async fn attempt_on(state: &Arc<AppState>, stable: &str, info: &GroupInfo) {
+    let owner = state.agent.identity().user_keypair().unwrap();
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (status, Json(body)) = sign_recovery_mandate(state, owner, stable, &local_hex).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    sync_head(state, info).await;
+    try_commit(state, stable).await;
+}
+
+// ─── #2197: the exit for a leafless seat ──────────────────────────────────
+
+/// The roster-only `MemberRemoved` the author's route just committed for
+/// `target`, rebuilt from its retained head commit.
+async fn last_roster_only_removal(
+    f: &V2Fixture,
+    target: &str,
+) -> crate::server::NamedGroupMetadataEvent {
+    let info = f.state.named_groups.read().await[&f.stable].clone();
+    let commit = info.commit_log.last().unwrap().commit.clone();
+    assert_eq!(commit.state_hash, info.state_hash);
+    crate::server::NamedGroupMetadataEvent::MemberRemoved {
+        group_id: f.stable.clone(),
+        revision: info.roster_revision,
+        actor: hex::encode(f.state.agent.agent_id().as_bytes()),
+        agent_id: target.to_string(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit),
+    }
+}
+
+/// After a V2 recovery the creator is Active with no leaf. An admin's
+/// removal of it is roster-only: no TreeKEM commit, no epoch or binding
+/// change. A receiver applies it by its own proof (the creator's
+/// KeyPackage names no leaf in its tree) and reaches the same head. An
+/// ordinary TreeKEM removal then works again, and a roster-only removal
+/// of a seat that still holds a leaf is refused by the receiver.
+#[tokio::test]
+async fn an_admin_removes_the_leafless_creator_roster_only() {
+    let (_rdir, receiver, _, _) = recovery_fixture().await;
+    let r_keypair = receiver.agent.identity().agent_keypair();
+    let r_id = r_keypair.agent_id();
+    let s_keypair = x0x::identity::AgentKeypair::generate().unwrap();
+    let mut f = v2_fixture(Shape {
+        survivors: &[&s_keypair, r_keypair],
+        ..Shape::default()
+    })
+    .await;
+    let _r_tree = receiver_for(&mut f, &receiver).await;
+    attempt(&f).await;
+    let (frame, _) = outbox(&f.state, &f.stable).await;
+    let bytes = frame.unwrap();
+    let commit = orc::decode_frame(&bytes)
+        .ok()
+        .and_then(orc::OwnerRecoveryFrameV1::into_commit)
+        .unwrap();
+    let author = f.state.agent.agent_id();
+    assert_eq!(
+        receive_commit(&receiver, author, commit, &bytes).await,
+        ReceiveOutcome::Applied
+    );
+    let creator_hex = hex::encode(f.creator.as_bytes());
+    let local_hex = hex::encode(author.as_bytes());
+    // T is revoked: an owner-certified group seals nothing else until T is
+    // evicted (ADR-0038), so the S4 eviction runs first; it spares the held
+    // creator. The receiver takes the resulting roster (its tree already
+    // shows the creator without a leaf).
+    let evicted = crate::server::routes::named_groups::owner_certified_seal_with_eviction(
+        &f.state, &f.stable, &local_hex,
+    )
+    .await
+    .expect("an owner-certified group");
+    assert!(
+        evicted.is_ok()
+            || !f.state.named_groups.read().await[&f.stable]
+                .has_active_member(&hex::encode(f.tolerated.as_bytes()))
+    );
+    let before = f.state.named_groups.read().await[&f.stable].clone();
+    assert!(
+        before.has_active_member(&creator_hex),
+        "the creator is spared"
+    );
+    receiver
+        .named_groups
+        .write()
+        .await
+        .insert(f.stable.clone(), before.clone());
+    assert!(
+        crate::server::routes::named_groups::treekem_seat_is_provably_leafless(
+            &f.state,
+            &f.stable,
+            &before,
+            &creator_hex
+        )
+        .await
+    );
+    // Gate: a member whose current advert lacks bit 23 holds it.
+    let at = x0x::dm::now_unix_ms();
+    advertise(&f.state, r_id, bits_without_v2(), at);
+    let (status, Json(body)) =
+        crate::server::routes::named_groups::remove_treekem_named_group_member(
+            Arc::clone(&f.state),
+            f.stable.clone(),
+            creator_hex.clone(),
+            local_hex.clone(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["capability"], "owner_recovery_v2");
+    advertise(
+        &f.state,
+        r_id,
+        x0x::dm::CapabilityRegistry::current().bits,
+        at + 1,
+    );
+    let (status, Json(body)) =
+        crate::server::routes::named_groups::remove_treekem_named_group_member(
+            Arc::clone(&f.state),
+            f.stable.clone(),
+            creator_hex.clone(),
+            local_hex.clone(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["roster_only"], true);
+    let after = f.state.named_groups.read().await[&f.stable].clone();
+    assert!(!after.has_active_member(&creator_hex));
+    assert_eq!(after.secret_epoch, before.secret_epoch, "no epoch change");
+    assert_eq!(after.security_binding, before.security_binding);
+
+    let event = last_roster_only_removal(&f, &creator_hex).await;
+    let applied = crate::server::routes::named_groups::apply_named_group_metadata_event(
+        &receiver, event, author, true, None,
+    )
+    .await;
+    assert!(applied.accepted, "{applied:?}");
+    assert_eq!(
+        receiver.named_groups.read().await[&f.stable].state_hash,
+        after.state_hash
+    );
+
+    // A roster-only removal of S, which holds a leaf, is refused.
+    let mut forged = after.clone();
+    let tolerated_hex = hex::encode(s_keypair.agent_id().as_bytes());
+    forged.roster_revision += 1;
+    forged.remove_member(&tolerated_hex, Some(local_hex.clone()));
+    let forged_commit = forged
+        .seal_commit_evicting(f.state.agent.identity().agent_keypair(), 9_000)
+        .unwrap();
+    let forged_event = crate::server::NamedGroupMetadataEvent::MemberRemoved {
+        group_id: f.stable.clone(),
+        revision: forged.roster_revision,
+        actor: local_hex.clone(),
+        agent_id: tolerated_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(forged_commit),
+    };
+    let refused = crate::server::routes::named_groups::apply_named_group_metadata_event(
+        &receiver,
+        forged_event,
+        author,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        !refused.accepted,
+        "a seat with a leaf needs its TreeKEM removal"
+    );
+
+    // An ordinary TreeKEM removal works again on the author.
+    let (status, Json(body)) =
+        crate::server::routes::named_groups::remove_treekem_named_group_member(
+            Arc::clone(&f.state),
+            f.stable.clone(),
+            tolerated_hex,
+            local_hex,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["epoch"], before.secret_epoch + 1);
+}
+
+/// The ban of the leafless creator is roster-only too.
+#[tokio::test]
+async fn an_admin_bans_the_leafless_creator_roster_only() {
+    let f = v2_fixture(Shape::default()).await;
+    attempt(&f).await;
+    let creator_hex = hex::encode(f.creator.as_bytes());
+    let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+    // T (revoked) is evicted first, as an owner-certified seal requires.
+    let _ = crate::server::routes::named_groups::owner_certified_seal_with_eviction(
+        &f.state, &f.stable, &local_hex,
+    )
+    .await;
+    let before = f.state.named_groups.read().await[&f.stable].clone();
+    let (status, Json(body)) = crate::server::routes::named_groups::ban_treekem_group_member(
+        Arc::clone(&f.state),
+        f.stable.clone(),
+        creator_hex.clone(),
+        local_hex,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["roster_only"], true);
+    let after = f.state.named_groups.read().await[&f.stable].clone();
+    assert!(after.is_banned(&creator_hex));
+    assert_eq!(after.secret_epoch, before.secret_epoch);
+}
+
+/// The revocation eviction of the leafless creator (its verdict is Failed
+/// once it is revoked) is roster-only. T, revoked with a leaf, is evicted in
+/// the same operation with its own TreeKEM commit.
+#[tokio::test]
+async fn a_revoked_leafless_creator_is_evicted_roster_only() {
+    let f = v2_fixture(Shape::default()).await;
+    attempt(&f).await;
+    revoke_agent(&f.state, f.creator_keys.as_ref().unwrap()).await;
+    let creator_hex = hex::encode(f.creator.as_bytes());
+    let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+    let before = f.state.named_groups.read().await[&f.stable].clone();
+    let outcome = crate::server::routes::named_groups::owner_certified_seal_with_eviction(
+        &f.state, &f.stable, &local_hex,
+    )
+    .await
+    .expect("an owner-certified group");
+    let after = f.state.named_groups.read().await[&f.stable].clone();
+    assert!(
+        !after.has_active_member(&creator_hex),
+        "the creator is evicted: {:?}",
+        outcome
+            .as_ref()
+            .err()
+            .map(|(status, Json(body))| (*status, body.clone()))
+    );
+    // T (revoked, with a leaf) is evicted in the same operation with its
+    // own TreeKEM commit; the creator's eviction adds none.
+    assert!(!after.has_active_member(&hex::encode(f.tolerated.as_bytes())));
+    assert_eq!(after.secret_epoch, before.secret_epoch + 1);
+}
+
+/// A self-leaver's leaf is not hidden by an Active seat with no leaf.
+#[test]
+fn a_leafless_seat_does_not_hide_a_removed_members_leaf() {
+    use base64::Engine as _;
+    let (creator, leaver) = (agent(0xC1), agent(0x7E));
+    let (mut committer, seats) = in_step(
+        b"2139-hidden",
+        agent(0xA0),
+        &[(creator, 0xC1), (leaver, 0x7E)],
+    );
+    committer
+        .remove_members_verified(&[(creator, seats[0].kp.as_slice())])
+        .unwrap();
+    let mut info = roster_with(&[(creator, &seats[0].kp), (leaver, &seats[1].kp)]);
+    let admin_hex = hex::encode(agent(0xA0).as_bytes());
+    info.members_v2.insert(
+        admin_hex.clone(),
+        x0x::groups::GroupMember::new_member(admin_hex.clone(), None, None, 1),
+    );
+    let own = TreeKemMlsGroup::prepare_member(agent(0xA0), &[0xA0; 32])
+        .unwrap()
+        .key_package_bytes()
+        .to_vec();
+    info.set_member_treekem_key_package(
+        &admin_hex,
+        base64::engine::general_purpose::STANDARD.encode(own),
+    );
+    info.remove_member(&hex::encode(leaver.as_bytes()), None);
+    assert_eq!(committer.member_count(), 2, "the committer and the leaver");
+    assert!(
+        crate::server::routes::named_groups::tree_has_leaf_outside_active_roster(&info, &committer)
+    );
 }

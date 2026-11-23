@@ -221,11 +221,12 @@ impl CapabilityRegistry {
     /// multi-remove and a new body version): verifies and applies the
     /// `OwnerRecoveryV2` commit (`X0XORC2`), whose one TreeKEM commit removes
     /// every revoked admin's leaf and the held expired creator's leaf
-    /// together. Bit 23, the next free bit. The promoted member authors V2
-    /// only while every survivor is ready: its current verified advert
-    /// carries this bit, or the sticky record holds it
-    /// ([`crate::dm_capability::CapabilityStore::registry_bit_ready`]).
-    /// Otherwise it holds; it never sends V1 in place of a needed V2.
+    /// together, and (#2197) accepts the roster-only removal or ban of a
+    /// seat that provably holds no leaf. Bit 23, the next free bit. The
+    /// promoted member follows the D76 rule of ADR 0110 for it: a survivor
+    /// whose current verified advert lacks the bit holds the commit; one with
+    /// no current advert is stranded until it upgrades. It never sends V1 in
+    /// place of a needed V2.
     pub const OWNER_RECOVERY_V2: u64 = 1 << 23;
 
     /// The routes supported by every receiver of this release.
