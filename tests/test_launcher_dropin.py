@@ -567,17 +567,108 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("owned by uid", result.stderr)
 
-    def test_a_failed_rerun_leaves_the_direct_job_and_reloads(self) -> None:
+    def test_a_rerun_that_fails_before_any_change_changes_nothing(self) -> None:
         self.assert_installed(self.install())
+        before = self.anchor.read_bytes()
+        dropin_before = self.dropin.read_bytes()
         self.write_daemon(1)
         result = self.install()
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("--check` failed", result.stderr)
-        self.assertIn("runs x0xd directly", result.stderr)
-        self.assertFalse(self.dropin.exists())
-        # The anchor pre-check runs the daemon's check before systemd is asked.
+        self.assertIn("changed nothing", result.stderr)
+        self.assertEqual(self.dropin.read_bytes(), dropin_before)
+        self.assertEqual(self.anchor.read_bytes(), before)
+        # The helper never asked systemd; install.sh reloads once.
         self.assertEqual(self.systemctl_calls(), ["daemon-reload"])
-        # The drop-in is gone, so the unit is out of the anchor too.
+        # #2186 review: a missing launcher source over an in-flight journal
+        # fails its first check and must not unbind the unit either.
+        self.write_daemon(0)
+        self.write_journal("swapped_cli")
+        self.launcher_src.unlink()
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("launcher not found", result.stderr)
+        self.assertEqual(self.dropin.read_bytes(), dropin_before)
+        self.assertEqual(self.anchor.read_bytes(), before)
+
+    def run_helper(self) -> int:
+        """`launcher-dropin.py` in this process, for a rerun with systemd's
+        answer agreeing with the unit files."""
+        self.unit.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.deploy / "systemd" / "x0xd-testnet.service", self.unit)
+        self.systemd_answers()
+        argv = [
+            "launcher-dropin.py", "--unit", str(self.unit), "--binary", str(self.binary),
+            "--launcher-source", str(self.launcher_src),
+            "--launcher", str(self.binary.with_name("x0x-launcher")),
+            "--instance", "testnet", "--dropin", str(self.dropin),
+            "--anchor-dir", str(self.anchor_dir),
+        ]
+        env = {"PATH": f"{self.stubs}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+        with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, env):
+            return dropin.main()
+
+    def fail_the_last_anchor_write(self):
+        """Make the final anchor write (the unit entering the anchor) fail,
+        after the drop-in was written."""
+        real = dropin.write_anchor
+
+        def write(path, data):
+            if data is not None and b'"testnet"' in data:
+                raise OSError("disk full")
+            return real(path, data)
+
+        return mock.patch.object(dropin, "write_anchor", write)
+
+    def test_a_failed_clean_up_keeps_the_drop_in(self) -> None:
+        # #2186 review: the unit leaves the anchor before its drop-in goes;
+        # if that fails, the drop-in stays (exit 4).
+        self.assert_installed(self.install())
+        with self.fail_the_last_anchor_write(), mock.patch.object(
+            dropin, "forget", side_effect=OSError("lock wait")
+        ):
+            self.assertEqual(self.run_helper(), 4)
+        self.assertTrue(self.dropin.exists())
+        self.assertFalse(self.anchor.exists() and "testnet" in self.anchor.read_text("utf-8"))
+
+    def test_a_crash_between_the_clean_up_steps_keeps_the_drop_in(self) -> None:
+        self.assert_installed(self.install())
+        with self.fail_the_last_anchor_write(), mock.patch.object(
+            dropin, "forget", side_effect=KeyboardInterrupt("power loss")
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_helper()
+        self.assertTrue(self.dropin.exists())
+
+    def test_a_failed_restore_after_a_late_refusal_is_typed_and_loud(self) -> None:
+        self.assert_installed(self.install())
+        count = self.tmp / "checks"
+        text = self.binary.read_text("utf-8").replace(
+            "#!/bin/sh\n",
+            "#!/bin/sh\n"
+            f'n=$(cat "{count}" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "{count}"\n'
+            f'[ $n -eq 2 ] && echo \'{{"phase": "booting"}}\' > "{self.data_root}/upgrade-journal.json"\n',
+            1,
+        )
+        self.binary.write_text(text, "utf-8")
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        with mock.patch.object(dropin, "write_dropin", side_effect=OSError("disk full")):
+            with contextlib.redirect_stderr(err):
+                status = self.run_helper()
+        self.assertEqual(status, 1, err.getvalue())
+        self.assertIn("restoring the drop-in and the plan anchor then failed", err.getvalue())
+        # The unit is not bound and not anchored: consistent.
+        self.assertFalse(self.dropin.exists())
+        self.assertFalse(self.anchor.exists())
+
+    def test_a_failure_after_the_first_change_unbinds_and_unanchors(self) -> None:
+        self.assert_installed(self.install())
+        with self.fail_the_last_anchor_write():
+            self.assertEqual(self.run_helper(), 1)
+        self.assertFalse(self.dropin.exists())
         self.assertFalse(self.anchor.exists())
 
     def test_an_unsplittable_exec_start_is_a_typed_refusal(self) -> None:

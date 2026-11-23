@@ -423,7 +423,7 @@ fn plan_daemon_lock(
             held.metadata().map_err(retry)?,
             lock.metadata().map_err(retry)?,
         );
-        if same_file((a.dev(), a.ino()), (b.dev(), b.ino())) {
+        if same_file(file_id(&a), file_id(&b)) {
             return Ok(None);
         }
     }
@@ -446,6 +446,11 @@ fn plan_daemon_lock(
 /// equal: inode numbers repeat across file systems.
 fn same_file(a: (u64, u64), b: (u64, u64)) -> bool {
     a == b
+}
+
+/// The (device, inode) pair that names one file.
+fn file_id(metadata: &std::fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
 }
 
 /// Before a passthrough `exec` of a trial-form start that holds no lock
@@ -1091,6 +1096,11 @@ mod tests {
     /// on another device is another file.
     #[test]
     fn same_file_compares_device_and_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(file_id(&meta), (meta.dev(), meta.ino()));
         assert!(same_file((1, 5), (1, 5)));
         assert!(!same_file((1, 5), (2, 5)));
         assert!(!same_file((1, 5), (1, 6)));

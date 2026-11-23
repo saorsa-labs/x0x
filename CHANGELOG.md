@@ -22,9 +22,10 @@ All notable changes to this project will be documented in this file.
   the anchor only when no data root of the install holds a journal other
   than an idle or superseded one, runs one install at a time per anchor
   directory, and never leaves the anchor naming a unit without its drop-in.
-  With no path it fetches and GPG-verifies the new
-  `x0x-launcher-<platform>.tar.gz` release asset (Linux x64 and ARM64; the
-  release also builds macOS). The fleet's `x0xd-443` units cannot be bound
+  With no path it fetches and GPG-verifies the
+  `x0x-launcher-<platform>.tar.gz` release asset (Linux x64 and ARM64),
+  which releases carry only once the separate release workflow change
+  (#2190) lands; until then it fails closed and `--launcher PATH` is used. The fleet's `x0xd-443` units cannot be bound
   yet, so fleet hosts have no trial. The launcher is still dormant (`ENABLED` is
   false) and no apply path calls the producer, so no install changes
   behaviour.

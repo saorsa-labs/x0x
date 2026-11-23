@@ -278,6 +278,11 @@ if [ -n "$LAUNCHER_SRC" ]; then
         echo "error: the launcher step changed nothing: the launcher, its drop-in and the plan" >&2
         echo "       anchor are as they were (the unit and config above, and any --binary, are installed)" >&2
         exit 1
+    elif [ "$status" -eq 4 ]; then
+        systemctl daemon-reload
+        echo "error: the launcher step failed part way and its clean-up failed (see above); the" >&2
+        echo "       drop-in of $svc_name is left as it was; the unit and config above, and any --binary, are installed" >&2
+        exit 1
     elif [ "$status" -ne 0 ]; then
         systemctl daemon-reload
         echo "error: the launcher drop-in is not installed and $INST_ID is out of the plan anchor;" >&2

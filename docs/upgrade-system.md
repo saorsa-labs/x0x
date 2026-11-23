@@ -607,9 +607,11 @@ drop-in's `ExecStart`:
   above it must be root's and not writable by group or others (a sticky
   directory is allowed), as the launcher checks. The path in the drop-in is
   canonical: on macOS `/etc` is `/private/etc`.
-- **Checks before changes.** Every check runs before the first change,
-  including the final check against the data root found after systemd is
-  asked. The launcher, its drop-in and the anchor change only when no data
+- **Checks before changes.** The journal check runs before the first change
+  and again after systemd is asked (against the data root systemd's answer
+  gives). The first change, taking the unit out of the anchor, and the
+  removal of the drop-in come before systemd is asked; nothing else changes
+  before the second check. The launcher, its drop-in and the anchor change only when no data
   root the anchor names, before or after, and no data root of this unit
   holds a host journal other than an `idle` or `superseded` one. A
   HostCommitted or Restored journal holds them too, since its launcher may
@@ -617,18 +619,30 @@ drop-in's `ExecStart`:
   unreadable, a symlink or not a regular file counts as a journal; it is
   opened without following a symlink or blocking on a FIFO. A refusal
   exits with "the launcher step changed nothing": the launcher, the drop-in
-  and the anchor are as they were. A refusal found after systemd was asked
-  restores the drop-in and the anchor and reloads systemd, and `install.sh`
-  reloads systemd again. The unit file, the config and any `--binary` that
-  `install.sh` wrote before the launcher step stay installed; the message
-  says so.
+  and the anchor are as they were. Any other error before the first change
+  also changes nothing. A refusal found after systemd was asked restores
+  the drop-in, then the anchor, and reloads systemd, and `install.sh`
+  reloads systemd again. If that restore itself fails, the error says so
+  (`RestoreFailed`): the unit is then out of the anchor and its drop-in may
+  be missing, which keeps the rule below. The unit file, the config and any
+  `--binary` that `install.sh` wrote before the launcher step stay
+  installed; the message says so.
+- **Steady state blocks the installer (open before the launcher is
+  enabled).** No production code writes an Idle or Superseded journal yet.
+  After the first update of a bound host, its journal stays HostCommitted
+  (or Restored), so every later `install.sh` run for that install, with or
+  without `--launcher`, is refused until the journal is moved aside by hand
+  (stop the install's units, move `upgrade-journal.json` and its
+  `upgrade-plan-binding.*.json` files aside). The refusal message says this.
 - **The anchor names a unit only while its drop-in is in place.** The unit
   leaves the anchor first, then the launcher and the drop-in are written,
   and the unit enters the anchor last. A power loss at any step therefore
   never leaves the anchor naming a unit without its drop-in (a test crashes
-  after each change). A failed install that removes the drop-in also takes
-  the unit out of the anchor, whatever the journals say: a launcher that
-  then refuses a binding fails closed. The drop-in's header says to remove
+  after each change). An install that fails after its first change takes
+  the unit out of the anchor first, whatever the journals say (a launcher
+  that then refuses a binding fails closed), and only then removes the
+  drop-in. If taking it out of the anchor fails, the drop-in stays and the
+  installer exits loudly (status 4). The drop-in's header says to remove
   it with `install.sh` without `--launcher`; a drop-in deleted by hand
   still leaves the anchor naming that unit.
 - **One run at a time.** A run holds an exclusive lock on
@@ -664,7 +678,10 @@ signature (`.asc`) and `SAORSA_PUBLIC_KEY.asc`. It needs curl and gpg. The
 `.sha256` must hold 64 hex digits that match, the key must have the pinned
 fingerprint and the signature must be a `VALIDSIG` of it, checked in a
 throwaway GnuPG home. A failure leaves the launcher, its drop-in and the
-anchor as they were. The release workflow builds `x0x-launcher`
+anchor as they were. The asset is produced only once the separate release
+workflow PR (#2190, for David to merge) lands; until a release carries it,
+`--launcher` with no path fails closed and `--launcher PATH` is the way to
+install. That PR builds `x0x-launcher`
 (`--features m2-launcher`) for linux-x64-gnu, linux-arm64-gnu, macos-x64 and
 macos-arm64 and ships it as that archive, signed with ML-DSA-65 (`.sig`,
 context `x0x-launcher-v1`) and GPG (`.asc`). It is not in the signed release
@@ -1120,8 +1137,9 @@ installer's plan anchor" above) and writes
 `<unit>.service.d/30-x0x-launcher.conf` (by a temporary file and a rename):
 
 ```ini
-# Installed by .deployment/install.sh --launcher (#1378). Remove this file
-# and run `systemctl daemon-reload` to return to the direct job.
+# Installed by .deployment/install.sh --launcher (#1378). To return to the
+# direct job, run .deployment/install.sh without --launcher: it also takes
+# this unit out of the plan anchor. Do not just delete this file.
 [Service]
 ExecStart=
 ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> --plan-anchor /etc/x0x/launcher/install-<key>.anchor.json -- /opt/x0x/x0xd <unit args>

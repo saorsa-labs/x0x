@@ -133,6 +133,10 @@ class Held(Refused):
     drop-in and the anchor are as they were."""
 
 
+class RestoreFailed(Refused):
+    """A late refusal whose restore failed: the state is reported as it is."""
+
+
 class Settings(NamedTuple):
     user: str
     exec_start: list[str]
@@ -620,11 +624,13 @@ def check_no_journal(data_roots: set[str]) -> None:
         if phase is not None and phase not in ANCHOR_FREE_PHASES:
             raise Held(
                 f"the host journal in {root} is {phase}; the launcher, its drop-in and the "
-                "plan anchor cannot change while a launcher may still read it. Wait until the "
-                "update settles; for a settled journal (host_committed or restored) whose "
-                "install no longer needs it, stop the install's units and move "
-                f"{JOURNAL_FILE_NAME} and its upgrade-plan-binding.*.json files aside "
-                "(docs/upgrade-system.md, 'Moving a data root to another install')"
+                "plan anchor cannot change while a launcher may still read it. For an update "
+                "in progress, wait until it settles. A settled journal (host_committed or "
+                "restored) stays so after every update, also for this same install in its "
+                "steady state, since nothing writes idle yet: stop the install's units, move "
+                f"{JOURNAL_FILE_NAME} and its upgrade-plan-binding.*.json files aside, run "
+                "the install again, then start the units (docs/upgrade-system.md, 'Moving a "
+                "data root to another install')"
             )
 
 
@@ -800,6 +806,8 @@ def install(options: argparse.Namespace) -> None:
         installed = read_regular(launcher, "the installed launcher")
         previous = read_regular(dropin, "the launcher drop-in")
         old_anchor, without = anchor_change(anchor, daemon, cli, options.instance, None)
+        # The first change. An error before it changes nothing at all.
+        options.changed = True
         write_anchor(anchor, without)
         try:
             # systemd must not see an earlier launcher drop-in when it is asked.
@@ -817,12 +825,21 @@ def install(options: argparse.Namespace) -> None:
                 str(anchor),
             )
             check_no_journal(set(anchor_participants(anchor, daemon)[1].values()) | {early, root})
-        except Held:
-            # Back as it was: the drop-in first, then the anchor, then systemd.
-            if previous is not None:
-                write_dropin(dropin, previous.decode("utf-8"))
-            write_anchor(anchor, old_anchor)
+        except Held as held:
+            # Back as it was: the drop-in first, then the anchor, then
+            # systemd. A failure part way keeps the rule: the anchor is
+            # restored only after the drop-in.
+            try:
+                if previous is not None:
+                    write_dropin(dropin, previous.decode("utf-8"))
+                write_anchor(anchor, old_anchor)
+            except Exception as error:
+                raise RestoreFailed(
+                    f"{held}; restoring the drop-in and the plan anchor then failed ({error}): "
+                    f"{options.instance} is out of the anchor and its drop-in may be missing"
+                ) from error
             reload_systemd()
+            options.changed = False
             raise
         if installed is not None and installed != new_launcher:
             install_launcher(installed, launcher.with_name(f"{launcher.name}.previous"))
@@ -889,6 +906,33 @@ def forget(options: argparse.Namespace) -> None:
                   file=sys.stderr)
 
 
+def failed(options: argparse.Namespace, error: Exception) -> int:
+    """An install that failed after its first change. The unit leaves the
+    anchor FIRST (`forget`), and only then is the drop-in removed, so a
+    crash between the two, or a `forget` that fails, never leaves the anchor
+    naming an unbound unit. If `forget` fails, the drop-in stays: the unit
+    is still bound and still anchored (exit 4)."""
+    detail = str(error) if isinstance(error, Refused) else f"{type(error).__name__}: {error}"
+    print(f"error: {detail}", file=sys.stderr)
+    try:
+        forget(options)
+    except Exception as cleanup:
+        print(
+            f"error: cannot take {options.instance} out of the plan anchor ({cleanup}); the "
+            "launcher drop-in is left as it is, so the anchor names the unit only while its "
+            "drop-in is in place. Fix the cause and run the install again.",
+            file=sys.stderr,
+        )
+        return 4
+    dropin = Path(options.dropin)
+    try:
+        dropin.unlink(missing_ok=True)
+    except OSError as cleanup:
+        print(f"error: cannot remove {dropin}: {cleanup}", file=sys.stderr)
+        return 4
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Install x0x-launcher and its systemd drop-in for one instance."
@@ -917,25 +961,22 @@ def main() -> int:
         return 0
     if not (options.unit and options.launcher_source and options.launcher):
         parser.error("--unit, --launcher-source and --launcher are required to install")
+    options.changed = False
     try:
         install(options)
     except Held as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+        if not options.changed:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+        return failed(options, error)
     except Exception as error:
-        dropin = Path(options.dropin)
-        try:
-            dropin.unlink(missing_ok=True)
-        except OSError as cleanup:
-            print(f"error: cannot remove {dropin}: {cleanup}", file=sys.stderr)
-        try:
-            forget(options)
-        except Exception as cleanup:
-            print(f"error: cannot take {options.instance} out of the plan anchor: {cleanup}",
+        if not options.changed:
+            detail = str(error) if isinstance(error, Refused) else f"{type(error).__name__}: {error}"
+            print(f"error: {detail}", file=sys.stderr)
+            print("error: the launcher step failed before its first change; nothing changed",
                   file=sys.stderr)
-        detail = str(error) if isinstance(error, Refused) else f"{type(error).__name__}: {error}"
-        print(f"error: {detail}", file=sys.stderr)
-        return 1
+            return 2
+        return failed(options, error)
     print(f"[install] launcher drop-in: {options.dropin}")
     return 0
 
