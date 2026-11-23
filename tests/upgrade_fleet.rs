@@ -10,7 +10,7 @@ macro_rules! fleet_policy_regression_tests {
 
             fn verified(unit: &str, user_manager: bool) -> SystemdVerifiedUnit {
                 SystemdVerifiedUnit {
-                    unit: unit.into(), user_manager, restart: "always".into(), template_version: None,
+                    unit: unit.into(), user_manager, restart: "always".into(), template_version: None, launcher: None,
                 }
             }
 

@@ -5,8 +5,9 @@
 //! (`upgrade_flush::process_start`) and the boot (`boot_identity`), each
 //! from the same function the handler uses.
 //!
-//! Library only: the launcher never observes a daemon this way. Dormant:
-//! no apply path calls it yet.
+//! Library only: the launcher never observes a daemon this way. The apply
+//! path calls it only through `producer`, whose gate stays closed while
+//! `launcher_contract::LAUNCHER_ENABLED` is false.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -15,9 +16,52 @@ use std::path::Path;
 
 use super::journal::{Participant, RestartBinding};
 
-/// Environment variables the launcher sets for one child start; they are
-/// never part of the captured environment.
-const PER_START_ENV: [&str; 1] = ["X0X_M2_BOOT_FD"];
+/// Environment variables set for one start only, by the launcher
+/// (`X0X_M2_BOOT_FD`) or by the service manager (systemd's per-invocation
+/// and socket, notify, watchdog and trigger variables). They are never part
+/// of the captured environment: the launcher starts the candidate with the
+/// captured one, and an old value would name the previous start (#2012,
+/// #2115 review).
+pub(crate) const PER_START_ENV: &[&str] = &[
+    "X0X_M2_BOOT_FD",
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "NOTIFY_SOCKET",
+    "LISTEN_PID",
+    "LISTEN_FDS",
+    "LISTEN_FDNAMES",
+    "MAINPID",
+    "MANAGERPID",
+    "SYSTEMD_EXEC_PID",
+    "WATCHDOG_PID",
+    "WATCHDOG_USEC",
+    "TRIGGER_UNIT",
+    "TRIGGER_PATH",
+    "TRIGGER_TIMER_REALTIME_USEC",
+    "TRIGGER_TIMER_MONOTONIC_USEC",
+    "MONITOR_SERVICE_RESULT",
+    "MONITOR_EXIT_CODE",
+    "MONITOR_EXIT_STATUS",
+    "MONITOR_INVOCATION_ID",
+    "MONITOR_UNIT",
+];
+
+/// The captured environment: `vars` without the per-start variables. A
+/// non-UTF-8 variable is refused, since the journal stores text.
+pub(crate) fn captured_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> io::Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for (key, value) in vars {
+        let (Ok(key), Ok(value)) = (key.into_string(), value.into_string()) else {
+            return Err(refused("a daemon environment variable is not UTF-8"));
+        };
+        if !PER_START_ENV.contains(&key.as_str()) {
+            env.insert(key, value);
+        }
+    }
+    Ok(env)
+}
 
 fn refused(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, reason.into())
@@ -52,15 +96,7 @@ pub(crate) fn observe_this_daemon(
                 .map_err(|_| refused("a daemon argument is not UTF-8"))?,
         );
     }
-    let mut env = BTreeMap::new();
-    for (key, value) in std::env::vars_os() {
-        let (Ok(key), Ok(value)) = (key.into_string(), value.into_string()) else {
-            return Err(refused("a daemon environment variable is not UTF-8"));
-        };
-        if !PER_START_ENV.contains(&key.as_str()) {
-            env.insert(key, value);
-        }
-    }
+    let env = captured_env(std::env::vars_os())?;
     Ok(Participant {
         instance_id: instance_id.to_owned(),
         executable,
@@ -113,5 +149,28 @@ mod tests {
         assert_eq!(observed.argv[0], observed.executable.to_str().unwrap());
         assert_eq!(observed.data_root, dir.path().canonicalize().unwrap());
         assert!(!observed.env.contains_key("X0X_M2_BOOT_FD"));
+    }
+
+    /// #2012: no per-start variable of the launcher or of systemd reaches
+    /// the captured environment; every other variable does.
+    #[test]
+    fn per_start_variables_are_left_out_of_the_captured_environment() {
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = PER_START_ENV
+            .iter()
+            .map(|key| ((*key).into(), "stale".into()))
+            .collect();
+        vars.push(("X0X_LOG".into(), "info".into()));
+        let env = captured_env(vars).unwrap();
+        assert_eq!(env.len(), 1, "{:?}", env.keys().collect::<Vec<_>>());
+        assert_eq!(env.get("X0X_LOG").map(String::as_str), Some("info"));
+        for key in [
+            "INVOCATION_ID",
+            "JOURNAL_STREAM",
+            "NOTIFY_SOCKET",
+            "LISTEN_FDS",
+            "X0X_M2_BOOT_FD",
+        ] {
+            assert!(PER_START_ENV.contains(&key), "{key}");
+        }
     }
 }
