@@ -94,16 +94,17 @@ All notable changes to this project will be documented in this file.
 - **TreeKEM Welcome transfer: a slow chunk ack no longer holds the
   joiner's Welcome listener (#2202, refs #2189).** The joiner sent each
   `ChunkAck` inside the single Welcome listener loop and waited for its
-  receipt (up to 24 s), so chunks queued behind it waited in series; in the
-  #1172 soak re-adds seated after 203–248 s. The ack now runs in a bounded
-  background task (32 at a time; beyond that an ack is dropped, and a later
-  chunk's ack covers it). The joiner now completes the Welcome as soon as it
-  holds every chunk and the content hash matches, without waiting for the
-  owner's `Complete` (a later `Complete` is ignored). A repeated
-  `FetchRequest` while the owner's stream to that recipient is still running
-  leaves the stream and its acks in place instead of restarting it. No wire
-  change; the serving checks are unchanged. The direct-path timeouts
-  themselves are tracked in #2189.
+  receipt (up to 24 s), so chunks queued behind it waited in series (in the
+  #1172 soak, ack failures 24 s apart, each followed at once by the next
+  queued chunk). The ack now runs in a bounded background task (32 at a
+  time). With all 32 busy the ack is dropped and logged; a later chunk's ack
+  covers it, but a dropped ack for the last chunk leaves the owner waiting
+  out its final-ack timeout without sending `Complete`. The joiner now
+  completes the Welcome as soon as it holds every chunk and the content hash
+  matches, without waiting for the owner's `Complete`. A `Complete` that
+  arrives before every chunk no longer fails the fetch; later chunks can
+  still finish it. No wire change; the serving checks are unchanged. The
+  direct-path timeouts themselves are tracked in #2189.
 
 - **jemalloc builds of `x0xd` apply their jemalloc options (#1172; A06
   amendment of 23 Nov 2026).** The options were exported as `malloc_conf`,

@@ -55782,13 +55782,6 @@ async fn handle_welcome_fetch_request_via<S, F>(
         );
         return;
     }
-    // #2202: a repeated fetch while this recipient's stream is still live
-    // leaves it running. Restarting it dropped its acks and sent every
-    // chunk again, so under slow acks a stream could never finish.
-    if welcome_stream_live(state, &welcome_id).await {
-        tracing::debug!(target: "welcome.trace", stage = "stream_live_kept", welcome_id = %welcome_id);
-        return;
-    }
     let stream_state = Arc::clone(state);
     let recipient = *sender;
     let stream_id = welcome_id.clone();
@@ -55804,17 +55797,6 @@ async fn handle_welcome_fetch_request_via<S, F>(
         .await;
     })
     .await;
-}
-
-/// Whether a Welcome stream for `welcome_id` is registered and still runs.
-async fn welcome_stream_live(state: &AppState, welcome_id: &str) -> bool {
-    state
-        .pending_welcome_streams
-        .lock()
-        .await
-        .as_ref()
-        .and_then(|streams| streams.get(welcome_id))
-        .is_some_and(|handle| !handle.is_finished())
 }
 
 async fn replace_welcome_stream<F>(state: &Arc<AppState>, welcome_id: &str, stream: F)
@@ -56128,13 +56110,20 @@ pub(in crate::server) const WELCOME_ACK_SEND_PERMITS: usize = 32;
 /// loop for every Welcome frame, and an ack send can wait 24 s for its
 /// receipt; awaited inline, one slow ack held every chunk queued behind it.
 /// The owner records the highest sequence acked, so acks may land out of
-/// order. With every permit busy the ack is dropped: a later chunk's ack
-/// covers it, and the joiner completes from the chunks it holds.
+/// order. With every permit busy the ack is dropped and logged: a later
+/// chunk's ack covers it, except for the last chunk, whose lost ack leaves
+/// the owner waiting out its final-ack timeout without sending `Complete`.
+/// The joiner does not need that `Complete`: it finishes from the chunks it
+/// holds.
 fn ack_welcome_chunk(state: &Arc<AppState>, sender: &AgentId, welcome_id: &str, sequence: u64) {
     let Ok(permit) = Arc::clone(&state.welcome_ack_sends).try_acquire_owned() else {
         tracing::warn!(target: "welcome.trace", stage = "chunk_ack_dropped_busy", welcome_id = %welcome_id, seq = sequence);
+        #[cfg(test)]
+        welcome_ack_test_gate::note(welcome_id, false);
         return;
     };
+    #[cfg(test)]
+    welcome_ack_test_gate::note(welcome_id, true);
     let task_state = Arc::clone(state);
     let recipient = *sender;
     let welcome_id = welcome_id.to_string();
@@ -56177,6 +56166,31 @@ pub(in crate::server) mod welcome_ack_test_gate {
         gate
     }
 
+    /// Per Welcome id: (ack sends started, acks dropped because every
+    /// permit was busy).
+    static COUNTS: LazyLock<Mutex<HashMap<String, (u32, u32)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn note(welcome_id: &str, started: bool) {
+        if let Ok(mut counts) = COUNTS.lock() {
+            let entry = counts.entry(welcome_id.to_string()).or_default();
+            if started {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+    }
+
+    /// `(started, dropped)` for `welcome_id`.
+    pub(in crate::server) fn counts(welcome_id: &str) -> (u32, u32) {
+        COUNTS
+            .lock()
+            .ok()
+            .and_then(|counts| counts.get(welcome_id).copied())
+            .unwrap_or_default()
+    }
+
     pub(super) async fn wait(welcome_id: &str) {
         let gate = GATES
             .lock()
@@ -56196,6 +56210,15 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
             return;
         };
         if receive.source != sender_hex {
+            return;
+        }
+        // #2202: a `Complete` before every chunk is here does not end the
+        // fetch. The missing chunks of this stream, or of a restarted one,
+        // can still arrive; the fetch keeps its own deadline.
+        if receive.received_bytes != receive.byte_len
+            || receive.chunks.len() as u64 != receive.total_chunks
+        {
+            tracing::debug!(target: "welcome.trace", stage = "complete_before_all_chunks", welcome_id = %welcome_id);
             return;
         }
     }
