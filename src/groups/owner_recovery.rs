@@ -156,7 +156,65 @@ pub struct SignedOwnerRecoveryV1 {
     pub signature: Vec<u8>,
 }
 
-/// One `X0XORC1` frame.
+/// The typed direct-message prefix of an `OwnerRecoveryV2` commit frame
+/// (#2139). It is not [`OWNER_RECOVERY_PREFIX`]: the carrier picks the
+/// receiver capability from the prefix, and this one needs
+/// `owner_recovery_v2` (bit 23), not `owner_recovery_v1` (bit 7).
+pub const OWNER_RECOVERY_V2_PREFIX: &[u8] = b"X0XORC2";
+
+/// The promoted member's outer agent-signature domain of a V2 commit.
+pub const OWNER_RECOVERY_COMMIT_V2_DOMAIN: &[u8] = b"x0x.owner-recovery.commit.v2";
+
+/// How far a V2 body's exclusion anchor may be ahead of the receiver's
+/// clock. A body further ahead is `recovery_exclusion_unproven`: the
+/// receiver keeps it and checks it again later, it does not refuse it.
+pub const EXCLUSION_ANCHOR_LEAD_SECS: u64 = crate::groups::eviction::EXPIRY_TOLERANCE_SECS;
+
+/// One seat whose TreeKEM leaf a V2 commit removes while the seat stays
+/// Active (#2139): the group's creator, held on its own expired committed
+/// certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcludedSeatV2 {
+    /// The seat (raw agent ID).
+    pub agent: [u8; 32],
+    /// Its committed `treekem_key_package_hash`.
+    pub leaf_key_package_hash: String,
+}
+
+/// The frozen `OwnerRecoveryV2` commit body (#2139). `core` is a complete
+/// [`OwnerRecoveryBodyV1`] whose crypto is TreeKEM with exactly one commit,
+/// made by saorsa-mls `remove_members`, and whose security binding is the
+/// commit-bound `treekem:epoch=<n>:commit=<blake3>` ([`treekem_binding_v2`]).
+/// That one commit removes the leaves of every leafed seat in
+/// `core.removed` and of every seat in `excluded`, so no removed leaf gets
+/// key material from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerRecoveryBodyV2 {
+    /// The V1 fields, in the V1 order.
+    pub core: OwnerRecoveryBodyV1,
+    /// Seats whose leaf the commit removes but which stay seated, sorted by
+    /// agent ID.
+    pub excluded: Vec<ExcludedSeatV2>,
+    /// The author's clock (Unix seconds) at which each excluded seat's
+    /// committed certificate is expired. Receivers check the expiry at this
+    /// signed time, not at their own clock, so every receiver decides it the
+    /// same way.
+    pub exclusion_anchor_unix: u64,
+}
+
+/// A signed `OwnerRecoveryV2` commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedOwnerRecoveryV2 {
+    /// The body.
+    pub body: OwnerRecoveryBodyV2,
+    /// ML-DSA-65 signature by `body.core.actor` over
+    /// [`commit_v2_signable_bytes`].
+    pub signature: Vec<u8>,
+}
+
+/// One owner-recovery frame. `Mandate` and `Commit` travel under
+/// [`OWNER_RECOVERY_PREFIX`]; `CommitV2` (appended, postcard index 2)
+/// travels only under [`OWNER_RECOVERY_V2_PREFIX`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum OwnerRecoveryFrameV1 {
@@ -164,6 +222,106 @@ pub enum OwnerRecoveryFrameV1 {
     Mandate(SignedOwnerRecoveryMandateV1),
     /// The promoted member's commit, sent to the survivors.
     Commit(Box<SignedOwnerRecoveryV1>),
+    /// The promoted member's V2 commit (#2139), sent to the survivors.
+    CommitV2(Box<SignedOwnerRecoveryV2>),
+}
+
+/// A signed recovery commit of either body version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerRecoveryCommit {
+    /// An `OwnerRecoveryV1` commit.
+    V1(SignedOwnerRecoveryV1),
+    /// An `OwnerRecoveryV2` commit.
+    V2(SignedOwnerRecoveryV2),
+}
+
+impl OwnerRecoveryFrameV1 {
+    /// The commit this frame carries, or `None` for a mandate.
+    #[must_use]
+    pub fn into_commit(self) -> Option<OwnerRecoveryCommit> {
+        match self {
+            Self::Mandate(_) => None,
+            Self::Commit(frame) => Some(OwnerRecoveryCommit::V1(*frame)),
+            Self::CommitV2(frame) => Some(OwnerRecoveryCommit::V2(*frame)),
+        }
+    }
+}
+
+impl OwnerRecoveryCommit {
+    /// The V1-shaped fields every version carries.
+    #[must_use]
+    pub fn core(&self) -> &OwnerRecoveryBodyV1 {
+        match self {
+            Self::V1(frame) => &frame.body,
+            Self::V2(frame) => &frame.body.core,
+        }
+    }
+
+    /// The V2 body, for a V2 commit.
+    #[must_use]
+    pub fn v2(&self) -> Option<&OwnerRecoveryBodyV2> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(frame) => Some(&frame.body),
+        }
+    }
+
+    /// Verify the outer signature in this version's domain and the
+    /// embedded commit ([`verify_commit_signatures`],
+    /// [`verify_commit_v2_signatures`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OwnerRecoveryRefusal::RecoveryMemberIneligible`].
+    pub fn verify_signatures(&self) -> Result<(), OwnerRecoveryRefusal> {
+        match self {
+            Self::V1(frame) => verify_commit_signatures(frame),
+            Self::V2(frame) => verify_commit_v2_signatures(frame),
+        }
+    }
+
+    /// [`validate_against_parent`] or [`validate_against_parent_v2`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failed check.
+    pub fn validate_against_parent(
+        &self,
+        parent: &GroupInfo,
+        current_epoch: u64,
+        revocations: &VerifiedAgentRevocations,
+        now_unix: u64,
+    ) -> Result<(), OwnerRecoveryRefusal> {
+        match self {
+            Self::V1(frame) => {
+                validate_against_parent(&frame.body, parent, current_epoch, revocations, now_unix)
+            }
+            Self::V2(frame) => validate_against_parent_v2(
+                &frame.body,
+                parent,
+                current_epoch,
+                revocations,
+                now_unix,
+            ),
+        }
+    }
+
+    /// [`validate_sibling`] or [`validate_sibling_v2`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failed check.
+    pub fn validate_sibling(
+        &self,
+        current: &GroupInfo,
+        revocations: &VerifiedAgentRevocations,
+        now_unix: u64,
+    ) -> Result<(), OwnerRecoveryRefusal> {
+        match self {
+            Self::V1(frame) => validate_sibling(&frame.body, current, revocations, now_unix),
+            Self::V2(frame) => validate_sibling_v2(&frame.body, current, revocations, now_unix),
+        }
+    }
 }
 
 /// Why a frame, a mandate or a commit is refused. The `snake_case` names
@@ -197,6 +355,12 @@ pub enum OwnerRecoveryRefusal {
     /// state as `waiting_for_active_admin` (ADR 0110 §4), not
     /// `recovery_not_needed`.
     WaitingForActiveAdmin,
+    /// #2139: this node cannot decide a V2 body's exclusions yet: the
+    /// exclusion anchor is more than [`EXCLUSION_ANCHOR_LEAD_SECS`] ahead of
+    /// its clock, or it lacks an excluded seat's committed certificate
+    /// bytes. The body is kept and checked again; this is not a refusal of
+    /// its content.
+    RecoveryExclusionUnproven,
 }
 
 impl OwnerRecoveryRefusal {
@@ -213,6 +377,7 @@ impl OwnerRecoveryRefusal {
             Self::RecoveryProofInvalid => "recovery_proof_invalid",
             Self::RecoveryGroupQuarantined => "recovery_group_quarantined",
             Self::WaitingForActiveAdmin => "waiting_for_active_admin",
+            Self::RecoveryExclusionUnproven => "recovery_exclusion_unproven",
         }
     }
 }
@@ -318,30 +483,82 @@ pub fn sign_commit(
     })
 }
 
-/// Encode a frame as a direct-message payload.
+/// The bytes the promoted member signs for a V2 commit: the V2 commit
+/// domain, then the length-prefixed canonical postcard body.
+///
+/// # Errors
+///
+/// Returns the postcard error when encoding fails.
+pub fn commit_v2_signable_bytes(body: &OwnerRecoveryBodyV2) -> Result<Vec<u8>, postcard::Error> {
+    Ok(domain_framed(
+        OWNER_RECOVERY_COMMIT_V2_DOMAIN,
+        &postcard::to_stdvec(body)?,
+    ))
+}
+
+/// Sign a V2 commit body with the promoted member's agent key.
+///
+/// # Errors
+///
+/// As [`sign_commit`].
+pub fn sign_commit_v2(
+    body: OwnerRecoveryBodyV2,
+    keypair: &AgentKeypair,
+) -> Result<SignedOwnerRecoveryV2, OwnerRecoveryRefusal> {
+    if keypair.agent_id().as_bytes() != &body.core.actor {
+        return Err(OwnerRecoveryRefusal::RecoveryMemberIneligible);
+    }
+    let bytes = commit_v2_signable_bytes(&body).map_err(|_| OwnerRecoveryRefusal::Malformed)?;
+    let signature = sign_with_ml_dsa(keypair.secret_key(), &bytes)
+        .map_err(|_| OwnerRecoveryRefusal::RecoveryMemberIneligible)?;
+    Ok(SignedOwnerRecoveryV2 {
+        body,
+        signature: signature.as_bytes().to_vec(),
+    })
+}
+
+/// Encode a frame as a direct-message payload: `CommitV2` under
+/// [`OWNER_RECOVERY_V2_PREFIX`], the others under [`OWNER_RECOVERY_PREFIX`].
 ///
 /// # Errors
 ///
 /// Returns the postcard error when encoding fails.
 pub fn encode_frame(frame: &OwnerRecoveryFrameV1) -> Result<Vec<u8>, postcard::Error> {
-    let mut out = OWNER_RECOVERY_PREFIX.to_vec();
+    let prefix = match frame {
+        OwnerRecoveryFrameV1::CommitV2(_) => OWNER_RECOVERY_V2_PREFIX,
+        _ => OWNER_RECOVERY_PREFIX,
+    };
+    let mut out = prefix.to_vec();
     out.extend(postcard::to_stdvec(frame)?);
     Ok(out)
 }
 
-/// Decode a frame with exact consumption. This checks the shape only.
+/// Whether `payload` claims an owner-recovery frame of either prefix.
+#[must_use]
+pub fn is_owner_recovery_payload(payload: &[u8]) -> bool {
+    payload.starts_with(OWNER_RECOVERY_PREFIX) || payload.starts_with(OWNER_RECOVERY_V2_PREFIX)
+}
+
+/// Decode a frame with exact consumption. This checks the shape only. A
+/// `CommitV2` under [`OWNER_RECOVERY_PREFIX`], or any other variant under
+/// [`OWNER_RECOVERY_V2_PREFIX`], is `Malformed`: the prefix is what the
+/// carrier's capability gate read.
 ///
 /// # Errors
 ///
 /// Returns [`OwnerRecoveryRefusal::WrongPrefix`] or
 /// [`OwnerRecoveryRefusal::Malformed`].
 pub fn decode_frame(payload: &[u8]) -> Result<OwnerRecoveryFrameV1, OwnerRecoveryRefusal> {
-    let body = payload
-        .strip_prefix(OWNER_RECOVERY_PREFIX)
-        .ok_or(OwnerRecoveryRefusal::WrongPrefix)?;
+    let (body, v2) = if let Some(body) = payload.strip_prefix(OWNER_RECOVERY_PREFIX) {
+        (body, false)
+    } else if let Some(body) = payload.strip_prefix(OWNER_RECOVERY_V2_PREFIX) {
+        (body, true)
+    } else {
+        return Err(OwnerRecoveryRefusal::WrongPrefix);
+    };
     let (frame, rest) = postcard::take_from_bytes::<OwnerRecoveryFrameV1>(body)
         .map_err(|_| OwnerRecoveryRefusal::Malformed)?;
-    if !rest.is_empty() {
+    if !rest.is_empty() || matches!(frame, OwnerRecoveryFrameV1::CommitV2(_)) != v2 {
         return Err(OwnerRecoveryRefusal::Malformed);
     }
     Ok(frame)
@@ -376,8 +593,30 @@ pub fn verify_mandate_signature(
 ///
 /// Returns [`OwnerRecoveryRefusal::RecoveryMemberIneligible`].
 pub fn verify_commit_signatures(frame: &SignedOwnerRecoveryV1) -> Result<(), OwnerRecoveryRefusal> {
+    let bytes = commit_signable_bytes(&frame.body).map_err(|_| OwnerRecoveryRefusal::Malformed)?;
+    verify_actor_signature(&frame.body, &bytes, &frame.signature)
+}
+
+/// [`verify_commit_signatures`] for a V2 commit: the outer signature is
+/// in [`OWNER_RECOVERY_COMMIT_V2_DOMAIN`] over the whole V2 body.
+///
+/// # Errors
+///
+/// Returns [`OwnerRecoveryRefusal::RecoveryMemberIneligible`].
+pub fn verify_commit_v2_signatures(
+    frame: &SignedOwnerRecoveryV2,
+) -> Result<(), OwnerRecoveryRefusal> {
+    let bytes =
+        commit_v2_signable_bytes(&frame.body).map_err(|_| OwnerRecoveryRefusal::Malformed)?;
+    verify_actor_signature(&frame.body.core, &bytes, &frame.signature)
+}
+
+fn verify_actor_signature(
+    body: &OwnerRecoveryBodyV1,
+    bytes: &[u8],
+    signature: &[u8],
+) -> Result<(), OwnerRecoveryRefusal> {
     let refuse = OwnerRecoveryRefusal::RecoveryMemberIneligible;
-    let body = &frame.body;
     let commit = body.commit.to_commit();
     commit.verify_structure().map_err(|_| refuse)?;
     if commit.committed_by != hex::encode(body.actor) {
@@ -385,9 +624,83 @@ pub fn verify_commit_signatures(frame: &SignedOwnerRecoveryV1) -> Result<(), Own
     }
     let key_bytes = hex::decode(&commit.signer_public_key).map_err(|_| refuse)?;
     let key = MlDsaPublicKey::from_bytes(&key_bytes).map_err(|_| refuse)?;
-    let signature = MlDsaSignature::from_bytes(&frame.signature).map_err(|_| refuse)?;
-    let bytes = commit_signable_bytes(body).map_err(|_| OwnerRecoveryRefusal::Malformed)?;
-    verify_with_ml_dsa(&key, &bytes, &signature).map_err(|_| refuse)
+    let signature = MlDsaSignature::from_bytes(signature).map_err(|_| refuse)?;
+    verify_with_ml_dsa(&key, bytes, &signature).map_err(|_| refuse)
+}
+
+/// The security binding a V2 commit must sign: the commit-bound form
+/// `treekem:epoch=<n>:commit=<blake3>` that the crypto-only exclusion and,
+/// behind `removal_commit_binding_v1`, the admin removal also use. It names
+/// the one commit's exact bytes, so two V2 recoveries on one parent never
+/// share a state hash.
+#[must_use]
+pub fn treekem_binding_v2(next_epoch: u64, commit: &[u8]) -> String {
+    crate::groups::crypto_exclusion::treekem_binding(next_epoch, commit)
+}
+
+/// #2139: the seats the author excludes in a V2 commit at its clock
+/// `anchor_unix`. Only the group's creator qualifies, and only while it is
+/// held on its own expired committed certificate at the anchor
+/// ([`GroupInfo::creator_expired_certificate_hold`]), is Active, is neither
+/// the actor nor a removed seat, and commits a TreeKEM key-package hash.
+/// A non-creator seat with an expired certificate is left to its own S4
+/// expiry row, which needs its leaf to remove it.
+#[must_use]
+pub fn recovery_exclusions(
+    info: &GroupInfo,
+    actor: &[u8; 32],
+    removed: &BTreeSet<[u8; 32]>,
+    anchor_unix: u64,
+) -> Vec<ExcludedSeatV2> {
+    let creator = *info.creator.as_bytes();
+    let creator_hex = hex::encode(creator);
+    if crypto_kind(info) != RecoveryCryptoKind::TreeKem
+        || &creator == actor
+        || removed.contains(&creator)
+        || !info.has_active_member(&creator_hex)
+        || !info.creator_expired_certificate_hold(&creator_hex, anchor_unix)
+    {
+        return Vec::new();
+    }
+    info.members_v2
+        .get(&creator_hex)
+        .and_then(|member| member.treekem_key_package_hash.clone())
+        .map(|leaf_key_package_hash| ExcludedSeatV2 {
+            agent: creator,
+            leaf_key_package_hash,
+        })
+        .into_iter()
+        .collect()
+}
+
+/// #2139: whether a TreeKEM recovery needs the V2 body: a seat is excluded,
+/// or two or more removed seats hold a leaf. V1 makes one commit per
+/// leafed seat, and each commit's path secrets reach every leaf still in
+/// the tree, so with two leafed seats the second one gets the first
+/// commit's epoch.
+#[must_use]
+pub fn recovery_needs_v2(removed: &[RemovedSeatV1], excluded: &[ExcludedSeatV2]) -> bool {
+    !excluded.is_empty()
+        || removed
+            .iter()
+            .filter(|seat| seat.leaf_key_package_hash.is_some())
+            .count()
+            >= 2
+}
+
+/// #2139: the survivors that hold a V2 recovery, in raw-ID order: every
+/// one for which `ready` is false. `ready` is the sticky rule
+/// ([`crate::dm_capability::CapabilityStore::registry_bit_ready`] for
+/// `owner_recovery_v2`), so a survivor never seen with the bit holds it.
+#[must_use]
+pub fn v2_receiver_holders(
+    survivors: impl IntoIterator<Item = [u8; 32]>,
+    ready: impl Fn(&[u8; 32]) -> bool,
+) -> Vec<[u8; 32]> {
+    let mut holders: Vec<[u8; 32]> = survivors.into_iter().filter(|id| !ready(id)).collect();
+    holders.sort_unstable();
+    holders.dedup();
+    holders
 }
 
 /// The TreeKEM security binding the commit must sign: the final epoch and
@@ -682,6 +995,128 @@ pub fn validate_against_parent(
     revocations: &VerifiedAgentRevocations,
     now_unix: u64,
 ) -> Result<(), OwnerRecoveryRefusal> {
+    validate_against_parent_with(body, parent, current_epoch, revocations, now_unix, None)
+}
+
+/// [`validate_against_parent`] for a V2 body (#2139). Every V1 check runs
+/// on `body.core`, except the TreeKEM transition, which must be:
+///
+/// - a TreeKEM group, and exactly one commit, at `current_epoch + 1`, with
+///   the commit-bound binding [`treekem_binding_v2`];
+/// - at least one leaf to remove (a leafed removed seat or an excluded
+///   seat);
+/// - every excluded seat listed once in ascending order, not the actor,
+///   not a removed seat, the group's creator, Active on the parent, with the
+///   committed leaf hash, and held on its own expired committed
+///   certificate at `exclusion_anchor_unix`
+///   ([`GroupInfo::creator_expired_certificate_hold`]).
+///
+/// The expiry is read at the signed anchor, so receivers with different
+/// clocks decide it the same way. Only the last check reads the clock: an
+/// anchor more than [`EXCLUSION_ANCHOR_LEAD_SECS`] ahead of `now_unix`, or
+/// an excluded seat whose certificate bytes this node lacks, is
+/// [`OwnerRecoveryRefusal::RecoveryExclusionUnproven`], which the receiver
+/// keeps and checks again. The caller proves on its tree that the commit
+/// removes exactly those leaves.
+///
+/// # Errors
+///
+/// Returns the first failed check.
+pub fn validate_against_parent_v2(
+    body: &OwnerRecoveryBodyV2,
+    parent: &GroupInfo,
+    current_epoch: u64,
+    revocations: &VerifiedAgentRevocations,
+    now_unix: u64,
+) -> Result<(), OwnerRecoveryRefusal> {
+    validate_against_parent_with(
+        &body.core,
+        parent,
+        current_epoch,
+        revocations,
+        now_unix,
+        Some(body),
+    )?;
+    let mut unproven = false;
+    for seat in &body.excluded {
+        let seat_hex = hex::encode(seat.agent);
+        if parent
+            .members_v2
+            .get(&seat_hex)
+            .is_none_or(|member| member.certificate.is_none())
+        {
+            unproven = true;
+        } else if !parent.creator_expired_certificate_hold(&seat_hex, body.exclusion_anchor_unix) {
+            return Err(OwnerRecoveryRefusal::RecoveryProofInvalid);
+        }
+    }
+    let ahead = body.exclusion_anchor_unix > now_unix.saturating_add(EXCLUSION_ANCHOR_LEAD_SECS);
+    if unproven || (ahead && !body.excluded.is_empty()) {
+        return Err(OwnerRecoveryRefusal::RecoveryExclusionUnproven);
+    }
+    Ok(())
+}
+
+/// The V2 transition rule shared by [`validate_against_parent_v2`] and
+/// [`validate_sibling_v2`]: one commit at `parent_epoch + 1` with the
+/// commit-bound binding, and at least one leaf to remove.
+fn v2_transition_ok(
+    body: &OwnerRecoveryBodyV1,
+    kind: RecoveryCryptoKind,
+    parent_epoch: Option<u64>,
+    excluded: &[ExcludedSeatV2],
+) -> bool {
+    let OwnerRecoveryCryptoV1::TreeKem {
+        commits,
+        next_epoch,
+    } = &body.crypto
+    else {
+        return false;
+    };
+    let leafed = body
+        .removed
+        .iter()
+        .filter(|seat| seat.leaf_key_package_hash.is_some())
+        .count();
+    kind == RecoveryCryptoKind::TreeKem
+        && commits.len() == 1
+        && leafed.saturating_add(excluded.len()) > 0
+        && parent_epoch.map(|epoch| epoch.saturating_add(1)) == Some(*next_epoch)
+        && commits.first().is_some_and(|commit| {
+            body.commit.security_binding.as_deref()
+                == Some(treekem_binding_v2(*next_epoch, commit).as_str())
+        })
+}
+
+/// The structural V2 exclusion rule: ascending, unique, not the actor, not
+/// removed, the creator, and `seated(agent)` returns the committed leaf
+/// hash of an Active seat.
+fn v2_exclusions_ok(
+    body: &OwnerRecoveryBodyV1,
+    excluded: &[ExcludedSeatV2],
+    creator: &[u8; 32],
+    seated: impl Fn(&[u8; 32]) -> Option<String>,
+) -> bool {
+    let removed: BTreeSet<[u8; 32]> = body.removed.iter().map(|seat| seat.agent).collect();
+    excluded
+        .windows(2)
+        .all(|pair| pair[0].agent < pair[1].agent)
+        && excluded.iter().all(|seat| {
+            seat.agent != body.actor
+                && !removed.contains(&seat.agent)
+                && &seat.agent == creator
+                && seated(&seat.agent).as_deref() == Some(seat.leaf_key_package_hash.as_str())
+        })
+}
+
+fn validate_against_parent_with(
+    body: &OwnerRecoveryBodyV1,
+    parent: &GroupInfo,
+    current_epoch: u64,
+    revocations: &VerifiedAgentRevocations,
+    now_unix: u64,
+    v2: Option<&OwnerRecoveryBodyV2>,
+) -> Result<(), OwnerRecoveryRefusal> {
     if parent.withdrawn || parent.fork_quarantine.is_some() || body.commit.withdrawn {
         return Err(OwnerRecoveryRefusal::RecoveryGroupQuarantined);
     }
@@ -722,13 +1157,25 @@ pub fn validate_against_parent(
             return Err(OwnerRecoveryRefusal::RecoveryProofInvalid);
         }
     }
-    let binding_ok = match (&body.crypto, kind) {
+    let binding_ok = match (&body.crypto, kind, v2) {
+        (_, _, Some(v2)) => {
+            v2_transition_ok(body, kind, Some(current_epoch), &v2.excluded)
+                && v2_exclusions_ok(body, &v2.excluded, parent.creator.as_bytes(), |agent| {
+                    let agent_hex = hex::encode(agent);
+                    parent
+                        .members_v2
+                        .get(&agent_hex)
+                        .filter(|member| member.state == GroupMemberState::Active)
+                        .and_then(|member| member.treekem_key_package_hash.clone())
+                })
+        }
         (
             OwnerRecoveryCryptoV1::TreeKem {
                 commits,
                 next_epoch,
             },
             RecoveryCryptoKind::TreeKem,
+            None,
         ) => {
             let leaves = body
                 .removed
@@ -740,12 +1187,12 @@ pub fn validate_against_parent(
                 && body.commit.security_binding.as_deref()
                     == Some(treekem_binding(*next_epoch, commits).as_str())
         }
-        (OwnerRecoveryCryptoV1::Gss { next_secret_epoch }, RecoveryCryptoKind::Gss) => {
+        (OwnerRecoveryCryptoV1::Gss { next_secret_epoch }, RecoveryCryptoKind::Gss, None) => {
             *next_secret_epoch == committed_secret_epoch(parent).saturating_add(1)
                 && body.commit.security_binding.as_deref()
                     == Some(gss_binding(*next_secret_epoch).as_str())
         }
-        (OwnerRecoveryCryptoV1::SignedPublic, RecoveryCryptoKind::SignedPublic) => {
+        (OwnerRecoveryCryptoV1::SignedPublic, RecoveryCryptoKind::SignedPublic, None) => {
             body.commit.security_binding == parent.security_binding
         }
         _ => false,
@@ -804,6 +1251,34 @@ pub fn validate_sibling(
     revocations: &VerifiedAgentRevocations,
     now_unix: u64,
 ) -> Result<(), OwnerRecoveryRefusal> {
+    validate_sibling_with(body, current, revocations, now_unix, None)
+}
+
+/// [`validate_sibling`] for a V2 body (#2139): the same checks on
+/// `body.core`, with the V2 transition (one commit at the parent's epoch
+/// plus one, the commit-bound binding) and the structural exclusion rule
+/// against the retained parent roster. A V2 recovery and a V1 or V2
+/// recovery on the same parent are therefore fork evidence for each other.
+///
+/// # Errors
+///
+/// As [`validate_sibling`].
+pub fn validate_sibling_v2(
+    body: &OwnerRecoveryBodyV2,
+    current: &GroupInfo,
+    revocations: &VerifiedAgentRevocations,
+    now_unix: u64,
+) -> Result<(), OwnerRecoveryRefusal> {
+    validate_sibling_with(&body.core, current, revocations, now_unix, Some(body))
+}
+
+fn validate_sibling_with(
+    body: &OwnerRecoveryBodyV1,
+    current: &GroupInfo,
+    revocations: &VerifiedAgentRevocations,
+    now_unix: u64,
+    v2: Option<&OwnerRecoveryBodyV2>,
+) -> Result<(), OwnerRecoveryRefusal> {
     if current.withdrawn || current.fork_quarantine.is_some() || body.commit.withdrawn {
         return Err(OwnerRecoveryRefusal::RecoveryGroupQuarantined);
     }
@@ -843,7 +1318,7 @@ pub fn validate_sibling(
         return Err(OwnerRecoveryRefusal::RecoveryHeadMismatch);
     }
     validate_sibling_mandate(body, current, &parent.roster, revocations, now_unix)?;
-    validate_sibling_transition(body, current, parent)
+    validate_sibling_transition(body, current, parent, v2)
 }
 
 fn validate_sibling_mandate(
@@ -914,6 +1389,7 @@ fn validate_sibling_transition(
     body: &OwnerRecoveryBodyV1,
     current: &GroupInfo,
     parent: &crate::groups::state_commit::RetainedCommit,
+    v2: Option<&OwnerRecoveryBodyV2>,
 ) -> Result<(), OwnerRecoveryRefusal> {
     let kind = crypto_kind(current);
     let named = &body.mandate.body.revoked_admins;
@@ -933,13 +1409,25 @@ fn validate_sibling_transition(
         }
     }
     let parent_binding = parent.commit.security_binding.as_deref();
-    let binding_ok = match (&body.crypto, kind) {
+    let binding_ok = match (&body.crypto, kind, v2) {
+        (_, _, Some(v2)) => {
+            let parent_epoch = parent_binding.and_then(|b| binding_epoch(b, "treekem:epoch="));
+            v2_transition_ok(body, kind, parent_epoch, &v2.excluded)
+                && v2_exclusions_ok(body, &v2.excluded, current.creator.as_bytes(), |agent| {
+                    parent
+                        .roster
+                        .get(&hex::encode(agent))
+                        .filter(|seat| seat.state == GroupMemberState::Active)
+                        .and_then(|seat| seat.treekem_key_package_hash.clone())
+                })
+        }
         (
             OwnerRecoveryCryptoV1::TreeKem {
                 commits,
                 next_epoch,
             },
             RecoveryCryptoKind::TreeKem,
+            None,
         ) => {
             let leaves = body
                 .removed
@@ -953,13 +1441,13 @@ fn validate_sibling_transition(
                 && body.commit.security_binding.as_deref()
                     == Some(treekem_binding(*next_epoch, commits).as_str())
         }
-        (OwnerRecoveryCryptoV1::Gss { next_secret_epoch }, RecoveryCryptoKind::Gss) => {
+        (OwnerRecoveryCryptoV1::Gss { next_secret_epoch }, RecoveryCryptoKind::Gss, None) => {
             let parent_epoch = parent_binding.and_then(|b| binding_epoch(b, "gss:epoch="));
             parent_epoch.map(|epoch| epoch.saturating_add(1)) == Some(*next_secret_epoch)
                 && body.commit.security_binding.as_deref()
                     == Some(gss_binding(*next_secret_epoch).as_str())
         }
-        (OwnerRecoveryCryptoV1::SignedPublic, RecoveryCryptoKind::SignedPublic) => {
+        (OwnerRecoveryCryptoV1::SignedPublic, RecoveryCryptoKind::SignedPublic, None) => {
             body.commit.security_binding.as_deref() == parent_binding
         }
         _ => false,
@@ -1578,6 +2066,460 @@ mod tests {
         assert_eq!(promoted.role, GroupRole::Admin);
         assert_eq!(other.role, GroupRole::Member);
         assert_eq!(other.state, GroupMemberState::Active);
+    }
+
+    // ─── #2139: OwnerRecoveryV2 ────────────────────────────────────────
+
+    /// The creator's committed certificate expired at this time.
+    const CREATOR_NOT_AFTER: u64 = NOW - 7_200;
+
+    /// A TreeKEM fixture whose creator is `other`, a Member held on its own
+    /// expired committed certificate, with a committed leaf.
+    fn v2_fixture() -> Fixture {
+        let mut f = treekem();
+        let cert = AgentCertificate::issue_with_expiry(&f.owner, &f.other, Some(CREATOR_NOT_AFTER))
+            .expect("cert");
+        let other_hex = hex::encode(f.other.agent_id().as_bytes());
+        let seat = f.info.members_v2.get_mut(&other_hex).expect("other seat");
+        seat.certificate_digest = Some(crate::groups::owner_cert::certificate_digest_hex(&cert));
+        seat.certificate = Some(cert);
+        f.info.creator = f.other.agent_id();
+        f.info.recompute_state_hash();
+        assert!(f.info.creator_expired_certificate_hold(&other_hex, NOW));
+        f
+    }
+
+    fn excluded_creator(f: &Fixture) -> Vec<ExcludedSeatV2> {
+        let other_hex = hex::encode(f.other.agent_id().as_bytes());
+        vec![ExcludedSeatV2 {
+            agent: *f.other.agent_id().as_bytes(),
+            leaf_key_package_hash: f.info.members_v2[&other_hex]
+                .treekem_key_package_hash
+                .clone()
+                .expect("leaf"),
+        }]
+    }
+
+    /// A V2 body on `f.info` at TreeKEM epoch `epoch`, with one stand-in
+    /// commit (the library rule does not parse it) and `crypto` edited by
+    /// `edit` before the seal.
+    fn commit_v2_for(
+        f: &Fixture,
+        excluded: Vec<ExcludedSeatV2>,
+        anchor: u64,
+        epoch: u64,
+        edit: impl FnOnce(&mut OwnerRecoveryBodyV1, &mut GroupInfo),
+    ) -> OwnerRecoveryBodyV2 {
+        let mut core = commit_for(f, mandate_for(f), epoch);
+        let commit = vec![0x2b_u8; 40];
+        let next_epoch = epoch + 1;
+        core.crypto = OwnerRecoveryCryptoV1::TreeKem {
+            commits: vec![commit.clone()],
+            next_epoch,
+        };
+        let mut next = f.info.clone();
+        apply_roster_change(&mut next, &core);
+        next.secret_epoch = next_epoch;
+        next.security_binding = Some(treekem_binding_v2(next_epoch, &commit));
+        edit(&mut core, &mut next);
+        core.commit =
+            CommitHeaderV1::from(&next.seal_commit_evicting(&f.promoted, 2_000).expect("seal"));
+        OwnerRecoveryBodyV2 {
+            core,
+            excluded,
+            exclusion_anchor_unix: anchor,
+        }
+    }
+
+    #[test]
+    fn a_v2_frame_has_its_own_prefix_and_a_crossed_prefix_is_malformed() {
+        let f = v2_fixture();
+        let body = commit_v2_for(&f, excluded_creator(&f), NOW, 3, |_, _| {});
+        let signed = sign_commit_v2(body, &f.promoted).expect("sign");
+        verify_commit_v2_signatures(&signed).expect("signatures");
+        let frame = OwnerRecoveryFrameV1::CommitV2(Box::new(signed.clone()));
+        let bytes = encode_frame(&frame).expect("encode");
+        assert!(bytes.starts_with(OWNER_RECOVERY_V2_PREFIX));
+        assert!(!bytes.starts_with(OWNER_RECOVERY_PREFIX));
+        assert!(is_owner_recovery_payload(&bytes));
+        assert_eq!(decode_frame(&bytes), Ok(frame.clone()));
+        // The carrier gates the V2 prefix on bit 23: a receiver that has
+        // bit 7 only is refused before any write.
+        assert_eq!(
+            crate::dm::CapabilityRegistry::required_for_payload(&bytes),
+            Some((
+                crate::dm::CapabilityRegistry::OWNER_RECOVERY_V2,
+                "owner_recovery_v2"
+            ))
+        );
+        let bit_7_only = crate::dm::CapabilityRegistry {
+            version: 1,
+            bits: crate::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
+        };
+        assert!(matches!(
+            bit_7_only.require_payload(&bytes),
+            Err(crate::dm::DmError::RecipientUpgradeRequired {
+                capability: "owner_recovery_v2"
+            })
+        ));
+        // The same postcard frame under the V1 prefix: the carrier would
+        // gate it on bit 7 only, so the decoder refuses it.
+        let crossed = [
+            OWNER_RECOVERY_PREFIX,
+            &bytes[OWNER_RECOVERY_V2_PREFIX.len()..],
+        ]
+        .concat();
+        assert_eq!(decode_frame(&crossed), Err(OwnerRecoveryRefusal::Malformed));
+        // A V1 commit under the V2 prefix is refused the same way.
+        let v1 = OwnerRecoveryFrameV1::Commit(Box::new(
+            sign_commit(commit_for(&f, mandate_for(&f), 3), &f.promoted).expect("sign"),
+        ));
+        let v1_bytes = encode_frame(&v1).expect("encode");
+        let crossed = [
+            OWNER_RECOVERY_V2_PREFIX,
+            &v1_bytes[OWNER_RECOVERY_PREFIX.len()..],
+        ]
+        .concat();
+        assert_eq!(decode_frame(&crossed), Err(OwnerRecoveryRefusal::Malformed));
+        // The V1 signature domain does not verify a V2 body, nor the reverse.
+        let mut as_v1 = SignedOwnerRecoveryV1 {
+            body: signed.body.core.clone(),
+            signature: signed.signature.clone(),
+        };
+        assert_eq!(
+            verify_commit_signatures(&as_v1),
+            Err(OwnerRecoveryRefusal::RecoveryMemberIneligible)
+        );
+        as_v1.signature = sign_commit(as_v1.body.clone(), &f.promoted)
+            .expect("sign")
+            .signature;
+        assert!(verify_commit_signatures(&as_v1).is_ok());
+        let mut tampered = signed;
+        tampered.body.exclusion_anchor_unix += 1;
+        assert_eq!(
+            verify_commit_v2_signatures(&tampered),
+            Err(OwnerRecoveryRefusal::RecoveryMemberIneligible)
+        );
+    }
+
+    /// What a 0.49.x receiver does with a V2 frame. Its decoder is this
+    /// copy of the released one: the frame enum has only `Mandate` and
+    /// `Commit`, and the prefix is `X0XORC1`. Its direct listener routes a
+    /// payload to owner recovery only by that prefix; anything else is
+    /// parsed as a JSON metadata event and dropped when it does not parse.
+    #[test]
+    fn a_049_receiver_refuses_a_v2_frame_fail_closed() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        enum ReleasedFrame {
+            Mandate(SignedOwnerRecoveryMandateV1),
+            Commit(Box<SignedOwnerRecoveryV1>),
+        }
+        fn released_decode(payload: &[u8]) -> Result<ReleasedFrame, OwnerRecoveryRefusal> {
+            let body = payload
+                .strip_prefix(b"X0XORC1".as_slice())
+                .ok_or(OwnerRecoveryRefusal::WrongPrefix)?;
+            let (frame, rest) = postcard::take_from_bytes::<ReleasedFrame>(body)
+                .map_err(|_| OwnerRecoveryRefusal::Malformed)?;
+            if !rest.is_empty() {
+                return Err(OwnerRecoveryRefusal::Malformed);
+            }
+            Ok(frame)
+        }
+        let f = v2_fixture();
+        let body = commit_v2_for(&f, excluded_creator(&f), NOW, 3, |_, _| {});
+        let frame = OwnerRecoveryFrameV1::CommitV2(Box::new(
+            sign_commit_v2(body, &f.promoted).expect("sign"),
+        ));
+        let bytes = encode_frame(&frame).expect("encode");
+        // The listener never hands it to owner recovery, and it is no
+        // metadata event: nothing is applied.
+        assert!(!bytes.starts_with(b"X0XORC1"));
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
+        assert_eq!(
+            released_decode(&bytes).err(),
+            Some(OwnerRecoveryRefusal::WrongPrefix)
+        );
+        // Even under the old prefix the released decoder cannot read
+        // variant 2.
+        let crossed = [
+            b"X0XORC1".as_slice(),
+            &bytes[OWNER_RECOVERY_V2_PREFIX.len()..],
+        ]
+        .concat();
+        assert_eq!(
+            released_decode(&crossed).err(),
+            Some(OwnerRecoveryRefusal::Malformed)
+        );
+    }
+
+    #[test]
+    fn a_valid_v2_body_is_accepted_and_v1_rules_refuse_its_core() {
+        let f = v2_fixture();
+        let body = commit_v2_for(&f, excluded_creator(&f), NOW, 3, |_, _| {});
+        assert_eq!(
+            validate_against_parent_v2(&body, &f.info, 3, &f.revocations, NOW),
+            Ok(())
+        );
+        assert_eq!(
+            validate_against_parent(&body.core, &f.info, 3, &f.revocations, NOW),
+            Err(OwnerRecoveryRefusal::RecoveryProofInvalid),
+            "the core is no valid V1 body: its binding and commit count differ"
+        );
+        // One leafed revoked admin and no exclusion is also a valid V2.
+        let plain = commit_v2_for(&f, Vec::new(), 0, 3, |_, _| {});
+        assert_eq!(
+            validate_against_parent_v2(&plain, &f.info, 3, &f.revocations, NOW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn malformed_v2_bodies_are_typed_refusals() {
+        let f = v2_fixture();
+        let refuse = |body: &OwnerRecoveryBodyV2| {
+            validate_against_parent_v2(body, &f.info, 3, &f.revocations, NOW)
+        };
+        let invalid = Err(OwnerRecoveryRefusal::RecoveryProofInvalid);
+        let excluded = excluded_creator(&f);
+
+        let two_commits = commit_v2_for(&f, excluded.clone(), NOW, 3, |core, next| {
+            let commits = vec![vec![1u8; 8], vec![2u8; 8]];
+            next.security_binding = Some(treekem_binding_v2(4, &commits[0]));
+            core.crypto = OwnerRecoveryCryptoV1::TreeKem {
+                commits,
+                next_epoch: 4,
+            };
+        });
+        assert_eq!(refuse(&two_commits), invalid, "an extra commit");
+
+        let no_commit = commit_v2_for(&f, excluded.clone(), NOW, 3, |core, next| {
+            next.security_binding = Some(treekem_binding(3, &[]));
+            core.crypto = OwnerRecoveryCryptoV1::TreeKem {
+                commits: Vec::new(),
+                next_epoch: 3,
+            };
+        });
+        assert_eq!(refuse(&no_commit), invalid, "no commit");
+
+        let v1_binding = commit_v2_for(&f, excluded.clone(), NOW, 3, |core, next| {
+            if let OwnerRecoveryCryptoV1::TreeKem { commits, .. } = &core.crypto {
+                next.security_binding = Some(treekem_binding(4, commits));
+            }
+        });
+        assert_eq!(refuse(&v1_binding), invalid, "the V1 binding");
+
+        let epoch = commit_v2_for(&f, excluded.clone(), NOW, 5, |_, _| {});
+        assert_eq!(refuse(&epoch), invalid, "the wrong epoch");
+
+        let mut duplicate = commit_v2_for(&f, excluded.clone(), NOW, 3, |_, _| {});
+        duplicate.excluded.push(duplicate.excluded[0].clone());
+        assert_eq!(refuse(&duplicate), invalid, "a duplicate excluded seat");
+
+        let mut wrong_leaf = commit_v2_for(&f, excluded.clone(), NOW, 3, |_, _| {});
+        wrong_leaf.excluded[0].leaf_key_package_hash = "other".to_string();
+        assert_eq!(refuse(&wrong_leaf), invalid, "another leaf hash");
+
+        let actor = ExcludedSeatV2 {
+            agent: *f.promoted.agent_id().as_bytes(),
+            leaf_key_package_hash: f.info.members_v2
+                [&hex::encode(f.promoted.agent_id().as_bytes())]
+                .treekem_key_package_hash
+                .clone()
+                .expect("leaf"),
+        };
+        let own = commit_v2_for(&f, vec![actor], NOW, 3, |_, _| {});
+        assert_eq!(refuse(&own), invalid, "the actor's own seat");
+
+        let admin = ExcludedSeatV2 {
+            agent: *f.admin.agent_id().as_bytes(),
+            leaf_key_package_hash: f.info.members_v2[&hex::encode(f.admin.agent_id().as_bytes())]
+                .treekem_key_package_hash
+                .clone()
+                .expect("leaf"),
+        };
+        let removed = commit_v2_for(&f, vec![admin], NOW, 3, |_, _| {});
+        assert_eq!(refuse(&removed), invalid, "a removed seat");
+
+        // A non-creator seat with an expired certificate is not excludable.
+        let mut g = v2_fixture();
+        g.info.creator = g.admin.agent_id();
+        g.info.recompute_state_hash();
+        let not_creator = commit_v2_for(&g, excluded_creator(&g), NOW, 3, |_, _| {});
+        assert_eq!(
+            validate_against_parent_v2(&not_creator, &g.info, 3, &g.revocations, NOW),
+            invalid,
+            "a seat that is not the creator"
+        );
+
+        // An anchor before the certificate expired.
+        let early = commit_v2_for(&f, excluded.clone(), CREATOR_NOT_AFTER - 1, 3, |_, _| {});
+        assert_eq!(refuse(&early), invalid, "not expired at the anchor");
+
+        // Nothing to remove: no leafed removed seat and no exclusion.
+        let mut h = v2_fixture();
+        let admin_hex = hex::encode(h.admin.agent_id().as_bytes());
+        h.info
+            .members_v2
+            .get_mut(&admin_hex)
+            .expect("admin")
+            .treekem_key_package_hash = None;
+        h.info.recompute_state_hash();
+        let empty = commit_v2_for(&h, Vec::new(), NOW, 3, |_, _| {});
+        assert_eq!(
+            validate_against_parent_v2(&empty, &h.info, 3, &h.revocations, NOW),
+            invalid,
+            "an empty removal"
+        );
+
+        // V2 on a GSS group.
+        let gss = fixture(
+            GroupConfidentiality::MlsEncrypted,
+            crate::mls::SecureGroupPlane::Gss,
+        );
+        let mut on_gss = commit_v2_for(&f, Vec::new(), NOW, 3, |_, _| {});
+        on_gss.core = commit_for(&gss, mandate_for(&gss), 3);
+        assert_eq!(
+            validate_against_parent_v2(&on_gss, &gss.info, 3, &gss.revocations, NOW),
+            invalid,
+            "a GSS group"
+        );
+    }
+
+    /// Two honest receivers whose clocks differ by 400 s, near the
+    /// exclusion. The anchor is the author's clock; the creator's
+    /// certificate counts as expired (`not_after` + 300 s skew) one second
+    /// before it. The slow receiver keeps
+    /// the body (`recovery_exclusion_unproven`) and accepts it when its
+    /// clock is within the lead of the anchor; neither receiver ever refuses
+    /// it, so both end on the same head. A rule that read the expiry at the
+    /// receiver's own clock (`seat_expiry_due` at `now`) splits them: the
+    /// slow receiver would refuse the body for good.
+    #[test]
+    fn receivers_with_skewed_clocks_agree_on_an_exclusion() {
+        let anchor = NOW;
+        let mut f = v2_fixture();
+        let other_hex = hex::encode(f.other.agent_id().as_bytes());
+        let cert = AgentCertificate::issue_with_expiry(
+            &f.owner,
+            &f.other,
+            Some(anchor - EXCLUSION_ANCHOR_LEAD_SECS - 1),
+        )
+        .expect("cert");
+        let seat = f.info.members_v2.get_mut(&other_hex).expect("seat");
+        seat.certificate_digest = Some(crate::groups::owner_cert::certificate_digest_hex(&cert));
+        seat.certificate = Some(cert);
+        f.info.recompute_state_hash();
+        let body = commit_v2_for(&f, excluded_creator(&f), anchor, 3, |_, _| {});
+        let check = |now| validate_against_parent_v2(&body, &f.info, 3, &f.revocations, now);
+
+        let fast = anchor + 200;
+        let slow = anchor - 200;
+        assert_eq!(check(fast), Ok(()));
+        assert_eq!(check(slow), Ok(()), "within the lead");
+        let slower = anchor - EXCLUSION_ANCHOR_LEAD_SECS - 100;
+        assert_eq!(
+            check(slower),
+            Err(OwnerRecoveryRefusal::RecoveryExclusionUnproven),
+            "too far behind: kept for a retry, not refused"
+        );
+        assert_eq!(
+            check(slower + 100),
+            Ok(()),
+            "accepted once the clock catches up"
+        );
+
+        let seat = &f.info.members_v2[&other_hex];
+        let receiver_clock_rule = |now| crate::groups::cert_rebind::seat_expiry_due(seat, now);
+        assert_ne!(
+            receiver_clock_rule(fast),
+            receiver_clock_rule(slow),
+            "a receiver-clock rule would decide the two receivers differently"
+        );
+    }
+
+    #[test]
+    fn missing_certificate_bytes_keep_a_v2_body_for_a_retry() {
+        let mut f = v2_fixture();
+        let body = commit_v2_for(&f, excluded_creator(&f), NOW, 3, |_, _| {});
+        let other_hex = hex::encode(f.other.agent_id().as_bytes());
+        f.info
+            .members_v2
+            .get_mut(&other_hex)
+            .expect("seat")
+            .certificate = None;
+        assert_eq!(
+            validate_against_parent_v2(&body, &f.info, 3, &f.revocations, NOW),
+            Err(OwnerRecoveryRefusal::RecoveryExclusionUnproven)
+        );
+    }
+
+    #[test]
+    fn the_author_excludes_only_the_held_creator_and_needs_v2_for_two_leaves() {
+        let f = v2_fixture();
+        let actor = *f.promoted.agent_id().as_bytes();
+        let removed = BTreeSet::from([*f.admin.agent_id().as_bytes()]);
+        assert_eq!(
+            recovery_exclusions(&f.info, &actor, &removed, NOW),
+            excluded_creator(&f)
+        );
+        assert!(
+            recovery_exclusions(&f.info, &actor, &removed, CREATOR_NOT_AFTER - 1).is_empty(),
+            "not expired at the anchor"
+        );
+        assert!(
+            recovery_exclusions(&f.info, f.other.agent_id().as_bytes(), &removed, NOW).is_empty(),
+            "the creator is the actor"
+        );
+        let plain = treekem();
+        assert!(
+            recovery_exclusions(&plain.info, &actor, &removed, NOW).is_empty(),
+            "a creator with a valid certificate"
+        );
+        let leafed = |n: u8| RemovedSeatV1 {
+            agent: [n; 32],
+            leaf_key_package_hash: Some(format!("kp{n}")),
+        };
+        let leafless = RemovedSeatV1 {
+            agent: [9; 32],
+            leaf_key_package_hash: None,
+        };
+        assert!(!recovery_needs_v2(&[leafed(1), leafless.clone()], &[]));
+        assert!(recovery_needs_v2(&[leafed(1), leafed(2)], &[]));
+        assert!(recovery_needs_v2(&[leafless], &excluded_creator(&f)));
+        assert_eq!(
+            v2_receiver_holders([[3u8; 32], [1u8; 32], [2u8; 32]], |id| id == &[2u8; 32]),
+            vec![[1u8; 32], [3u8; 32]]
+        );
+    }
+
+    /// A V2 recovery and a V1 recovery on the same retained parent are fork
+    /// evidence for each other.
+    #[test]
+    fn a_v2_recovery_on_a_retained_parent_is_a_sibling() {
+        let mut f = v2_fixture();
+        f.info.security_binding = Some("treekem:epoch=3".to_string());
+        f.info
+            .seal_commit_evicting(&f.admin, 500)
+            .expect("seal parent");
+        let theirs = commit_v2_for(&f, excluded_creator(&f), NOW, 3, |_, _| {});
+        let ours = own_branch(&f, &theirs.core);
+        assert_ne!(ours.state_hash, theirs.core.commit.state_hash);
+        assert_eq!(
+            validate_sibling_v2(&theirs, &ours, &f.revocations, NOW),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sibling(&theirs.core, &ours, &f.revocations, NOW),
+            Err(OwnerRecoveryRefusal::RecoveryProofInvalid),
+            "the V1 rule does not read a V2 sibling"
+        );
+        let mut wrong = theirs.clone();
+        wrong.excluded[0].leaf_key_package_hash = "other".to_string();
+        assert_eq!(
+            validate_sibling_v2(&wrong, &ours, &f.revocations, NOW),
+            Err(OwnerRecoveryRefusal::RecoveryProofInvalid)
+        );
     }
 
     #[test]

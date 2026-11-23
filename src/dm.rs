@@ -217,6 +217,17 @@ impl CapabilityRegistry {
     /// receiver recomputes the legacy binding for a ban and refuses it.
     pub const REMOVAL_COMMIT_BINDING_V1: u64 = 1 << 22;
 
+    /// #2139 (David's decision of 22 Nov 2026: fix it with a saorsa-mls
+    /// multi-remove and a new body version): verifies and applies the
+    /// `OwnerRecoveryV2` commit (`X0XORC2`), whose one TreeKEM commit removes
+    /// every revoked admin's leaf and the held expired creator's leaf
+    /// together. Bit 23, the next free bit. The promoted member authors V2
+    /// only while every survivor is ready: its current verified advert
+    /// carries this bit, or the sticky record holds it
+    /// ([`crate::dm_capability::CapabilityStore::registry_bit_ready`]).
+    /// Otherwise it holds; it never sends V1 in place of a needed V2.
+    pub const OWNER_RECOVERY_V2: u64 = 1 << 23;
+
     /// The routes supported by every receiver of this release.
     /// Route-gated bits (`grant_revocation_push_v1`,
     /// `join_request_outcome_v1`, `join_request_head_v1`, `data_read_v1`,
@@ -242,7 +253,8 @@ impl CapabilityRegistry {
                 | Self::TREEKEM_CATCHUP_REFUSAL_V1
                 | Self::SHARE_GRANT_NAMES_V1
                 | Self::ROSTER_ONLY_BAN_V1
-                | Self::REMOVAL_COMMIT_BINDING_V1,
+                | Self::REMOVAL_COMMIT_BINDING_V1
+                | Self::OWNER_RECOVERY_V2,
         }
     }
 
@@ -297,6 +309,8 @@ impl CapabilityRegistry {
             Some((Self::CERTIFICATE_REBIND_V1, "certificate_rebind_v1"))
         } else if payload.starts_with(crate::groups::owner_recovery::OWNER_RECOVERY_PREFIX) {
             Some((Self::OWNER_RECOVERY_V1, "owner_recovery_v1"))
+        } else if payload.starts_with(crate::groups::owner_recovery::OWNER_RECOVERY_V2_PREFIX) {
+            Some((Self::OWNER_RECOVERY_V2, "owner_recovery_v2"))
         } else if payload.starts_with(crate::gui::remote::SHOW_REQUEST_PREFIX)
             || payload.starts_with(crate::gui::remote::SHOW_RESULT_PREFIX)
             || payload.starts_with(crate::gui::remote::ACTIVITY_PREFIX)

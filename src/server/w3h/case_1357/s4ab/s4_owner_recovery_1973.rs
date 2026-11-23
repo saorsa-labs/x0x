@@ -219,25 +219,26 @@ impl Watch {
 }
 
 /// The kind of a frame E received that carries keys or a commit for
-/// `e1`, if `payload` is one: an owner-recovery commit (`X0XORC1`, any
+/// `e1`, if `payload` is one: an owner-recovery commit (`X0XORC1` or `X0XORC2`, any
 /// epoch: the only one in this arm is the e0+1 recovery), a GSS share
 /// (`secure_share_delivered`), a catch-up page with a link at `e1`, or a
 /// metadata event at `e1`.
 fn keyed_at(payload: &[u8], e1: u64) -> Option<String> {
     use crate::groups::owner_recovery::{
-        decode_frame, OwnerRecoveryCryptoV1, OwnerRecoveryFrameV1, OWNER_RECOVERY_PREFIX,
+        decode_frame, is_owner_recovery_payload, OwnerRecoveryCryptoV1, OwnerRecoveryFrameV1,
     };
-    if payload.starts_with(OWNER_RECOVERY_PREFIX) {
+    if is_owner_recovery_payload(payload) {
         return match decode_frame(payload) {
-            Ok(OwnerRecoveryFrameV1::Commit(commit)) => {
-                let epoch = match &commit.body.crypto {
+            Ok(OwnerRecoveryFrameV1::Mandate(_)) => None,
+            Ok(frame) => {
+                let commit = frame.into_commit()?;
+                let epoch = match &commit.core().crypto {
                     OwnerRecoveryCryptoV1::TreeKem { next_epoch, .. } => Some(*next_epoch),
                     OwnerRecoveryCryptoV1::Gss { next_secret_epoch } => Some(*next_secret_epoch),
                     _ => None,
                 };
                 Some(format!("owner-recovery commit to epoch {epoch:?}"))
             }
-            Ok(OwnerRecoveryFrameV1::Mandate(_)) => None,
             Err(error) => Some(format!("undecoded owner-recovery frame ({error:?})")),
         };
     }

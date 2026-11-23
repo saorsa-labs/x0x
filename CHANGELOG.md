@@ -6,6 +6,25 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Owner recovery removes every revoked leaf and the held creator's leaf in
+  one TreeKEM commit (`OwnerRecoveryV2`, #2139; A09, A15 and A08 amendments
+  of 23 Nov 2026).** A TreeKEM owner recovery that excludes the creator held
+  on its own expired certificate, or removes two or more leaves, now sends a
+  V2 frame (prefix `X0XORC2`, capability bit 23 `owner_recovery_v2`). Its one
+  commit, made by saorsa-mls `remove_members`, gives none of the removed
+  leaves the new epoch; the creator stays seated with no leaf. Receivers
+  check that the commit removes exactly those leaves and read the creator's
+  expiry at the author's signed anchor, so receivers with different clocks
+  agree. Other recoveries are V1, unchanged. saorsa-mls is now 0.3.10.
+  **Upgrade note:** the promoted member sends V2 only when every survivor is
+  ready (a current advert with bit 23, or the sticky record of it).
+  Otherwise its status shows `waiting_for_receiver_upgrade` with
+  `"capability": "owner_recovery_v2"` and nothing is committed; one survivor
+  never seen with bit 23 blocks the recovery until it upgrades and is online
+  once, or leaves. A 0.49.x node is never sent a V2 frame and applies
+  nothing from one. Giving the creator a leaf again after the owner
+  re-certifies it is still open (#2197).
+
 - **Launcher enable step 2: data-root stage lock, installer plan anchor and
   a signed launcher asset (#2012; A14 amendment of 22 Nov 2026).** The
   prepare producer holds a lock on the data root

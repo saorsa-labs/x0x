@@ -2383,8 +2383,14 @@ every wait. A wait always names its cause; it does not stop silently.
     `{"state": "waiting_for_recovery_member" | "waiting_for_receiver_upgrade", "promoted_member", "mandate_id", "parent_head", "advert"}`
     until the promoted member commits. On the promoted member,
     `promoted_member` is `{"state", "named", "parent_head"}`; `state` is
-    `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
-    lists each Active member whose current advert lacks bit 7),
+    `mandate_received`, `waiting_for_receiver_upgrade` (with
+    `"capability": "owner_recovery_v1"`: the D76 hold, `named` lists each
+    Active member whose current advert lacks bit 7; with
+    `"capability": "owner_recovery_v2"` (#2139): the recovery needs the V2
+    body, because it excludes the held creator's leaf or removes two or more
+    leaves, and `named` lists each survivor not ready for bit 23, meaning no
+    current verified advert with the bit and no sticky record of it. Nothing
+    is committed while it holds, and V1 is never sent instead),
     `waiting_for_member_key_package`, `waiting_for_member_eviction`
     (#1973: the recovery seal was refused),
     `waiting_for_creator_certificate_renewal` (#2120: the creator's own
