@@ -100,6 +100,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The `x0x` CLI could crash with a stack overflow on Windows (#1764; A11
+  amendment of 22 Nov 2026).** A debug `x0x autostart` on a hosted Windows
+  runner exited with `STATUS_STACK_OVERFLOW` (0xC00000FD). The CLI ran its
+  async main on the process main thread, which has 1 MiB of stack on Windows,
+  and building the clap command tree there needs more: on a macOS arm64 debug
+  build it overflowed a 1.5 MiB thread and fit in 2 MiB, and the old debug
+  `x0x --version` aborted with the main stack limited to 1 MiB. The CLI now
+  runs on a thread named `x0x-main` with an 8 MiB stack, as `x0xd` does
+  since #2083. Release builds were not measured here; the `ci-full.yml`
+  Windows job now runs `--version`, `--help` and `autostart --help` on both
+  the debug and the release `x0x.exe`. Exit codes are unchanged, except that
+  a failure to start the CLI runtime now prints an error and exits 1 instead
+  of panicking.
 - **Package size:** the v0.49.0 crate was 12.4 MiB compressed and crates.io
   rejected it (413, 10 MiB limit). The `exclude` list now drops `tests/` (except
   the two `[[test]]` targets), `docs/`, `issues/`, `scripts/`, `.github/`,

@@ -1356,14 +1356,22 @@ version 2. A version-1 wrapper refuses supervised self-update; run
 `x0x autostart` to regenerate it. Before #1588, Windows refused every
 supervised apply, so no working setup loses self-update.
 
-CI (`Test Suite (Windows)`, `windows-latest`) runs the pipe, clock,
-record-barrier and foreground exit-status tests
+CI (`Test Suite (Windows)`, `windows-latest`, in `ci-full.yml`) runs the
+pipe, clock, record-barrier and foreground exit-status tests
 (`cargo test --lib windows_exec_regressions`,
-`cargo test --test upgrade_journal`). It does not run a Windows service
-or a second local user.
+`cargo test --test upgrade_journal`). It then runs the flush-owner
+acceptance (#1764, `scripts/ci/windows-flush-acceptance.ps1`): the real
+`x0xd` under a wrapper made by `x0x autostart`, with no peers and with
+self-update on but its release sources off. The flush owner starts only
+when self-update is on (`[update] enabled = true`).
+It checks the owner start and pipe name, the token checks, a refusal for a
+second non-admin local user, the wrapper restart rule with a stub child,
+and the directory barrier on NTFS (see [`cicd.md`](cicd.md)).
 
-Owed: final acceptance is a supervised self-update run on a Windows VM.
-That run is not done yet.
+Owed: a supervised self-update run on Windows (#1764 items 2 and 3): a
+real apply that exits 100 and restarts on the new version, and an injected
+flush failure that restores the old binary and exits 75. The hosted run
+does not do this: it has no signed test release to download.
 
 ### Migrating an existing launchd job
 

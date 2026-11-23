@@ -16,6 +16,14 @@ on:
   schedule:
     - cron: '17 2 * * *'
   workflow_dispatch:
+    inputs:
+      only:
+        description: "Jobs to run: all, or only Test Suite (Windows) (#1764). The nightly schedule always runs all."
+        type: choice
+        options:
+          - all
+          - windows
+        default: all
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,6 +46,7 @@ concurrency:
 jobs:
   test:
     name: Test Suite (full)
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -317,6 +326,7 @@ jobs:
 
   signing-path-100k:
     name: Signing path 100k acceptance
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -453,6 +463,7 @@ jobs:
   # namespace (scripts/ci/prepare-released-h-s3-home.sh).
   h-s3-home-released:
     name: H-S3-home released binaries
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -529,6 +540,7 @@ jobs:
   # matches the VM runs.
   h-s3-released-rows:
     name: H-S3-rm released-binary rows
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -609,6 +621,7 @@ jobs:
 
   linux-systemd-policy:
     name: Linux systemd policy acceptance
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -742,6 +755,7 @@ jobs:
     # `s4-1973`, and the #2004 expired-member arm has `s4-2004`.
     # A group is omitted when the tree has no matching test.
     name: W3-H shard plan
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -767,6 +781,7 @@ jobs:
     # below is the D196 gate and counts 20 receipts per case.
     # `fail-fast: false` so one bad group still uploads traces.
     name: W3-H shard (${{ matrix.group }})
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     needs: w3h-plan
     runs-on: ubuntu-latest
     # Every S3 group (`s3`, and `s3-c`, `s3-c2`, `s3-c3`, `s3-d8` for the
@@ -911,7 +926,7 @@ jobs:
     # The check name stays `W3-H harness (determinism)`.
     name: W3-H harness (determinism)
     needs: w3h-shard
-    if: always() && !cancelled()
+    if: always() && !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.only == 'all')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1230,14 +1245,22 @@ jobs:
 
       # #894: scripts/install.ps1 must at least parse under both Windows
       # PowerShell 5.1 (what `irm | iex` runs on a stock machine) and pwsh 7.
-      - name: Parse-check scripts/install.ps1
+      # #1764: the flush-owner acceptance scripts run under pwsh 7 (main) and
+      # Windows PowerShell 5.1 (the second-user client); parse both early.
+      - name: Parse-check the PowerShell scripts
         shell: pwsh
         run: |
-          $check = '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1).Path, [ref]$null, [ref]$e); if ($e) { $e | Out-String | Write-Host; exit 1 }'
-          foreach ($exe in @('powershell', 'pwsh')) {
-            & $exe -NoProfile -Command $check
-            if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed to parse under $exe" }
+          $scripts = @('scripts/install.ps1', 'scripts/ci/windows-flush-acceptance-peer.ps1', 'scripts/ci/windows-cli-stack-check.ps1')
+          foreach ($script in $scripts) {
+            $check = "`$e = `$null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path '$script').Path, [ref]`$null, [ref]`$e); if (`$e) { `$e | Out-String | Write-Host; exit 1 }"
+            foreach ($exe in @('powershell', 'pwsh')) {
+              & $exe -NoProfile -Command $check
+              if ($LASTEXITCODE -ne 0) { throw "$script failed to parse under $exe" }
+            }
           }
+          $e = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/ci/windows-flush-acceptance.ps1').Path, [ref]$null, [ref]$e)
+          if ($e) { $e | Out-String | Write-Host; throw 'windows-flush-acceptance.ps1 failed to parse under pwsh' }
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
@@ -1301,8 +1324,59 @@ jobs:
       - name: Run the upgrade journal integration tests
         run: cargo test --test upgrade_journal
 
+      # #1764: process-level acceptance of the flush owner on this hosted
+      # Windows Server runner. The real x0xd runs under the real
+      # `x0x autostart` v2 wrapper with an isolated loopback config (no seeds,
+      # no mDNS, no port mapping; self-update on with its release sources off,
+      # because the flush owner needs it). The script checks the
+      # owner start, the pipe name and server, the token checks, a refusal for
+      # a second non-admin local user, the wrapper restart rule (stub child)
+      # and the directory barrier on NTFS. It runs no supervised apply.
+      - name: Build x0xd and x0x for the flush-owner acceptance
+        id: acceptance_build
+        if: always()
+        run: cargo build --bin x0xd --bin x0x
+
+      # #1764: the debug `x0x` overflowed the 1 MiB Windows main-thread
+      # stack (exit 0xC00000FD) in `x0x autostart`, because clap built its
+      # command tree there. The CLI now runs on `x0x-main` with an explicit
+      # stack, like x0xd (#2083). These commands only parse arguments.
+      - name: CLI starts without a stack overflow (debug)
+        id: cli_stack_debug
+        if: always() && steps.acceptance_build.outcome == 'success'
+        shell: pwsh
+        run: ./scripts/ci/windows-cli-stack-check.ps1 -X0x target/debug/x0x.exe
+
+      - name: Build the release x0x
+        id: release_cli_build
+        if: always() && steps.acceptance_build.outcome == 'success'
+        run: cargo build --release --bin x0x
+
+      - name: CLI starts without a stack overflow (release)
+        if: always() && steps.release_cli_build.outcome == 'success'
+        shell: pwsh
+        run: ./scripts/ci/windows-cli-stack-check.ps1 -X0x target/release/x0x.exe
+
+      - name: Windows flush-owner acceptance (#1764)
+        if: always() && steps.acceptance_build.outcome == 'success'
+        shell: pwsh
+        run: >-
+          ./scripts/ci/windows-flush-acceptance.ps1
+          -X0xd target/debug/x0xd.exe -X0x target/debug/x0x.exe
+          -Evidence "$env:RUNNER_TEMP/windows-flush-acceptance"
+          -Work "$env:RUNNER_TEMP/windows-flush-acceptance-work"
+
+      - name: Upload Windows flush-owner acceptance evidence
+        if: always() && steps.acceptance_build.outcome == 'success'
+        uses: actions/upload-artifact@v5
+        with:
+          name: windows-flush-acceptance
+          path: ${{ runner.temp }}/windows-flush-acceptance/
+          if-no-files-found: error
+
   coverage:
     name: Coverage Gate
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
     runs-on: ubuntu-latest
     # 150 min holds the serialised build below: the full job measured
     # 75m48s (job 130877153343) and 64m21s on a same-head rerun (job

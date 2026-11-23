@@ -13,7 +13,10 @@ pub use auth::{gui_idle_timeout, DEFAULT_GUI_IDLE_TIMEOUT_MINUTES, MAX_GUI_IDLE_
 pub mod config;
 mod crdt_subscriptions;
 mod daemon_runtime;
-pub use daemon_runtime::{run_daemon_runtime, DAEMON_MAIN_THREAD_NAME, DAEMON_THREAD_STACK_BYTES};
+pub use daemon_runtime::{
+    run_cli_runtime, run_daemon_runtime, CLI_MAIN_THREAD_NAME, DAEMON_MAIN_THREAD_NAME,
+    DAEMON_THREAD_STACK_BYTES,
+};
 mod data_read;
 mod delegations;
 mod delivery_gate;
