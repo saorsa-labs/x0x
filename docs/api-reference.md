@@ -3110,8 +3110,11 @@ Success `200`:
 
 Effectiveness is exactly "the carrier message is durably committed in this
 group's history" — never "the notification was received". `notification`
-reports the best-effort DM handoff to the delegate (`"durable_ack"` or
-`"unreachable:<error>"`) and is informational only. The notification DM
+reports the best-effort DM handoff to the delegate and is informational
+only: `"durable_ack"` (gossip-inbox path; the delegate's application ACK
+arrived), `"raw_quic_acked"` (raw-QUIC path; the delegate's reader drained
+the bytes, no application ACK), `"raw_quic"`, `"relayed"`, `"loopback"`, or
+`"unreachable:<error>"`. The notification DM
 payload is the ASCII prefix `x0x-delegation:v1:` followed by the signed
 delegation JSON (arrays-of-bytes fields; no outer wrapper).
 

@@ -342,6 +342,9 @@ mod tests {
     fn ordinary_send_budget_sums_the_configured_stages() {
         let config = dm::DmSendConfig {
             timeout_per_attempt: Duration::from_secs(2),
+            // No receive-pipeline ACK: the raw stage falls back to the
+            // per-attempt timeout (the default carries one since #2187).
+            raw_quic_receive_ack_timeout: None,
             ..Default::default()
         };
         // evidence 2 + refresh 3 + dial 3 + raw (2*2 + 0.25)

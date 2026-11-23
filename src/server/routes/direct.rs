@@ -37,7 +37,7 @@ pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
     x0x::dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(8),
         prefer_raw_quic_if_connected: true,
-        raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
+        raw_quic_receive_ack_timeout: Some(x0x::dm::DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT),
         ..x0x::dm::DmSendConfig::default()
     }
 }

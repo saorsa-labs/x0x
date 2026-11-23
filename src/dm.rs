@@ -1338,11 +1338,28 @@ pub struct DmSendConfig {
     /// If true and `require_gossip` is false, first try the legacy/raw
     /// QUIC direct-stream path when a live direct connection already exists.
     /// If that fast path is unavailable, fall back to the normal
-    /// capability-aware send logic.
+    /// capability-aware send logic. A strict send
+    /// (`require_durable_app_ack`) never takes this path.
+    ///
+    /// Defaults to `true` (#2187), matching the `POST /direct/send` daemon
+    /// default: a connected peer is reached in one direct stream instead of
+    /// a gossip-inbox publish that the mesh relays. Callers that need the
+    /// gossip-inbox application ACK must set this to `false` (or set
+    /// `require_gossip`). The default pairs this with
+    /// `raw_quic_receive_ack_timeout =`
+    /// [`DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT`], so a raw-QUIC success still
+    /// means the recipient's reader drained the bytes.
     pub prefer_raw_quic_if_connected: bool,
     /// When set, raw-QUIC sends use ant-quic's receive-pipeline ACK surface
     /// and only return success after the remote reader task has drained the
     /// bytes. `None` keeps the old fire-and-forget raw path.
+    ///
+    /// Defaults to `Some(`[`DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT`]`)` (#2187),
+    /// the value the `POST /direct/send` product path uses. The library
+    /// default must equal the product-path default on both halves: raw-QUIC
+    /// preferred AND the receive-pipeline ACK. Preferring raw QUIC without
+    /// the ACK would silently weaken delivery to fire-and-forget, which A07
+    /// forbids. Set `None` explicitly to opt into fire-and-forget.
     pub raw_quic_receive_ack_timeout: Option<Duration>,
     /// If true, a preferred raw-QUIC failure is terminal and the sender will
     /// not silently fall back to gossip-inbox even when a capability advert is
@@ -1383,17 +1400,21 @@ impl Default for DmSendConfig {
     fn default() -> Self {
         // Adaptive default: unknown peers fall back to 250 ms × 16 = 4 s.
         // `Agent::send_direct_with_config` replaces this fallback with the
-        // peer-specific bootstrap-cache EWMA RTT when available. The raw-QUIC
-        // receive-pipeline ACK is opt-in: leaving it disabled preserves the
-        // legacy fire-and-forget raw fallback and lets capability-aware sends
-        // prefer the gossip-inbox path's application-level ACK.
+        // peer-specific bootstrap-cache EWMA RTT when available. Since #2187
+        // the default equals the `POST /direct/send` product path: a
+        // connected peer is tried over raw QUIC first, WITH the ant-quic
+        // receive-pipeline ACK, so the raw path is never fire-and-forget by
+        // default. Callers that need the gossip-inbox path's
+        // application-level ACK set `prefer_raw_quic_if_connected` to false.
         Self {
             timeout_per_attempt: dm_attempt_timeout(None),
             max_retries: 1,
             backoff: BackoffPolicy::ExponentialFromTimeout { factor: 2 },
             require_gossip: false,
-            prefer_raw_quic_if_connected: false,
-            raw_quic_receive_ack_timeout: None,
+            // #2187: match the HTTP API default (src/api/mod.rs
+            // `body_bool_default_true("prefer_raw_quic_if_connected")`).
+            prefer_raw_quic_if_connected: true,
+            raw_quic_receive_ack_timeout: Some(DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT),
             stop_fallback_on_raw_error: false,
             require_gossip_ack: true,
             require_durable_app_ack: false,
@@ -1406,6 +1427,11 @@ impl Default for DmSendConfig {
 
 /// X0X-0041: default prefer-newest-connection grace window.
 pub const DEFAULT_PREFER_NEWEST_GRACE_MS: u64 = 250;
+
+/// #2187: default raw-QUIC receive-pipeline ACK timeout. It is shared by
+/// [`DmSendConfig::default`] and the daemon's `POST /direct/send` product
+/// path, so the library default and the product-path default cannot drift.
+pub const DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// x0x #1150 (ADR 0107; lifecycle note section 2.7): the synchronous,
 /// authoritative half of a recovery-response admission. It runs once, at
@@ -3325,8 +3351,24 @@ mod tests {
             cfg.backoff,
             BackoffPolicy::ExponentialFromTimeout { factor: 2 }
         ));
-        assert_eq!(cfg.raw_quic_receive_ack_timeout, None);
         assert!(!cfg.stop_fallback_on_raw_error);
+    }
+
+    #[test]
+    fn default_dm_send_config_prefers_raw_quic_like_the_http_api() {
+        // Why (#2187): the library default must match the `POST /direct/send`
+        // product path on BOTH halves: raw QUIC preferred
+        // (`body_bool_default_true`) AND the receive-pipeline ACK. Raw QUIC
+        // without the ACK would silently weaken delivery to fire-and-forget.
+        let cfg = DmSendConfig::default();
+        assert!(cfg.prefer_raw_quic_if_connected);
+        assert_eq!(
+            cfg.raw_quic_receive_ack_timeout,
+            Some(DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT)
+        );
+        assert_eq!(DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT, Duration::from_secs(8));
+        assert!(!cfg.require_gossip);
+        assert!(!cfg.require_durable_app_ack);
     }
 
     /// #461 phase 1: the winning authenticated ACK's ingress is stamped;

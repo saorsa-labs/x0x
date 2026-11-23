@@ -11158,9 +11158,12 @@ impl Agent {
     ///
     /// See [`dm::DmError`].
     ///
-    /// Uses the default capability-aware policy. Call
-    /// [`Self::send_direct_with_config`] to opt into the raw-QUIC fast path
-    /// explicitly.
+    /// Uses [`dm::DmSendConfig::default`], which since #2187 first tries the
+    /// raw-QUIC fast path when a live direct connection to the recipient
+    /// already exists (matching the `POST /direct/send` default), then falls
+    /// back to the capability-aware policy above. Call
+    /// [`Self::send_direct_with_config`] with `prefer_raw_quic_if_connected:
+    /// false` to keep the gossip-inbox path and its application-level ACK.
     pub async fn send_direct(
         &self,
         to: &identity::AgentId,
@@ -35071,6 +35074,8 @@ mod tests {
                 b"stale-block-clear".to_vec(),
                 dm::DmSendConfig {
                     prefer_raw_quic_if_connected: true,
+                    // Fire-and-forget raw: this test pins `DmPath::RawQuic`.
+                    raw_quic_receive_ack_timeout: None,
                     ..dm::DmSendConfig::default()
                 },
             )
@@ -35228,6 +35233,8 @@ mod tests {
                 b"post-reconnect-probe".to_vec(),
                 dm::DmSendConfig {
                     prefer_raw_quic_if_connected: true,
+                    // Fire-and-forget raw: this test pins `DmPath::RawQuic`.
+                    raw_quic_receive_ack_timeout: None,
                     ..dm::DmSendConfig::default()
                 },
             )
@@ -35406,6 +35413,8 @@ mod tests {
                 b"post-reconnect-global-bootstrap".to_vec(),
                 dm::DmSendConfig {
                     prefer_raw_quic_if_connected: true,
+                    // Fire-and-forget raw: this test pins `DmPath::RawQuic`.
+                    raw_quic_receive_ack_timeout: None,
                     ..dm::DmSendConfig::default()
                 },
             )

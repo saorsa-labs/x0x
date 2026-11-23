@@ -1490,18 +1490,37 @@ impl std::fmt::Debug for PubSubManager {
     }
 }
 
-const FULL_EAGER_DEGREE_CEILING: usize = 6;
-// Compile-time pin (#674 design C1): the ceiling must equal sg's promotion
-// floor so the all-cooled rescue path swaps eager members instead of growing
-// toward sg's stock 12. A runtime test cannot discriminate this in steady
-// state (any ceiling >= 6 promotes to 6), so the constant itself is the
-// contract; raising it past 6 (or using sg's `0` sentinel) fails to compile.
-// This does NOT track sg's floor: if a future saorsa-gossip raises
-// `MIN_EAGER_DEGREE`, revisit this value so x0x does not cap the backbone
-// below what sg intends.
+/// PlumTree eager-degree ceiling for Full (and relay) participation.
+///
+/// saorsa-gossip promotes lazy peers to eager up to
+/// `MIN_EAGER_DEGREE.min(ceiling)`, with `MIN_EAGER_DEGREE = 6` (sg 0.5.97).
+/// Under #674 design C1 this ceiling was 6, equal to sg's floor, so it only
+/// bounded the all-cooled rescue path (stopping growth toward sg's stock 12)
+/// and never changed the steady-state degree. At 3 the ceiling sits BELOW
+/// sg's floor, so it now sets the steady-state eager degree of every Full
+/// topic without a preferred eager set to 3 (#2187, Wave 1). A topic owner's
+/// preferred eager set (group rosters) still raises the per-topic ceiling to
+/// the size of that set inside sg.
+///
+/// Why 3 (#2187): the E0-b egress attribution (x0x#2189) found that 88% of
+/// EAGER sends are `relay_forward` + `anti_entropy_push` + `iwant_reply`.
+/// `relay_forward` scales linearly with eager degree, so halving the degree
+/// from 6 to 3 halves relay-forward egress; PlumTree's lazy IHAVE/IWANT path
+/// still repairs any message the thinner eager tree misses.
+///
+/// Risk: sg's rescue and degree-maintenance behaviour with a ceiling below
+/// its own floor of 6 is untested territory upstream. The Wave 1 soak
+/// watches delivery rate, delivery p95 and message-cache RSS for this
+/// change; revisit the value if any of those regress, and revisit it if a
+/// future saorsa-gossip changes `MIN_EAGER_DEGREE`.
+const FULL_EAGER_DEGREE_CEILING: usize = 3;
+// Compile-time pin (#2187): the Wave 1 value is a deliberate contract, so a
+// change to it must be a deliberate edit of this assert as well. The steady-
+// state degree is also pinned at runtime by
+// `full_participation_eager_fanout_is_capped_at_ceiling_with_twelve_candidates`.
 const _: () = assert!(
-    FULL_EAGER_DEGREE_CEILING == 6,
-    "FULL_EAGER_DEGREE_CEILING must equal sg's MIN_EAGER_DEGREE (6); see #674 design C1"
+    FULL_EAGER_DEGREE_CEILING == 3,
+    "FULL_EAGER_DEGREE_CEILING must be 3 (#2187 Wave 1: halves relay_forward egress; see x0x#2189)"
 );
 
 fn drain_all_unstamped(deliveries: &TopicDeliveryMap) {
@@ -5558,15 +5577,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn full_eager_degree_ceiling_is_wave1_value() {
+        // Why (#2187 Wave 1): Full nodes run a 3-peer eager tree, below sg's
+        // MIN_EAGER_DEGREE (6), to halve relay_forward egress (x0x#2189).
+        assert_eq!(FULL_EAGER_DEGREE_CEILING, 3);
+    }
+
     #[tokio::test]
-    async fn full_participation_eager_fanout_meets_sg_floor_with_twelve_candidates() {
-        // Why (#674 design C1): with 12 candidate peers a Full node must eager-
-        // push to exactly sg's promotion floor (6) per publish, before and after
-        // a membership refresh. This pins the steady-state degree (a floor); it
-        // cannot discriminate the ceiling because sg promotes to
-        // MIN_EAGER_DEGREE.min(ceiling) and any ceiling >= 6 gives the same
-        // result — the ceiling's own value is pinned by
-        // `full_eager_degree_ceiling_equals_sg_promotion_floor` below.
+    async fn full_participation_eager_fanout_is_capped_at_ceiling_with_twelve_candidates() {
+        // Why (#2187 Wave 1): with 12 candidate peers a Full node must eager-
+        // push to exactly FULL_EAGER_DEGREE_CEILING (3) peers per publish,
+        // before and after a membership refresh. sg promotes to
+        // MIN_EAGER_DEGREE.min(ceiling) = 6.min(3) = 3, so unlike the old
+        // ceiling of 6 (#674 design C1) this test DOES discriminate the
+        // ceiling: a ceiling of 6 or more would give 6 sends here.
         let manager = slice1_manager(2, true).await;
         *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
             peers: (1..=12).rev().map(|id| PeerId::new([id; 32])).collect(),
@@ -5588,8 +5613,8 @@ mod tests {
             let sends = await_eager_settled_attempts(&manager, attempted).await;
             assert_eq!(
                 sends.len(),
-                6,
-                "Full eager fan-out must equal sg's 6-peer promotion floor with 12 candidates"
+                FULL_EAGER_DEGREE_CEILING,
+                "Full eager fan-out must equal the 3-peer Full ceiling with 12 candidates"
             );
             recorded_eager(&manager);
             assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
@@ -6505,9 +6530,11 @@ mod tests {
     /// forces the pinned [8] eager over a full eager set.
     #[tokio::test]
     async fn full_publish_initialize_is_add_only_and_never_forces_preferred_eager() {
-        // Full, ceiling 6, pinned bootstrap [8]; six connected peers fill eager.
+        // Full, ceiling FULL_EAGER_DEGREE_CEILING (3), pinned bootstrap [8];
+        // that many connected peers fill eager.
         let manager = slice1_manager(2, true).await;
-        let initial: Vec<[u8; 32]> = (1..=6).map(|id| [id; 32]).collect();
+        let ceiling = u8::try_from(FULL_EAGER_DEGREE_CEILING).expect("ceiling fits u8");
+        let initial: Vec<[u8; 32]> = (1..=ceiling).map(|id| [id; 32]).collect();
         set_plane(&manager, initial.clone());
         let name = "x0x/dm/v1/inbox/807-full-parity";
         let topic = TopicId::new([81; 32]);
@@ -6516,7 +6543,7 @@ mod tests {
             plane_roles(&manager, topic, &initial)
                 .iter()
                 .all(|(_, role)| role == "eager"),
-            "six connected peers fill the Full eager ceiling"
+            "ceiling-many connected peers fill the Full eager ceiling"
         );
 
         // The pinned Full/bootstrap peer connects; the publish re-seeds.
