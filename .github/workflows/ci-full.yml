@@ -739,6 +739,40 @@ jobs:
           if-no-files-found: error
 
 
+  # #1172: nothing else builds or starts a jemalloc x0xd. A separate job,
+  # because a jemalloc build of the bin rebuilds the crate with another
+  # feature set (too slow for the slim ci.yml Test Suite).
+  jemalloc-x0xd-smoke:
+    name: jemalloc x0xd smoke
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-jemalloc-smoke-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build x0xd with jemalloc
+        run: cargo build --locked --features jemalloc --bin x0xd
+
+      - name: Start x0xd and read the jemalloc options back
+        run: |
+          set -o pipefail
+          _RJEM_MALLOC_CONF=stats_print:true ./target/debug/x0xd --version 2>&1 | tee jemalloc-stats.txt
+          grep -E '^x0xd ' jemalloc-stats.txt
+          grep -E 'opt\.dirty_decay_ms: 1000\b' jemalloc-stats.txt
+          grep -E 'opt\.muzzy_decay_ms: 0\b' jemalloc-stats.txt
+          grep -E 'opt\.background_thread: true\b' jemalloc-stats.txt
+
   w3h-plan:
     # Names the case groups for the matrix. A case is in exactly one group.
     # S3 (`w3h_1356_`) and S4 (`w3h_1357_`) each have a group, so more of
