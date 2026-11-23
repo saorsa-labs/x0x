@@ -179,6 +179,7 @@ async fn removing_or_banning_another_member_keeps_listener() -> Result<()> {
             }
         } else {
             NamedGroupMetadataEvent::MemberRemoved {
+                target_key_package_b64: None,
                 group_id: STABLE.to_string(),
                 revision: next.roster_revision,
                 actor: local,
@@ -224,6 +225,7 @@ async fn self_removal_ban_and_group_deletion_stop_listener() -> Result<()> {
         ));
         let event = match terminal {
             "remove" => NamedGroupMetadataEvent::MemberRemoved {
+                target_key_package_b64: None,
                 group_id: STABLE.to_string(),
                 revision: next.roster_revision,
                 actor: local.clone(),

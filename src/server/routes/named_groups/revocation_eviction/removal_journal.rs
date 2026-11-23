@@ -380,6 +380,7 @@ mod tests {
 
     fn removal_bytes(prev: &str, hash: &str, target: &[u8; 32]) -> Vec<u8> {
         let event = NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: "g".to_string(),
             revision: 2,
             actor: "a".repeat(64),

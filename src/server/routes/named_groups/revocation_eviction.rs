@@ -9834,6 +9834,7 @@ pub(super) mod tests {
         removed.remove_member(&target_hex, Some(admin_hex.clone()));
         let commit = removed.seal_commit(state.agent.identity().agent_keypair(), now_unix_ms())?;
         let saved = super::super::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.clone(),
             revision,
             actor: admin_hex,

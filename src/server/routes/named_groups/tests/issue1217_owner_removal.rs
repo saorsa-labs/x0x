@@ -55,6 +55,7 @@ fn removal_notice(
     large: bool,
 ) -> NamedGroupMetadataEvent {
     NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group.to_owned(),
         revision: 3,
         actor: hex_of(authority),

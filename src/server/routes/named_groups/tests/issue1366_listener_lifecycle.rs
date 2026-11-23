@@ -315,6 +315,7 @@ async fn issue1366_applied_self_removal_stops_the_public_listener() -> Result<()
     next.roster_revision = next.roster_revision.saturating_add(1);
     next.remove_member(&local, Some(local.clone()));
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: stable.clone(),
         revision: next.roster_revision,
         actor: local.clone(),
@@ -895,6 +896,7 @@ async fn self_removal_event(
     next.roster_revision = next.roster_revision.saturating_add(1);
     next.remove_member(&local, Some(local.clone()));
     Ok(NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: stable.to_string(),
         revision: next.roster_revision,
         actor: local.clone(),
