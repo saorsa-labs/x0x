@@ -14,11 +14,14 @@ All notable changes to this project will be documented in this file.
   warning and `x0xd` was upgraded alone). On Windows a release archive
   without a usable `x0x.exe` now fails the apply too. A companion failure is
   recorded and shown by `/health`, `GET /diagnostics/upgrade`
-  (`companion_failure`) and `x0x doctor` with the path and the remedy, and
-  the same release is not downloaded again for 30 minutes, doubling up to
-  24 hours. The restart owner keeps both install locks until the process
-  exits, also through the HTTP apply's 750 ms delayed restart; inside the
-  daemon, a lock wait during that time (another apply, `--clear-hold`, a
+  (`companion_failure`) and `x0x doctor` with the path and the remedy while
+  that release is newer than the running daemon; a successful apply removes
+  the record. The same release is not applied again, by any apply including
+  `POST /upgrade/apply`, for 30 minutes, doubling up to 24 hours; removing
+  `upgrade-companion-failure.json` from the data directory allows a retry at
+  once. A corrupt record is reported and never holds a release. The restart owner keeps both install locks until the process
+  exits, also through the HTTP apply's 750 ms delayed restart; on Unix, inside
+  the daemon, a lock wait during that time (another apply, `--clear-hold`, a
   skill update, a probe retry) fails at once with "restart in progress". A
   power loss between the two renames now leaves the new `x0xd` beside the
   old `x0x` until the next release. A successful apply installs the same

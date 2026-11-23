@@ -216,6 +216,8 @@ pub(in crate::server) struct VerdictSample {
     pub upgrade_journal: Option<JournalReport>,
     /// A sibling `x0x` that made the last apply of a release fail (#2012).
     pub upgrade_companion_failure: Option<crate::upgrade::companion_failure::CompanionFailure>,
+    /// The companion failure record exists but cannot be read (#2012).
+    pub upgrade_companion_record_unreadable: bool,
     /// Age of the refresher's cached sample when it was served, set by
     /// the handler merge in `HealthSnapshot::merged_verdict_inputs`.
     /// `None` on a bare/unsampled sample (no staleness claim). Past
@@ -257,6 +259,7 @@ impl Default for VerdictSample {
             upgrade_failed_artifact: false,
             upgrade_journal: None,
             upgrade_companion_failure: None,
+            upgrade_companion_record_unreadable: false,
             sample_age_secs: None,
         }
     }
@@ -433,7 +436,10 @@ pub(in crate::server) async fn sample_verdict_inputs(
     // following recorded paths, or attempting recovery (ADR 0094 section 6).
     sample.upgrade_record_diagnostic = recovery_record_diagnostic(&state.data_dir);
     sample.upgrade_journal = journal_report(&state.data_dir);
-    sample.upgrade_companion_failure = crate::upgrade::companion_failure::current(&state.data_dir);
+    (
+        sample.upgrade_companion_failure,
+        sample.upgrade_companion_record_unreadable,
+    ) = companion_sample(&state.data_dir);
     sample.upgrade_failed_artifact = state
         .data_dir
         .join(crate::upgrade::restart::UPGRADE_FAILED_FILE_NAME)
@@ -484,6 +490,26 @@ fn journal_report(data_dir: &Path) -> Option<JournalReport> {
         failed_attempt: cause.is_some()
             || matches!(record.phase, Phase::Restored | Phase::RecoveryFailed),
     })
+}
+
+/// The companion failure record as the verdict reads it (#2012).
+fn companion_sample(
+    data_dir: &Path,
+) -> (
+    Option<crate::upgrade::companion_failure::CompanionFailure>,
+    bool,
+) {
+    use crate::upgrade::companion_failure::{current, Read};
+    match current(data_dir) {
+        Read::Record(record) => (Some(record), false),
+        Read::Unreadable => {
+            tracing::warn!(
+                "the companion failure record cannot be read; it is reported and ignored"
+            );
+            (None, true)
+        }
+        Read::Missing => (None, false),
+    }
 }
 
 /// Publish the boot-time diagnosis before HTTP starts serving or refresh waits.
@@ -694,6 +720,7 @@ input_report! {
         failed_artifact: bool,
         journal: Option<JournalReport>,
         companion_failure: Option<crate::upgrade::companion_failure::CompanionFailure>,
+        companion_record_unreadable: bool,
     }
 }
 
@@ -973,10 +1000,27 @@ pub(in crate::server) fn classify_with_detail(
         InputState::Degraded
     } else if let Some(failed) = &sample.upgrade_companion_failure {
         bump(InputState::Degraded);
+        let outcome = if failed.pair_mixed {
+            "the daemon could not be restored, so the installed pair is mixed and needs \
+             manual recovery"
+        } else {
+            "the installed binaries were not changed"
+        };
+        reasons.push(if access.shows_node_numbers() {
+            format!(
+                "the last apply of {} failed on the sibling x0x CLI ({} time(s)); {outcome}; \
+                 see x0x doctor",
+                failed.version, failed.failures
+            )
+        } else {
+            format!("the last update failed on the sibling x0x CLI; {outcome}")
+        });
+        InputState::Degraded
+    } else if sample.upgrade_companion_record_unreadable {
+        bump(InputState::Degraded);
         reasons.push(format!(
-            "the last apply of {} failed on the sibling x0x CLI ({} time(s)); the pair was \
-             kept and the release is retried after its backoff; see x0x doctor",
-            failed.version, failed.failures
+            "the companion failure record ({}) cannot be read; it is ignored; see x0x doctor",
+            crate::upgrade::companion_failure::RECORD
         ));
         InputState::Degraded
     } else if let Some(diagnostic) = &sample.upgrade_record_diagnostic {
@@ -1090,6 +1134,7 @@ pub(in crate::server) fn classify_with_detail(
                 failed_artifact: sample.upgrade_failed_artifact,
                 journal: sample.upgrade_journal.clone(),
                 companion_failure: sample.upgrade_companion_failure.clone(),
+                companion_record_unreadable: sample.upgrade_companion_record_unreadable,
             },
         },
     }
@@ -1938,14 +1983,26 @@ mod tests {
         )
         .unwrap();
         let mut failed = sample();
-        failed.upgrade_companion_failure = crate::upgrade::companion_failure::current(dir.path());
+        failed.upgrade_companion_failure = companion_sample(dir.path()).0;
+        assert!(failed.upgrade_companion_failure.is_some());
+        let redacted = classify_with_detail(&failed, DetailAccess::Redacted);
+        assert_eq!(redacted.inputs.upgrade.state, "degraded");
+        for reason in &redacted.reasons {
+            for leak in ["99.0.0", "time(s)", "/opt/x0x"] {
+                assert!(
+                    !reason.contains(leak),
+                    "redacted reason leaks {leak}: {reason}"
+                );
+            }
+        }
+        assert!(redacted.reasons.iter().any(|r| r.contains("not changed")));
         let verdict = classify(&failed);
         assert_eq!(verdict.inputs.upgrade.state, "degraded");
         assert!(
             verdict
                 .reasons
                 .iter()
-                .any(|r| r.contains("sibling x0x CLI")),
+                .any(|r| r.contains("sibling x0x CLI") && r.contains("99.0.0")),
             "{:?}",
             verdict.reasons
         );

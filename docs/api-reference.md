@@ -327,10 +327,14 @@ with a reason that names the phase and the cause. `x0x doctor` warns on the
 same journal, from `GET /diagnostics/upgrade` `plan`.
 
 `inputs.upgrade.companion_failure` (#2012) is `null`, or `{version, detail,
-failures, last_unix}` when the last apply of a release newer than the
-running one failed on the sibling `x0x` (`detail` is the apply's error and
-names the path). It degrades the upgrade input. It is gated detail: the
-redacted body leaves it out, as it does `latest_version`.
+failures, last_unix, pair_mixed}` when the last apply of a release newer than
+the running one failed on the sibling `x0x` (`detail` is the apply's error and
+names the path; `pair_mixed` is true when the daemon could not be restored).
+It degrades the upgrade input. It is gated detail: the redacted body leaves it
+out, as it does `latest_version`, and the redacted reason names neither the
+release nor the count. `inputs.upgrade.companion_record_unreadable` is true
+when that record exists but cannot be read (also degraded; it holds no
+release).
 
 `reasons` carries one sentence per non-`ok` input. Each input object has a
 `state` badge (`ok`/`degraded`/`error`) plus its fields:
@@ -4258,7 +4262,7 @@ environment or free-text causes.
 | `last_hold_clear` | `{version, cause, cleared_at_unix}` from the most recent local clear receipt, or `null` |
 | `backups` | Backup files beside the daemon and its sibling CLI: `{artifact, name, size_bytes, modified_unix}`, `artifact` `daemon` or `cli`, at most 32. Names are `<binary>.backup` (legacy) or `<binary>.backup-<version>-<transaction>` (pair apply) |
 | `launcher_gate` | (#2012) The prepare producer's last gate decision in this daemon process: `{open, reason, plan_anchor}`, or `null` before the first `x0xd` apply since the daemon started. `open` is `false` in this release on every host (the launcher is dormant); `reason` says why, and `plan_anchor` is the anchor path the unit names, or `null`. `x0x doctor` copies it into its upgrade check's evidence |
-| `companion_failure` | (#2012) `null`, or `{version, detail, failures, last_unix}` from `<data_root>/upgrade-companion-failure.json` when the last apply of a release newer than the running one failed on the sibling `x0x`; that release is not applied again before `last_unix` plus 30 minutes doubled per further failure (at most 24 hours). `x0x doctor` warns on it with the path and the remedy |
+| `companion_failure` | (#2012) `null`, `{"record": "unreadable"}` for a record that cannot be read (it holds no release), or `{version, detail, failures, last_unix, pair_mixed}` from `<data_root>/upgrade-companion-failure.json` when the last apply of a release newer than the running one failed on the sibling `x0x`. That release is not applied again, by any apply including `POST /upgrade/apply`, before `last_unix` plus 30 minutes doubled per further failure (at most 24 hours); removing the file allows a retry at once; a successful apply removes it. `x0x doctor` warns on it with the path and the remedy |
 | `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `probe terminalization record unreadable`, `hold clear receipt unreadable`, `journal record unreadable`, `handoff record unreadable`, `boot record unreadable`); several are joined with `; ` |
 
 Probe records and holds exist only on Unix installs. On Windows the fields are

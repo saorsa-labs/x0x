@@ -393,3 +393,95 @@ async fn an_in_process_lock_wait_fails_fast_while_the_restart_owner_holds_the_lo
     assert_eq!(std::fs::read(&pair.daemon).unwrap(), b"new-daemon");
     release_tx.send(()).unwrap();
 }
+
+/// #2012 review: dropping the restart owner's mark (a refused or abandoned
+/// restart) lets a later in-process wait take the lock. Red: a `Drop` that
+/// leaves the mark.
+#[test]
+fn a_released_restart_owner_mark_lets_a_later_wait_take_the_lock() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("x0xd");
+    std::fs::write(&target, b"daemon").unwrap();
+    let mark = super::super::RestartOwnerMark::new(&[&target]);
+    let refused = super::super::acquire_install_lock(&target).err().unwrap();
+    assert!(super::super::is_restart_in_progress(&refused), "{refused}");
+    drop(mark);
+    assert!(super::super::acquire_install_lock(&target).is_ok());
+}
+
+/// #2012 review: a wait that began before the mark (another holder had the
+/// lock) fails at its next poll once the restart owner's mark appears.
+/// Red: check the mark only once, before the wait.
+#[test]
+fn a_wait_that_began_before_the_mark_fails_at_its_next_poll() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("x0xd");
+    std::fs::write(&target, b"daemon").unwrap();
+    let holder = super::super::acquire_install_lock(&target).unwrap();
+    let waiting = target.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let _ = tx.send(super::super::acquire_install_lock(&waiting).map(drop));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(rx.try_recv().is_err(), "still waiting on the holder");
+    let mark = super::super::RestartOwnerMark::new(&[&target]);
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the waiter must stop at its next poll");
+    let error = result.expect_err("refused");
+    assert!(super::super::is_restart_in_progress(&error), "{error}");
+    waiter.join().unwrap();
+    drop(mark);
+    drop(holder);
+}
+
+/// #2012 review: a companion failure writes the record (with the mixed
+/// flag when the daemon could not be restored); any other error does not.
+/// The record then refuses the same release until it is removed; a
+/// successful apply's continuation removes it before the restart. Red:
+/// recording off, or the success path not clearing.
+#[test]
+fn a_companion_failure_is_recorded_and_backs_off_until_cleared() {
+    use super::super::companion_failure::{self as record, Read};
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let other = note_companion_failure(root, "9.0.0", UpgradeError::Other("network".into()));
+    assert_eq!(other.to_string(), "network");
+    assert_eq!(record::read(root), Read::Missing);
+    let failure = companion_failure(Path::new("/opt/x0x/x0x"), "denied", "nothing was replaced");
+    note_companion_failure(root, "9.0.0", failure);
+    let Read::Record(written) = record::read(root) else {
+        panic!("recorded");
+    };
+    assert_eq!((written.version.as_str(), written.failures), ("9.0.0", 1));
+    assert!(!written.pair_mixed);
+    let refused = refuse_backed_off(root, "9.0.0").unwrap_err();
+    assert!(
+        refused.to_string().starts_with(record::BACKOFF),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains(record::RECORD), "{refused}");
+    assert!(refuse_backed_off(root, "9.0.1").is_ok(), "a newer release");
+    let ran = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&ran);
+    let cont = clearing_companion_record(
+        root.to_path_buf(),
+        Box::new(move |_, _| seen.store(true, Ordering::SeqCst)),
+    );
+    let lock = super::super::acquire_install_lock(&root.join("x0xd")).unwrap();
+    cont(&[], HeldInstallLocks::files(&[], None, lock.into_file()));
+    assert!(ran.load(Ordering::SeqCst));
+    assert_eq!(record::read(root), Read::Missing);
+    assert!(refuse_backed_off(root, "9.0.0").is_ok());
+    let mixed = companion_failure(
+        Path::new("/opt/x0x/x0x"),
+        "denied",
+        &format!(
+            "the daemon binary cannot be restored (gone); {}",
+            record::MIXED
+        ),
+    );
+    note_companion_failure(root, "9.0.0", mixed);
+    assert!(matches!(record::read(root), Read::Record(r) if r.pair_mixed));
+}

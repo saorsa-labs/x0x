@@ -199,14 +199,23 @@ reported as below. In 0.49.1 and earlier a failed companion only logged a
 warning, and the daemon was upgraded alone.
 
 A companion failure is recorded in `<data_root>/upgrade-companion-failure.json`
-(release, the error naming the `x0x` path, the count, the time). `/health`
-(`inputs.upgrade.companion_failure`, loopback or owner only), `GET
-/diagnostics/upgrade` (`companion_failure`) and `x0x doctor` show it, with the
-remedy: make the file readable and `x0x.backup` and `x0x.upgrade.lock` beside
-it writable by the daemon's account, or reinstall `x0x`. The same release is
-not downloaded again for 30 minutes after the first such failure, doubling
-per further failure up to 24 hours; a newer release is tried at once. A record
-for the version the daemon now runs is not shown.
+(mode 0600, synced; release, the error naming the `x0x` path, the count, the
+time, and whether the pair was left mixed). The recorded failures are the
+companion's lock and swap failures and, on Windows, an archive without a
+usable `x0x.exe`; on Unix an archive without `x0x` fails earlier, at the probe
+extraction, and is not recorded. `/health` (`inputs.upgrade.companion_failure`,
+loopback or owner only; the redacted reason names neither the release nor the
+count), `GET /diagnostics/upgrade` (`companion_failure`) and `x0x doctor` show
+it while its release is newer than the running daemon, with the remedy: make
+the file readable and `x0x.backup` and `x0x.upgrade.lock` beside it writable by
+the daemon's account, or reinstall `x0x`. The same release is not applied
+again, by any apply including an operator's `POST /upgrade/apply`, for 30
+minutes after the first such failure, doubling per further failure up to 24
+hours; a newer release is tried at once, removing the record allows a retry at
+once, and a wait more than 24 hours ahead (a clock stepped back) is ignored. A
+successful apply removes the record. A record that cannot be read is reported
+(`{"record": "unreadable"}`, a degraded `/health` reason, a doctor warning) and
+never holds a release.
 
 Crash window: the two renames are separate steps. A power loss or kill
 between them leaves the new `x0xd` beside the old `x0x`. Nothing repairs this
@@ -219,10 +228,12 @@ until the process exits. The HTTP apply's deferred owner keeps them through
 its 750 ms delay and the restart. While they are held, no other process that
 takes these locks swaps the install between the swap and the exit. Not every
 reader takes them: `install.sh --binary` does not, and the dormant launcher
-takes no lock. Inside the daemon, every wait for these locks (a second apply,
-`x0x upgrade --clear-hold`, a skill update, the probe-retry loop) fails at
-once with "restart in progress" instead of waiting, so it cannot hold up the
-restart's shutdown drain. A restart that is refused (and restores the
+takes no lock. On Unix, inside the daemon, every wait for these locks (a
+second apply, `x0x upgrade --clear-hold`, a skill update, the probe-retry loop)
+fails with "restart in progress" instead of waiting, at once or at its next
+20 ms poll, so it cannot hold up the restart's shutdown drain. On Windows only
+a wait that starts after the restart owner took the locks fails at once; one
+that already started still blocks. A restart that is refused (and restores the
 binaries) releases the locks when it returns.
 
 A daemon apply that finds no sibling `x0x` records that the file is missing

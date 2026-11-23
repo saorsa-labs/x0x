@@ -540,6 +540,23 @@ mod store_integrity_tests {
             warning.contains("0.50.0") && warning.contains("reinstall"),
             "{warning}"
         );
+        assert!(
+            warning.contains("not changed") && !warning.contains("mixed"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("upgrade-companion-failure.json"),
+            "{warning}"
+        );
+        assert!(warning.contains("POST /upgrade/apply"), "{warning}");
+        let mut mixed = diagnostics.clone();
+        mixed["companion_failure"]["pair_mixed"] = true.into();
+        let warning = companion_failure(&mixed).expect("warned");
+        assert!(warning.contains("manual recovery") && !warning.contains("not changed"));
+        let unreadable = serde_json::json!({"companion_failure": {"record": "unreadable"}});
+        assert!(companion_failure(&unreadable)
+            .unwrap()
+            .contains("cannot be read"));
         assert!(companion_failure(&serde_json::json!({"companion_failure": null})).is_none());
     }
 
@@ -642,11 +659,19 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
 }
 
 /// A release whose apply failed on the sibling `x0x` (`/diagnostics/upgrade`
-/// `companion_failure`, #2012 review), with the path and the remedy.
+/// `companion_failure`, #2012 review): what happened, the path, and the
+/// remedy, including how to retry before the backoff ends.
 pub(crate) fn companion_failure(diagnostics: &serde_json::Value) -> Option<String> {
     let failed = diagnostics
         .get("companion_failure")
         .filter(|v| v.is_object())?;
+    let record = crate::upgrade::companion_failure::RECORD;
+    if failed.get("record").and_then(|v| v.as_str()) == Some("unreadable") {
+        return Some(format!(
+            "the companion failure record ({record} in the data directory) cannot be read; it \
+             is ignored and holds no release; remove it"
+        ));
+    }
     let text = |key: &str| {
         failed
             .get(key)
@@ -654,11 +679,19 @@ pub(crate) fn companion_failure(diagnostics: &serde_json::Value) -> Option<Strin
             .unwrap_or("unknown")
     };
     let number = |key: &str| failed.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let mixed = failed.get("pair_mixed").and_then(|v| v.as_bool()) == Some(true);
+    let outcome = if mixed {
+        "the daemon could not be restored, so a new x0xd runs beside the old x0x and the \
+         install needs manual recovery"
+    } else {
+        "the installed binaries were not changed"
+    };
     Some(format!(
-        "the update to {} failed {} time(s) on the sibling x0x CLI and both binaries were kept: \
-         {}. Fix that file (it must be readable, and x0x.backup and x0x.upgrade.lock beside it \
-         must be writable by the daemon's account), or reinstall x0x; the release is retried \
-         after unix time {}",
+        "the update to {} failed {} time(s) on the sibling x0x CLI; {outcome}: {}. Fix that \
+         file (it must be readable, and x0x.backup and x0x.upgrade.lock beside it must be \
+         writable by the daemon's account), or reinstall x0x. This release, also by POST \
+         /upgrade/apply, is retried after unix time {}; to retry it now, remove {record} from \
+         the data directory",
         text("version"),
         number("failures"),
         text("detail"),

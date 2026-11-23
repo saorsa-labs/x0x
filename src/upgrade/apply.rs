@@ -850,6 +850,41 @@ fn companion_failure(path: &Path, reason: &str, outcome: &str) -> UpgradeError {
     ))
 }
 
+/// Refuse a release whose apply failed on the sibling CLI until its
+/// backoff has passed. Removing `<data_root>/upgrade-companion-failure.json`
+/// allows the retry at once.
+fn refuse_backed_off(data_root: &Path, version: &str) -> Result<(), UpgradeError> {
+    let Some(failed) = super::companion_failure::backed_off(data_root, version) else {
+        return Ok(());
+    };
+    warn!(
+        version,
+        failures = failed.failures,
+        retry_at_unix = failed.retry_at_unix(),
+        detail = %failed.detail,
+        "not applying a release whose last apply failed on the sibling x0x CLI until its \
+         backoff passes; see x0x doctor"
+    );
+    Err(UpgradeError::Other(format!(
+        "{}: release {version} failed {} time(s) on the sibling x0x CLI; it is retried after \
+         unix time {}, or at once after {} is removed from the data directory ({})",
+        super::companion_failure::BACKOFF,
+        failed.failures,
+        failed.retry_at_unix(),
+        super::companion_failure::RECORD,
+        failed.detail
+    )))
+}
+
+/// A restart continuation that first removes the companion failure record:
+/// the apply succeeded, so its release no longer needs the backoff.
+fn clearing_companion_record(data_root: PathBuf, cont: RestartContinuation) -> RestartContinuation {
+    Box::new(move |swapped, locks| {
+        super::companion_failure::clear(&data_root);
+        cont(swapped, locks)
+    })
+}
+
 /// Record a companion failure (`error` starting with [`COMPANION_FAILURE`])
 /// for `/health`, `/diagnostics/upgrade`, `x0x doctor` and the backoff.
 /// Any other error passes through unrecorded.
@@ -910,8 +945,8 @@ fn restore_after_companion_failure(
                 cli,
                 reason,
                 &format!(
-                    "the daemon binary cannot be restored ({restore}); the installed pair is \
-                     mixed and needs manual recovery"
+                    "the daemon binary cannot be restored ({restore}); {}",
+                    super::companion_failure::MIXED
                 ),
             )
         }
@@ -1672,28 +1707,9 @@ impl AutoApplyUpgrader {
             )));
         }
         // A release whose apply failed on the sibling CLI is not downloaded
-        // again until its backoff has passed (#2012 review).
-        if let Some(failed) =
-            super::companion_failure::backed_off(&restart_plan.data_root, &manifest.version)
-        {
-            warn!(
-                version = %manifest.version,
-                failures = failed.failures,
-                retry_at_unix = failed.retry_at_unix(),
-                detail = %failed.detail,
-                "not applying a release whose last apply failed on the sibling x0x CLI \
-                 until its backoff passes; see x0x doctor"
-            );
-            return Err(UpgradeError::Other(format!(
-                "{}: release {} failed {} time(s) on the sibling x0x CLI; retry after unix \
-                 time {} ({})",
-                super::companion_failure::BACKOFF,
-                manifest.version,
-                failed.failures,
-                failed.retry_at_unix(),
-                failed.detail
-            )));
-        }
+        // again until its backoff has passed (#2012 review). This holds
+        // every apply of that release, an operator's included.
+        refuse_backed_off(&restart_plan.data_root, &manifest.version)?;
         #[cfg(unix)]
         let probe_launch = super::probe::ProbeLaunch::capture(&restart_plan.cwd);
         // Refuse a failed record barrier before download or replacement.
@@ -2044,6 +2060,8 @@ impl AutoApplyUpgrader {
             None
         };
 
+        let on_success =
+            on_success.map(|cont| clearing_companion_record(restart_plan.data_root.clone(), cont));
         self.check_release()?;
         super::monitor::validate_manifest_timestamp(manifest)?;
         let result = apply_replacements_with_producer(
@@ -2065,6 +2083,7 @@ impl AutoApplyUpgrader {
         })?;
 
         if matches!(result, UpgradeResult::Success { .. }) {
+            super::companion_failure::clear(&restart_plan.data_root);
             // ADR-0061 §6 — report honestly. Installed bytes, a pending
             // restart, observed readiness and recovery are four distinct
             // facts; only the first is established at this point. Immediate
