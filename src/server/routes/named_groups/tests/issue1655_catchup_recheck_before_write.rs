@@ -133,6 +133,7 @@ async fn a_next_page_ask_to_a_sender_revoked_mid_handler_is_not_sent() -> Result
     leaving.remove_member(&member_hex, Some(member_hex.clone()));
     let commit = leaving.seal_commit(&member_kp, now_millis_u64())?;
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision,
         actor: member_hex.clone(),

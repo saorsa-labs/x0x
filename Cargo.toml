@@ -45,7 +45,7 @@ ant-quic = "=0.29.0"
 # keep the bound so a `cargo update` or a downstream fresh resolve cannot pick it
 # (transitive via ant-quic) until tinyvec or the toolchain moves.
 tinyvec = { version = ">=1.9, <1.13", default-features = false }
-saorsa-mls = "0.3.8"
+saorsa-mls = "0.3.10"
 async-trait = "0.1"
 bincode = "1.3"
 blake3 = "1.5"

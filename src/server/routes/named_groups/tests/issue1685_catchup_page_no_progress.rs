@@ -72,6 +72,7 @@ fn fork_removal_page_event(
     )
     .expect("signed fork commit");
     NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.to_string(),
         revision,
         actor: responder_hex.clone(),
@@ -483,6 +484,7 @@ async fn a_progressing_truncated_page_still_re_requests_the_next_page() -> Resul
     leaving.remove_member(&member_hex, Some(member_hex.clone()));
     let commit = leaving.seal_commit(&member_kp, now_millis_u64())?;
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision,
         actor: member_hex.clone(),
@@ -606,6 +608,7 @@ async fn a_stale_duplicate_page_keeps_paging() -> Result<()> {
     leaving.remove_member(&member_hex, Some(member_hex.clone()));
     let commit = leaving.seal_commit(&member_kp, now_millis_u64())?;
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision,
         actor: member_hex.clone(),
@@ -770,6 +773,7 @@ async fn an_applied_replay_rearms_the_stopped_page_loop_to_the_terminal_page() -
     leaving.remove_member(v1_hex, Some(v1_hex.clone()));
     let commit1 = leaving.seal_commit(v1_kp, now_millis_u64())?;
     let event1 = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision: revision1,
         actor: v1_hex.clone(),
@@ -784,6 +788,7 @@ async fn an_applied_replay_rearms_the_stopped_page_loop_to_the_terminal_page() -
     leaving.remove_member(v2_hex, Some(v2_hex.clone()));
     let commit2 = leaving.seal_commit(v2_kp, now_millis_u64())?;
     let event2 = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision: revision2,
         actor: v2_hex.clone(),
@@ -1118,6 +1123,7 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
     leaving.remove_member(v1_hex, Some(v1_hex.clone()));
     let commit1 = leaving.seal_commit(v1_kp, now_millis_u64())?;
     let event1 = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision: revision1,
         actor: v1_hex.clone(),
@@ -1132,6 +1138,7 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
     leaving.remove_member(v2_hex, Some(v2_hex.clone()));
     let commit2 = leaving.seal_commit(v2_kp, now_millis_u64())?;
     let event2 = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision: revision2,
         actor: v2_hex.clone(),
@@ -1146,6 +1153,7 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
     leaving.remove_member(&responder_hex, Some(responder_hex.clone()));
     let commit3 = leaving.seal_commit(&responder, now_millis_u64())?;
     let removal = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision: revision3,
         actor: responder_hex.clone(),
@@ -1403,6 +1411,7 @@ async fn issue1685_chain_pair(
     leaving.remove_member(v1_hex, Some(v1_hex.clone()));
     let commit1 = leaving.seal_commit(v1_kp, now_millis_u64())?;
     let event1 = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.to_string(),
         revision: revision1,
         actor: v1_hex.clone(),
@@ -1417,6 +1426,7 @@ async fn issue1685_chain_pair(
     leaving.remove_member(v2_hex, Some(v2_hex.clone()));
     let commit2 = leaving.seal_commit(v2_kp, now_millis_u64())?;
     let event2 = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.to_string(),
         revision: revision2,
         actor: v2_hex.clone(),
@@ -1620,6 +1630,7 @@ async fn a_next_page_ask_that_cannot_leave_keeps_the_stopped_row_armed() -> Resu
     leaving.remove_member(&member_hex, Some(member_hex.clone()));
     let commit = leaving.seal_commit(&member_kp, now_millis_u64())?;
     let leave = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision,
         actor: member_hex.clone(),
@@ -3394,6 +3405,7 @@ async fn a_truncated_page_answering_a_pre_advance_ask_pages_on_from_the_moved_cu
     leaving.remove_member(&member_hex, Some(member_hex.clone()));
     let commit = leaving.seal_commit(&member_kp, now_millis_u64())?;
     let event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: group_id.clone(),
         revision,
         actor: member_hex.clone(),

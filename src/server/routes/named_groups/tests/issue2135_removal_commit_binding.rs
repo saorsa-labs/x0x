@@ -190,6 +190,7 @@ impl Fixture {
             }
         } else {
             NamedGroupMetadataEvent::MemberRemoved {
+                target_key_package_b64: None,
                 group_id: GROUP.to_string(),
                 revision,
                 actor: d_hex,
