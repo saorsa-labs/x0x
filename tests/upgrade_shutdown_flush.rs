@@ -574,23 +574,24 @@ macro_rules! shutdown_flush_regression_tests {
                     let exited = Arc::clone(&exit);
                     let restarted_plan = plan.clone();
                     let for_restart = reservation.clone();
-                    let on_success = Box::new(move |_: &[(PathBuf, PathBuf)]| {
-                        assert!(
-                            retained.seal_admission(),
-                            "normal shutdown must retain the admitted replacement owner"
-                        );
-                        assert_eq!(
-                            std::fs::read(&restarted_plan.executable).unwrap(),
-                            b"new candidate"
-                        );
-                        assert!(!restarted_plan.data_root.join(flush::RECORD).exists());
-                        AutoApplyUpgrader::new("x0xd")
-                            .with_flush_reservation(Some(for_restart))
-                            .trigger_restart_with_exit(&restarted_plan, "2.0.0", |_| {
-                                exited.store(true, Ordering::SeqCst);
-                            })
-                            .unwrap();
-                    });
+                    let on_success =
+                        Box::new(move |_: &[(PathBuf, PathBuf)], _: HeldInstallLocks| {
+                            assert!(
+                                retained.seal_admission(),
+                                "normal shutdown must retain the admitted replacement owner"
+                            );
+                            assert_eq!(
+                                std::fs::read(&restarted_plan.executable).unwrap(),
+                                b"new candidate"
+                            );
+                            assert!(!restarted_plan.data_root.join(flush::RECORD).exists());
+                            AutoApplyUpgrader::new("x0xd")
+                                .with_flush_reservation(Some(for_restart))
+                                .trigger_restart_with_exit(&restarted_plan, "2.0.0", |_| {
+                                    exited.store(true, Ordering::SeqCst);
+                                })
+                                .unwrap();
+                        });
                     let result = apply_replacements_with_permit(
                         Upgrader::new(plan.executable.clone(), semver::Version::new(1, 0, 0)),
                         incoming,

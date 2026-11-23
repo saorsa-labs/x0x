@@ -295,7 +295,8 @@ curl http://127.0.0.1:12700/health
 #       "identity":           { "state": "ok", "agent": true, "machine": true, "user_present": false },
 #       "upgrade":            { "state": "ok", "checks_enabled": true, "update_available": false,
 #                              "latest_version": null, "checked_age_secs": 254,
-#                              "handoff_pending": false, "failed_artifact": false }
+#                              "handoff_pending": false, "failed_artifact": false,
+#                              "journal": null, "companion_failure": null }
 #     }
 #   }
 # }
@@ -316,6 +317,24 @@ verdict. The legacy `status`/`degraded_reason` fields keep their exact
 peer-only semantics; the verdict is additive only — a client must ignore
 unknown fields, and later x0x versions may add `verdict` fields without a
 version bump.
+
+`inputs.upgrade.journal` (#2012) is `null` without a host journal, else
+`{phase, cause, failed_attempt}`: the journal's phase (snake case), its cause
+class (`failed`, `interrupted` or `null`; never the cause text), and
+`failed_attempt`, `true` when a cause is recorded or the phase is `restored`
+or `recovery_failed`. A failed attempt makes the upgrade input `degraded`
+with a reason that names the phase and the cause. `x0x doctor` warns on the
+same journal, from `GET /diagnostics/upgrade` `plan`.
+
+`inputs.upgrade.companion_failure` (#2012) is `null`, or `{version, detail,
+failures, last_unix, pair_mixed}` when the last apply of a release newer than
+the running one failed on the sibling `x0x` (`detail` is the apply's error and
+names the path; `pair_mixed` is true when the daemon could not be restored).
+It degrades the upgrade input. It is gated detail: the redacted body leaves it
+out, as it does `latest_version`, and the redacted reason names neither the
+release nor the count. `inputs.upgrade.companion_record_unreadable` is true
+when that record exists but cannot be read (also degraded; it holds no
+release).
 
 `reasons` carries one sentence per non-`ok` input. Each input object has a
 `state` badge (`ok`/`degraded`/`error`) plus its fields:
@@ -4242,6 +4261,8 @@ environment or free-text causes.
 | `holds` | Entries `{version, kind, cause, clearable}`. `kind` is `failed_release` (see `x0x upgrade --clear-hold`), `recovery_failed` (never clearable) or `unresolved_probe_record` (no local clear can run: an unresolved `.pending` terminalization marker beside the probe record, or a probe record barrier failure latched in this daemon process; never clearable, `cause` is `null`). `clearable` is `true` only when `x0x upgrade --clear-hold` would clear the hold: a `.pending` marker or a probe barrier failure in this daemon process makes every hold not clearable |
 | `last_hold_clear` | `{version, cause, cleared_at_unix}` from the most recent local clear receipt, or `null` |
 | `backups` | Backup files beside the daemon and its sibling CLI: `{artifact, name, size_bytes, modified_unix}`, `artifact` `daemon` or `cli`, at most 32. Names are `<binary>.backup` (legacy) or `<binary>.backup-<version>-<transaction>` (pair apply) |
+| `launcher_gate` | (#2012) The prepare producer's last gate decision in this daemon process: `{open, reason, plan_anchor}`, or `null` before the first `x0xd` apply since the daemon started. `open` is `false` in this release on every host (the launcher is dormant); `reason` says why, and `plan_anchor` is the anchor path the unit names, or `null`. `x0x doctor` copies it into its upgrade check's evidence |
+| `companion_failure` | (#2012) `null`, `{"record": "unreadable"}` for a record that cannot be read (it holds no release), or `{version, detail, failures, last_unix, pair_mixed}` from `<data_root>/upgrade-companion-failure.json` when the last apply of a release newer than the running one failed on the sibling `x0x`. That release is not applied again, by any apply including `POST /upgrade/apply`, before `last_unix` plus 30 minutes doubled per further failure (at most 24 hours); removing the file allows a retry at once; a successful apply removes it. `x0x doctor` warns on it with the path and the remedy |
 | `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `probe terminalization record unreadable`, `hold clear receipt unreadable`, `journal record unreadable`, `handoff record unreadable`, `boot record unreadable`); several are joined with `; ` |
 
 Probe records and holds exist only on Unix installs. On Windows the fields are

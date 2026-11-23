@@ -33,6 +33,19 @@ pub(super) fn records_json(data_dir: &Path, install: Option<&Path>) -> Map<Strin
         "backups".into(),
         Value::Array(install.map(backups_json).unwrap_or_default()),
     );
+    body.insert("launcher_gate".into(), launcher_gate_json());
+    body.insert(
+        "companion_failure".into(),
+        match crate::upgrade::companion_failure::current(data_dir) {
+            crate::upgrade::companion_failure::Read::Record(record) => {
+                serde_json::to_value(record).unwrap_or(Value::Null)
+            }
+            crate::upgrade::companion_failure::Read::Unreadable => {
+                json!({ "record": "unreadable" })
+            }
+            crate::upgrade::companion_failure::Read::Missing => Value::Null,
+        },
+    );
     body.insert(
         "records_error".into(),
         if errors.is_empty() {
@@ -42,6 +55,22 @@ pub(super) fn records_json(data_dir: &Path, install: Option<&Path>) -> Map<Strin
         },
     );
     body
+}
+
+/// The prepare producer's last gate decision in this process (#2012):
+/// whether the launcher-protected path ran for the last apply and why not.
+/// `null` before the first apply since the daemon started.
+fn launcher_gate_json() -> Value {
+    #[cfg(unix)]
+    {
+        crate::upgrade::producer::last_gate()
+            .and_then(|gate| serde_json::to_value(gate).ok())
+            .unwrap_or(Value::Null)
+    }
+    #[cfg(not(unix))]
+    {
+        Value::Null
+    }
 }
 
 /// The `last_attempt`, `holds` and `last_hold_clear` fields, from the

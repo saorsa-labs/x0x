@@ -36,7 +36,7 @@ pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod lifecycle;
 
-const ENABLED: bool = false;
+const ENABLED: bool = contract::LAUNCHER_ENABLED;
 
 impl Clock {
     fn now() -> io::Result<Self> {
