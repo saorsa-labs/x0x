@@ -574,7 +574,8 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 when `x0x::allocator::GlobalJemalloc` is installed (as in an `x0xd` built
 with `--features jemalloc`), otherwise `"system"`. An embedder built with
 the feature but without that global allocator reports `"system"`.
-Release builds do not enable jemalloc yet. For jemalloc, `jemalloc` holds
+Release builds use jemalloc on Linux and macOS and the system allocator on
+Windows. For jemalloc, `jemalloc` holds
 the options read back from jemalloc at run time (`background_thread`,
 `dirty_decay_ms`, `muzzy_decay_ms`); it is `null` for the system allocator.
 The values are read once and cached, because jemalloc fixes them at start.

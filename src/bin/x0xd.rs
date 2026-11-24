@@ -32,8 +32,8 @@ mod log_flush;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 // jemalloc as the daemon's global allocator, only in builds with
-// `--features jemalloc`. Release builds do not enable that feature yet, so
-// released x0xd uses the system allocator (#1172). Under glibc malloc,
+// `--features jemalloc`. Release builds enable it on Linux and macOS;
+// Windows (MSVC) keeps the system allocator (#1172). Under glibc malloc,
 // arenas keep freed pages; jemalloc returns them. The options in
 // `x0x::allocator::JEMALLOC_CONF` reach jemalloc through the prefixed
 // `_rjem_malloc_conf` symbol that `export_jemalloc_conf!` defines here.

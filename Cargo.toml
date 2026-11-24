@@ -135,7 +135,8 @@ upgrade-test-signing = ["dep:fips204"]
 # jemalloc with aggressive purge — eliminates the 50 MB heap-to-RSS
 # amplification glibc was producing. Opt-in (not default) so library
 # consumers aren't forced into a particular allocator. Release builds of
-# x0xd do not enable it yet (#1172).
+# x0xd enable it on Linux and macOS; Windows (MSVC) keeps the system
+# allocator (#1172).
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Enable dhat heap profiling in x0xd. Outputs dhat-heap.json at exit.
 # Build: cargo build --bin x0xd --features profile-heap
