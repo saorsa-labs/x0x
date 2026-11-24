@@ -65,23 +65,31 @@ async fn inject(state: &AppState, msg: &JoinResultMessage) -> Result<()> {
     Ok(())
 }
 
-async fn applied_within(group_id: &str, count: u32, within: Duration) -> bool {
+/// How long a test waits for a step that must happen.
+const WAIT: Duration = Duration::from_secs(10);
+/// How long a test watches for a step that must not happen.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// Poll until `check` holds, or `within` ends.
+async fn until(within: Duration, check: impl Fn() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + within;
     loop {
-        if join_result_apply_test_gate::applied(group_id) >= count {
+        if check() {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
 /// WHY: a slow apply for one group (a Welcome fetch inside a `Result`) must
-/// not delay the join-result frames of another group, and a later frame of
-/// the slow group must still wait for it. Red before the fix: the listener
-/// awaits group A's held apply, so group B's frame is never applied.
+/// not delay the join-result frames of another group, and the frames of
+/// the slow group must still apply one at a time, in arrival order (#1275).
+/// Red before the fix: the listener awaits group A's held apply, so group
+/// B's frame is never applied. Red with same-group applies run at the same
+/// time: A's second frame enters while the first is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_result_apply_does_not_delay_another_groups_result() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -92,26 +100,50 @@ async fn a_slow_result_apply_does_not_delay_another_groups_result() -> Result<()
         Arc::clone(&state),
         state.agent.subscribe_direct(),
     ));
+    let entered_a = || join_result_apply_test_gate::entered(GROUP_A);
+    let applied_a = || join_result_apply_test_gate::applied(GROUP_A);
 
     inject(&state, &pending(GROUP_A, "a1")).await?;
     inject(&state, &pending(GROUP_A, "a2")).await?;
+    inject(&state, &pending(GROUP_A, "a3")).await?;
     inject(&state, &pending(GROUP_B, "b1")).await?;
 
-    let b_applied = applied_within(GROUP_B, 1, BOUND).await;
-    let a_while_held = join_result_apply_test_gate::applied(GROUP_A);
-    release_a.add_permits(16);
-    let a_applied = applied_within(GROUP_A, 2, BOUND).await;
+    let first_a_held = until(WAIT, || entered_a() >= 1).await;
+    let b_applied = until(BOUND, || {
+        join_result_apply_test_gate::applied(GROUP_B) == ["b1"]
+    })
+    .await;
+    // Only the first frame of A may be in its apply while it is held.
+    let second_a_entered_while_held = until(QUIET, || entered_a() > 1).await;
+    let mut steps = Vec::new();
+    for expected in [vec!["a1"], vec!["a1", "a2"], vec!["a1", "a2", "a3"]] {
+        release_a.add_permits(1);
+        let reached = until(WAIT, || applied_a() == expected).await;
+        // The next frame enters only after this one finished.
+        steps.push((reached, applied_a(), entered_a()));
+    }
     state.shutdown_started.cancel();
     listener.abort();
 
+    assert!(first_a_held, "group A's first frame entered its apply");
     assert!(
         b_applied,
         "group B's frame waited behind group A's held apply"
     );
-    assert_eq!(
-        a_while_held, 0,
-        "group A's second frame applied before its first apply finished"
+    assert!(
+        !second_a_entered_while_held,
+        "a second frame of group A entered its apply while the first was held"
     );
-    assert!(a_applied, "group A's frames applied once released");
+    for (n, (reached, applied, entered)) in steps.into_iter().enumerate() {
+        assert!(
+            reached,
+            "group A's frames finished out of arrival order: {applied:?}"
+        );
+        assert!(
+            entered as usize <= n + 2,
+            "group A had {entered} applies started after {} finished",
+            n + 1
+        );
+    }
     Ok(())
 }

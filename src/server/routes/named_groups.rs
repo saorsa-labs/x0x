@@ -53511,6 +53511,8 @@ pub(in crate::server) async fn apply_join_result_shielded(
     group_id: String,
 ) -> bool {
     let apply_state = Arc::clone(state);
+    #[cfg(test)]
+    let label = join_result_apply_test_gate::label(&msg);
     state
         .run_shielded(Box::pin(async move {
             #[cfg(test)]
@@ -53523,22 +53525,28 @@ pub(in crate::server) async fn apply_join_result_shielded(
                 )
                 .await;
             #[cfg(test)]
-            join_result_apply_test_gate::note_applied(&group_id);
+            join_result_apply_test_gate::note_applied(&group_id, label);
         }))
         .await
         .is_some()
 }
 
-/// #2207 tests: hold the join-result applies of one group until released,
-/// as a Welcome fetch inside the apply does, and record finished applies.
+/// #2207 tests: hold the join-result applies of one group, as a Welcome
+/// fetch inside the apply does. Each released permit lets exactly one held
+/// apply go on. Records the applies that entered the hold and, in order,
+/// the frames whose apply finished.
 #[cfg(test)]
 pub(in crate::server) mod join_result_apply_test_gate {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
 
+    use super::JoinResultMessage;
+
     static GATES: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    static APPLIED: LazyLock<Mutex<HashMap<String, u32>>> =
+    static ENTERED: LazyLock<Mutex<HashMap<String, u32>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static APPLIED: LazyLock<Mutex<HashMap<String, Vec<String>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     /// Hold every later apply of `group_id`; returns the release.
@@ -53550,28 +53558,50 @@ pub(in crate::server) mod join_result_apply_test_gate {
         gate
     }
 
-    /// Finished applies of `group_id`.
-    pub(in crate::server) fn applied(group_id: &str) -> u32 {
-        APPLIED
+    /// Applies of `group_id` that have started.
+    pub(in crate::server) fn entered(group_id: &str) -> u32 {
+        ENTERED
             .lock()
             .ok()
-            .and_then(|applied| applied.get(group_id).copied())
+            .and_then(|entered| entered.get(group_id).copied())
             .unwrap_or_default()
     }
 
-    pub(super) fn note_applied(group_id: &str) {
+    /// The labels of the finished applies of `group_id`, in finish order.
+    pub(in crate::server) fn applied(group_id: &str) -> Vec<String> {
+        APPLIED
+            .lock()
+            .ok()
+            .and_then(|applied| applied.get(group_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// A frame's label: the nonce of a `Pending`, else empty.
+    pub(super) fn label(msg: &JoinResultMessage) -> String {
+        match msg {
+            JoinResultMessage::Pending { notice } => notice.nonce.clone(),
+            _ => String::new(),
+        }
+    }
+
+    pub(super) fn note_applied(group_id: &str, label: String) {
         if let Ok(mut applied) = APPLIED.lock() {
-            *applied.entry(group_id.to_string()).or_default() += 1;
+            applied.entry(group_id.to_string()).or_default().push(label);
         }
     }
 
     pub(super) async fn wait(group_id: &str) {
+        if let Ok(mut entered) = ENTERED.lock() {
+            *entered.entry(group_id.to_string()).or_default() += 1;
+        }
         let gate = GATES
             .lock()
             .ok()
             .and_then(|gates| gates.get(group_id).cloned());
         if let Some(gate) = gate {
-            let _ = gate.acquire().await;
+            if let Ok(permit) = gate.acquire().await {
+                permit.forget();
+            }
         }
     }
 }
