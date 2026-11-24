@@ -1871,9 +1871,12 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/upgrade/announce",
         cli_name: "upgrade --announce",
-        description: "Authenticated: fetch the latest release manifest, verify its ML-DSA-65 signature and timestamp, and publish it on x0x/release (#1169); needs no signing key; this node installs only through its normal staggered gossip path",
+        description: "Authenticated: fetch the latest release manifest (or take the signed manifest bytes from the optional body), verify its ML-DSA-65 signature and timestamp, and publish it on x0x/release (#1169); needs no signing key; this node installs only through its normal staggered gossip path",
         category: "upgrade",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("manifest_b64", false, "--manifest-file"),
+            RequestField::body_as("signature_b64", false, "--signature-file"),
+        ]),
     },
     EndpointDef {
         method: Method::Post,

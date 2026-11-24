@@ -1112,6 +1112,13 @@ const PINNED_MANUAL_BODY_ENDPOINTS: &[(&str, &str, &[&str])] = &[
     // Request body read to bytes; an empty body is a background refresh
     // (refresh_session).
     ("POST", "/auth/session/refresh", &["idle_ms"]),
+    // parse_optional_json over raw Bytes; an empty body fetches from
+    // GitHub (announce_upgrade, #1169)
+    (
+        "POST",
+        "/upgrade/announce",
+        &["manifest_b64", "signature_b64"],
+    ),
 ];
 
 #[test]
