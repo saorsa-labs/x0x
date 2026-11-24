@@ -150,18 +150,24 @@ fn new_kind_and_value_go_last_so_the_old_encodings_do_not_change() {
 }
 
 #[test]
-fn protocol_negotiation_runs_at_the_lower_version_and_accepts_only_2_or_3() {
-    assert_eq!(SYNC_PROTOCOL_VERSION, 3);
+fn protocol_negotiation_runs_at_the_lower_version_and_accepts_only_2_to_4() {
+    // #2182 moved the current version to 4.
+    assert_eq!(SYNC_PROTOCOL_VERSION, 4);
+    assert_eq!(negotiated_protocol(4, 4), Some(4));
+    assert_eq!(negotiated_protocol(4, 3), Some(3));
+    assert_eq!(negotiated_protocol(4, 2), Some(2));
     assert_eq!(negotiated_protocol(3, 3), Some(3));
     assert_eq!(negotiated_protocol(3, 2), Some(2));
     assert_eq!(negotiated_protocol(2, 3), Some(2));
     assert_eq!(negotiated_protocol(2, 2), Some(2));
-    assert_eq!(negotiated_protocol(3, 1), None);
-    assert_eq!(negotiated_protocol(3, 4), None);
+    assert_eq!(negotiated_protocol(4, 1), None);
+    assert_eq!(negotiated_protocol(4, 5), None);
     assert!(SyncKind::DeviceEnrollment.carried_at(3));
     assert!(!SyncKind::DeviceEnrollment.carried_at(2));
+    assert!(SyncKind::IssuanceMode.carried_at(4));
+    assert!(!SyncKind::IssuanceMode.carried_at(3));
     for kind in SyncKind::ALL {
-        if kind != SyncKind::DeviceEnrollment {
+        if !matches!(kind, SyncKind::DeviceEnrollment | SyncKind::IssuanceMode) {
             assert!(kind.carried_at(2), "{kind:?} stays in protocol 2");
         }
     }
@@ -326,7 +332,7 @@ async fn a_protocol_2_peer_still_completes_a_session() {
             rb,
             Err(SyncError::ProtocolVersion {
                 local: 2,
-                remote: 3
+                remote: SYNC_PROTOCOL_VERSION
             })
         ),
         "{rb:?}"
@@ -677,7 +683,7 @@ async fn interleaved_sessions_do_not_leave_both_sides_at_protocol_2() {
     let _ = session(&a, &b).await;
     b.speak_only_protocol_for_testing(0);
     assert_eq!(a.hello_protocol_for(&mb), 2);
-    assert_eq!(b.hello_protocol_for(&ma), 3);
+    assert_eq!(b.hello_protocol_for(&ma), SYNC_PROTOCOL_VERSION);
 
     // Wire one gated side to another: what `x` sends goes to `y`'s relay.
     async fn wire(from: tokio::io::DuplexStream, to: tokio::io::DuplexStream) {
@@ -707,7 +713,7 @@ async fn interleaved_sessions_do_not_leave_both_sides_at_protocol_2() {
     // next frame: a = 3 (received 3), b = 2 (received 2 below its 3).
     let _ = t_a_gate.rest_seen.await;
     let _ = t_b_gate.rest_seen.await;
-    assert_eq!(a.hello_protocol_for(&mb), 3);
+    assert_eq!(a.hello_protocol_for(&mb), SYNC_PROTOCOL_VERSION);
     assert_eq!(b.hello_protocol_for(&ma), 2);
 
     // S, side b: opens at 2 from that memory.
@@ -724,8 +730,8 @@ async fn interleaved_sessions_do_not_leave_both_sides_at_protocol_2() {
     let _ = t_b_gate.release_rest.send(());
     t_a_task.await.expect("join").expect("T completes on a");
     t_b_task.await.expect("join").expect("T completes on b");
-    assert_eq!(a.hello_protocol_for(&mb), 3);
-    assert_eq!(b.hello_protocol_for(&ma), 3);
+    assert_eq!(a.hello_protocol_for(&mb), SYNC_PROTOCOL_VERSION);
+    assert_eq!(b.hello_protocol_for(&ma), SYNC_PROTOCOL_VERSION);
 
     // Now S, opened at 2 on both sides, runs and completes.
     let _ = s_a_gate.release_hello.send(());
@@ -743,8 +749,8 @@ async fn interleaved_sessions_do_not_leave_both_sides_at_protocol_2() {
 
     assert_eq!(
         (a.hello_protocol_for(&mb), b.hello_protocol_for(&ma)),
-        (3, 3),
-        "a completed session at protocol 2 must not lower a remembered 3"
+        (SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION),
+        "a completed session at protocol 2 must not lower a remembered 4"
     );
 }
 
@@ -1107,7 +1113,7 @@ async fn a_failed_commit_does_not_raise_the_remembered_version() {
     ra.expect("a completes");
     assert_eq!(
         a.hello_protocol_for(&machine(2)),
-        3,
+        SYNC_PROTOCOL_VERSION,
         "a durable commit raises it"
     );
 }

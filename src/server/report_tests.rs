@@ -988,6 +988,7 @@ fn a_rider_reset_to_acp_on_the_roster_is_still_refused() {
         mode,
         label: None,
         cert_b64: None,
+        synced_mode: false,
     };
     let owner_hex = "aa".repeat(32);
     let journal = vec![

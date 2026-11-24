@@ -173,6 +173,25 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Owner sync carries the roster mode and label (#2182; A02 and A04
+  amendments of 24 Nov 2026).** A hosting mode (`acp`/`rider`) or label set
+  by `POST /owner/agents/issue` on one owner device now reaches the owner's
+  other devices: `GET /owner/agents` and placement minting there follow
+  it. The `POST /report` target rule is unchanged: an agent that any
+  journal line records as a rider, a synced line included, is still
+  refused, so an ACP agent re-issued as a rider elsewhere is refused here,
+  and a rider re-issued as ACP stays refused. It travels as a new Tier-1
+  kind (0x06) in SyncV1 protocol 4. A device on protocol 3 or 2 refuses the
+  first protocol-4 session and syncs the older kinds at its own version
+  from the next one, without the mode. The receiving device appends a
+  journal line marked `synced_mode` that keeps the certificate the roster
+  shows; an older build ignores the marker. Two devices that set different
+  modes converge on the issuance with the later `issued_at`, whatever
+  order they sync in; in the same second the Tier-1 tie-break decides.
+  Limit: a re-issue on a device whose clock is behind the issuance it
+  replaces loses on every device. `POST /owner/agents/issue` now refuses a `label`
+  longer than 256 bytes with `400`. Mode records are stored in
+  `sync/issuance_mode_records.json`, so a rolled-back build still starts.
 - **TreeKEM Welcome transfer: a slow chunk ack no longer holds the
   joiner's Welcome listener (#2202, refs #2189).** The joiner sent each
   `ChunkAck` inside the single Welcome listener loop and waited for its
