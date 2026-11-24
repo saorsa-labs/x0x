@@ -81,6 +81,19 @@ pub(in crate::server) async fn owner_agents_issue(
             );
         }
     };
+    if req
+        .label
+        .as_ref()
+        .is_some_and(|label| label.len() > crate::profile::MAX_ISSUE_LABEL_BYTES)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "label is longer than {} bytes",
+                crate::profile::MAX_ISSUE_LABEL_BYTES
+            ),
+        );
+    }
     let key_bytes = match hex::decode(req.agent_public_key.trim()) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -1676,6 +1689,35 @@ mod lose_device_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "issue {mode} agent");
         agent
+    }
+
+    /// #2182: an issuance label longer than `MAX_ISSUE_LABEL_BYTES` is
+    /// refused with 400 and journals nothing; one at the limit is taken.
+    #[tokio::test]
+    async fn an_oversize_issuance_label_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        for (len, want) in [
+            (
+                crate::profile::MAX_ISSUE_LABEL_BYTES + 1,
+                StatusCode::BAD_REQUEST,
+            ),
+            (crate::profile::MAX_ISSUE_LABEL_BYTES, StatusCode::OK),
+        ] {
+            let agent = AgentKeypair::generate().unwrap();
+            let (status, body) = owner_agents_issue(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(ActorContext::Owner { durable: true }),
+                Json(IssueAgentRequest {
+                    agent_public_key: hex::encode(agent.public_key().as_bytes()),
+                    mode: Some("rider".to_string()),
+                    label: Some("x".repeat(len)),
+                    not_after: None,
+                }),
+            )
+            .await;
+            assert_eq!(status, want, "label of {len} bytes: {body:?}");
+        }
     }
 
     /// Record an owner-signed placement that pins `agent` to `machine`.

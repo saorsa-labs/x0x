@@ -20908,9 +20908,10 @@ impl Agent {
     /// [`profile::IssuedCertRecord::states_mode`]), whichever certificate
     /// wins: a renewal or a live sighting keeps a rider a rider; a later
     /// owner issuance in another mode changes it. File order, not
-    /// `issued_at`: only this daemon's issue route writes such lines and it
-    /// appends them in order, so a local clock step back cannot reorder
-    /// them.
+    /// `issued_at`: only this daemon's issue route, and owner sync for the
+    /// mode that won the register (#2182, a `synced_mode` line), write such
+    /// lines, and they append them in order, so a local clock step back
+    /// cannot reorder them.
     ///
     /// Empty when no user identity is configured.
     pub async fn owner_issued_certificates(&self) -> Vec<OwnerIssuedCert> {
