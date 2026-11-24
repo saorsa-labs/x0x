@@ -256,14 +256,98 @@ async fn a_synced_mode_keeps_the_certificate_the_roster_shows() {
     );
 }
 
-/// Conflict rule: two devices state different modes for one agent before
-/// they meet. Both records have version 1, so the standard Tier-1 rule
-/// decides (later signing time, then greater writer machine, then greater
-/// record hash). Both devices end with the winner's mode in their register
-/// and their roster, and the register stops changing. A statement made
-/// after that (version 2) then wins on both.
+/// Run sessions and reconcile passes until neither register changes for
+/// two passes.
+async fn settle(a: &Device, b: &Device) {
+    let mut stable = 0;
+    for _ in 0..8 {
+        let before = (mode_record(a).await, mode_record(b).await);
+        complete(session(a, b).await);
+        reconcile(a).await;
+        reconcile(b).await;
+        let after = (mode_record(a).await, mode_record(b).await);
+        stable = if before == after { stable + 1 } else { 0 };
+        if stable == 2 {
+            return;
+        }
+    }
+    panic!("the register never stopped changing");
+}
+
+async fn assert_both(a: &Device, b: &Device, mode: CertMode, label: Option<&str>) {
+    let want = Some((mode, label.map(str::to_string)));
+    for (device, who) in [(a, "a"), (b, "b")] {
+        assert_eq!(roster_mode(device).await, want, "roster of {who}");
+        let record = mode_record(device).await.expect("register record");
+        let SyncValue::IssuanceMode {
+            mode: held_mode,
+            label: held_label,
+            ..
+        } = record.value
+        else {
+            panic!("not a mode value");
+        };
+        assert_eq!(Some((held_mode, held_label)), want, "register of {who}");
+    }
+    assert_eq!(mode_record(a).await, mode_record(b).await);
+}
+
+/// Conflict rule, first contact after an upgrade (the #2182 field state):
+/// a holds an older rider issuance, b a newer ACP issuance, and neither
+/// has published. The record version is the issuance second, so the
+/// later issuance wins on both devices whichever device reconciles
+/// first.
 #[tokio::test]
-async fn conflicting_modes_converge_on_the_tier1_winner() {
+async fn the_later_issuance_wins_whichever_device_reconciles_first() {
+    for a_first in [true, false] {
+        let (_dir, a, b) = pair().await;
+        append(&a, &issued("da", 100, CertMode::Rider, Some("old"))).await;
+        append(&b, &issued("db", 200, CertMode::Acp, None)).await;
+        if a_first {
+            reconcile(&a).await;
+            complete(session(&a, &b).await);
+            reconcile(&b).await;
+        } else {
+            reconcile(&b).await;
+            complete(session(&a, &b).await);
+            reconcile(&a).await;
+        }
+        settle(&a, &b).await;
+        assert_both(&a, &b, CertMode::Acp, None).await;
+        assert_eq!(
+            mode_record(&a).await.map(|r| r.clock.version),
+            Some(200),
+            "a_first = {a_first}"
+        );
+    }
+}
+
+/// Security review probe: b publishes a rider issued at 100; a then issues
+/// the agent as ACP at 900, and a session lands before a's reconcile. a
+/// must keep its own newer line (not append b's rider over it), publish
+/// it at its next reconcile, and win on both devices.
+#[tokio::test]
+async fn an_unpublished_local_issuance_is_not_overwritten_by_an_older_one() {
+    let (_dir, a, b) = pair().await;
+    append(&b, &issued("db", 100, CertMode::Rider, None)).await;
+    reconcile(&b).await;
+    append(&a, &issued("da", 900, CertMode::Acp, None)).await;
+    complete(session(&a, &b).await);
+    assert_eq!(
+        roster_mode(&a).await,
+        Some((CertMode::Acp, None)),
+        "a keeps its newer local issuance"
+    );
+    settle(&a, &b).await;
+    assert_both(&a, &b, CertMode::Acp, None).await;
+}
+
+/// Two statements in the same second: equal versions, so the rest of the
+/// Tier-1 rule decides (later signing time, then greater writer machine,
+/// then greater record hash). Both devices end on that winner and the
+/// register stops changing.
+#[tokio::test]
+async fn same_second_statements_converge_on_the_tier1_winner() {
     let (_dir, a, b) = pair().await;
     append(&a, &issued("da", 100, CertMode::Rider, Some("from-a"))).await;
     append(&b, &issued("db", 100, CertMode::Acp, Some("from-b"))).await;
@@ -271,60 +355,68 @@ async fn conflicting_modes_converge_on_the_tier1_winner() {
     reconcile(&b).await;
     let ra = mode_record(&a).await.expect("a's statement");
     let rb = mode_record(&b).await.expect("b's statement");
-    assert_eq!((ra.clock.version, rb.clock.version), (1, 1));
+    assert_eq!((ra.clock.version, rb.clock.version), (100, 100));
     let winner = if OwnerSyncStore::classify(&ra, &rb) == MergeOutcome::Accepted {
-        ra.clone()
+        ra
     } else {
-        rb.clone()
+        rb
     };
-    let SyncValue::IssuanceMode {
-        mode: win_mode,
-        label: win_label,
-        ..
-    } = winner.value.clone()
-    else {
+    settle(&a, &b).await;
+    assert_eq!(mode_record(&a).await, Some(winner.clone()));
+    assert_eq!(mode_record(&b).await, Some(winner.clone()));
+    let SyncValue::IssuanceMode { mode, label, .. } = winner.value else {
         panic!("not a mode value");
     };
+    assert_both(&a, &b, mode, label.as_deref()).await;
+}
 
-    let mut stable = 0;
-    for _ in 0..6 {
-        let before = (mode_record(&a).await, mode_record(&b).await);
-        complete(session(&a, &b).await);
-        reconcile(&a).await;
-        reconcile(&b).await;
-        let after = (mode_record(&a).await, mode_record(&b).await);
-        stable = if before == after { stable + 1 } else { 0 };
-        if stable == 2 {
-            break;
-        }
-    }
-    assert_eq!(stable, 2, "the register never stopped changing");
-    for device in [&a, &b] {
-        assert_eq!(mode_record(device).await, Some(winner.clone()));
-        assert_eq!(
-            roster_mode(device).await,
-            Some((win_mode, win_label.clone()))
-        );
-    }
-
-    // The losing device re-issues: its new statement follows the winner
-    // (version 2) and wins on both devices.
-    let loser = if winner.clock.writer_machine == a.machine.0 {
-        &b
-    } else {
-        &a
-    };
-    append(loser, &issued("dz", 50, CertMode::Rider, Some("again"))).await;
-    reconcile(loser).await;
+/// Limit: a re-issue whose issuance second is before the published one
+/// (a clock behind the other device's) loses. The device that issued it
+/// yields: it appends the winner's mode line, so both rosters agree.
+#[tokio::test]
+async fn a_re_issue_with_an_earlier_second_yields_to_the_later_issuance() {
+    let (_dir, a, b) = pair().await;
+    append(&b, &issued("db", 900, CertMode::Acp, None)).await;
+    reconcile(&b).await;
     complete(session(&a, &b).await);
-    for device in [&a, &b] {
-        assert_eq!(mode_record(device).await.map(|r| r.clock.version), Some(2));
-        assert_eq!(
-            roster_mode(device).await,
-            Some((CertMode::Rider, Some("again".to_string()))),
-            "a later statement wins even with an earlier issuance second"
-        );
+    append(&a, &issued("da", 500, CertMode::Rider, None)).await;
+    settle(&a, &b).await;
+    assert_both(&a, &b, CertMode::Acp, None).await;
+}
+
+/// A third device that syncs only with b gets a's mode through b, and
+/// keeps its own later certificate.
+#[tokio::test]
+async fn a_third_device_gets_the_mode_through_another_device() {
+    let (dir, a, b) = pair().await;
+    let path = dir.path().join("c");
+    let store = Arc::new(OwnerSyncStore::load(&path).await.expect("store"));
+    let journal = path.join(crate::profile::CERT_JOURNAL_FILE);
+    store.set_journal_path(journal.clone());
+    let c = Device {
+        store,
+        journal,
+        machine: machine(3),
+    };
+    let owner = owner_kp(OWNER_SEED);
+    for (store, peer) in [(&b.store, c.machine), (&c.store, b.machine)] {
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("enroll");
     }
+    append(&c, &bare("d3", 300)).await;
+
+    append(&a, &issued("d1", 100, CertMode::Rider, Some("x"))).await;
+    reconcile(&a).await;
+    complete(session(&a, &b).await);
+    complete(session(&b, &c).await);
+    assert_eq!(
+        roster_mode(&c).await,
+        Some((CertMode::Rider, Some("x".to_string())))
+    );
+    assert_eq!(roster_cert(&c).await, Some(("d3".to_string(), 300)));
+    assert_eq!(mode_record(&c).await, mode_record(&a).await);
 }
 
 /// A peer that speaks only protocol 3 (a released build) refuses a
@@ -446,6 +538,25 @@ fn a_mode_record_must_name_the_agent_of_its_key() {
         AGENT,
         &value,
         super::tests::clock(1, 1, 1),
+        &owner_kp(OWNER_SEED),
+    )
+    .expect("sign");
+    assert!(matches!(record.verify(), Err(SyncError::MalformedFrame(_))));
+
+    // The version must be the issuance second of the statement.
+    let value = SyncValue::IssuanceMode {
+        agent_id: AGENT.into(),
+        cert_digest: "d".into(),
+        issued_at: 7,
+        not_after: None,
+        mode: CertMode::Rider,
+        label: None,
+    };
+    let record = VersionedRecord::sign(
+        SyncKind::IssuanceMode,
+        AGENT,
+        &value,
+        super::tests::clock(8, 1, 1),
         &owner_kp(OWNER_SEED),
     )
     .expect("sign");

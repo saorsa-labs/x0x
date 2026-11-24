@@ -1238,10 +1238,11 @@ changes it (#2158). Owner sync carries the mode and label (Tier-1 kind
 0x06, SyncV1 protocol 4, #2182): an issuance on another owner device adds
 a journal line here that states its mode and label and keeps the
 certificate the row shows, so a rider re-issued as ACP elsewhere shows
-`"acp"` here. When two owner devices state different modes before they
-sync, both keep the record that wins under the Tier-1 rule (highest
-version, then latest signing time, then greatest writer machine); a later
-issuance wins. A peer on protocol 3 or 2 does not receive the mode, and
+`"acp"` here. When two owner devices state different modes, both end on
+the issuance with the later `issued_at`, whatever order they sync in; in
+the same second the Tier-1 tie-break decides (latest signing time, then
+greatest writer machine). A re-issue on a device whose clock is behind
+the issuance it replaces loses on every device. A peer on protocol 3 or 2 does not receive the mode, and
 there a rider re-issued as ACP on another device stays `"rider"`.
 
 ## Home (ADR-0038)

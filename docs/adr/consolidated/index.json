@@ -19,7 +19,7 @@
       "revision": 1,
       "path": "A02-r01-identity-keys-and-device-enrollment.md",
       "title": "Identity Keys and Device Enrollment",
-      "sha256": "5bd0a601f3217f547844f2438076d66dea3e620c6a38d8a60ab699b573671cb7"
+      "sha256": "1be9c42f1b04556835dc32a74639096df7b488507b11600257a89e3f5d7b9fce"
     },
     {
       "id": "A03",
@@ -33,7 +33,7 @@
       "revision": 1,
       "path": "A04-r01-agent-attachment-and-inbound-events.md",
       "title": "Agent Attachment and Inbound Events",
-      "sha256": "692eb4b5ecc56d323903ace276e5452955d095bf6c57c1606bdec7b5d4c2308a"
+      "sha256": "d94273e8d56040a543868e148b8f30e904e6e0822015cdeca853dc8350972fe0"
     },
     {
       "id": "A05",

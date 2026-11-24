@@ -601,10 +601,22 @@ impl VersionedRecord {
         if let SyncValue::DeviceEnrollment { state } = &self.value {
             check_device_enrollment_shape(&self.key, state, &self.clock)?;
         }
-        if let SyncValue::IssuanceMode { agent_id, .. } = &self.value {
+        if let SyncValue::IssuanceMode {
+            agent_id,
+            issued_at,
+            ..
+        } = &self.value
+        {
             if *agent_id != self.key {
                 return Err(SyncError::MalformedFrame(
                     "issuance mode names another agent than its key".into(),
+                ));
+            }
+            // #2182: the version is the issuance second of the statement,
+            // so the Tier-1 rule orders two statements by issuance first.
+            if self.clock.version != *issued_at {
+                return Err(SyncError::MalformedFrame(
+                    "issuance mode version is not its issuance second".into(),
                 ));
             }
         }
@@ -2284,8 +2296,9 @@ impl OwnerSyncStore {
 
     /// #2182: append the mode line for the register's `IssuanceMode` value
     /// `value` to the journal file at `path` when this device needs it
-    /// ([`synced_mode_line`]). `held` holds `journal_apply`, as for
-    /// [`Self::apply_journal_value`], and comes back after the append.
+    /// ([`synced_mode_line`]; `published` and `yield_local` as there).
+    /// `held` holds `journal_apply`, as for [`Self::apply_journal_value`],
+    /// and comes back after the append.
     ///
     /// # Errors
     ///
@@ -2296,6 +2309,8 @@ impl OwnerSyncStore {
         path: &Path,
         owner_hex: &str,
         value: &SyncValue,
+        published: Option<&SyncValue>,
+        yield_local: bool,
         held: H,
     ) -> std::io::Result<H> {
         #[cfg(test)]
@@ -2312,7 +2327,9 @@ impl OwnerSyncStore {
         let (_, (_, held)) = crate::profile::IssuedCertRecord::append_when(
             path,
             (custody, held),
-            |existing| async move { synced_mode_line(&existing, owner_hex, value) },
+            |existing| async move {
+                synced_mode_line(&existing, owner_hex, value, published, yield_local)
+            },
         )
         .await?;
         Ok(held)
@@ -2993,6 +3010,18 @@ impl OwnerSyncStore {
                 );
                 continue;
             }
+            // #2182: the same bound for a kind 0x06 record, whose version
+            // is its issuance second.
+            if let SyncValue::IssuanceMode { issued_at, .. } = &record.value {
+                if issued_at.saturating_mul(1_000) > now_ms.saturating_add(ENROLL_EXPIRY_SKEW_MS) {
+                    tracing::warn!(
+                        target: "x0x::owner_sync",
+                        key = %record.key,
+                        "issuance mode record from the future not stored"
+                    );
+                    continue;
+                }
+            }
             if next.len() >= MAX_STORED_RECORDS
                 && !next.contains_key(&(record.kind, record.key.clone()))
             {
@@ -3084,9 +3113,16 @@ impl OwnerSyncStore {
         // the record again, whose line is then already there.
         if let Some(path) = journal.filter(|_| !mode_updates.is_empty()) {
             let owner_hex = hex::encode(owner.0);
-            for (record, _) in &mode_updates {
+            for (record, published) in &mode_updates {
                 hold = self
-                    .apply_mode_value(path, &owner_hex, &record.value, hold)
+                    .apply_mode_value(
+                        path,
+                        &owner_hex,
+                        &record.value,
+                        published.as_ref(),
+                        false,
+                        hold,
+                    )
                     .await
                     .map_err(|e| {
                         SyncError::Io(format!("failed to append synced mode line: {e}"))
@@ -3673,6 +3709,48 @@ impl OwnerSyncStore {
         self.replace_records(records, next, canonical_gate)
             .await
             .map(drop)
+    }
+
+    /// #2182: sign the `IssuanceMode` statement `desired` for agent `key`
+    /// at its issuance second (the record version), signed now by this
+    /// machine, and store it when it beats the register's record for the
+    /// agent under the Tier-1 rule. `Ok(false)` when it does not: the
+    /// register keeps its record.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::mint`].
+    pub(crate) async fn mint_mode_statement(
+        &self,
+        key: &str,
+        desired: &SyncValue,
+        owner: &UserKeypair,
+        writer_machine: MachineId,
+    ) -> Result<bool, SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
+        let SyncValue::IssuanceMode { issued_at, .. } = desired else {
+            return Ok(false);
+        };
+        let clock = RecordClock {
+            version: *issued_at,
+            signed_at_ms: now_unix_ms(),
+            writer_machine: writer_machine.0,
+        };
+        let record = VersionedRecord::sign(SyncKind::IssuanceMode, key, desired, clock, owner)
+            .map_err(|e| SyncError::BadSignature(format!("mint: {e}")))?;
+        let records = Arc::clone(&self.records).write_owned().await;
+        let slot = (SyncKind::IssuanceMode, key.to_string());
+        if records
+            .get(&slot)
+            .is_some_and(|stored| Self::classify(&record, stored) != MergeOutcome::Accepted)
+        {
+            return Ok(false);
+        }
+        let mut next = records.clone();
+        next.insert(slot, record);
+        self.replace_records(records, next, ()).await.map(|()| true)
     }
 
     /// Hold the canonical-Home admission gate for reading (#449 r3 P2).
@@ -5794,24 +5872,12 @@ async fn mint_journal_lines(
     };
     #[cfg(test)]
     store.pause_after_journal_read().await;
-    // #2182: publish each mode or label stated here that the register
-    // does not hold. A line that owner sync wrote for the register's
-    // value states the same, so it publishes nothing.
-    let register: BTreeMap<String, (crate::profile::CertMode, Option<String>)> = store
-        .records_snapshot()
-        .await
-        .into_iter()
-        .filter_map(|record| match record.value {
-            SyncValue::IssuanceMode {
-                agent_id,
-                mode,
-                label,
-                ..
-            } => Some((agent_id, (mode, label))),
-            _ => None,
-        })
+    // #2182: the mode statements of this device's own issuances.
+    let modes: Vec<SyncValue> = stated_modes(&lines, &owner_hex)
+        .into_values()
+        .filter(|line| !line.synced_mode)
+        .map(mode_statement)
         .collect();
-    let modes = mode_values_to_mint(&lines, &owner_hex, &register);
     for (agent_hex, value) in latest_journal_values(lines, &owner_hex) {
         if let Err(e) = store
             .mint(
@@ -5826,18 +5892,64 @@ async fn mint_journal_lines(
             tracing::warn!(target: "x0x::owner_sync", kind = ?SyncKind::IssuanceJournal, error = %e, "mint failed");
         }
     }
-    for (agent_hex, value) in modes {
-        if let Err(e) = store
-            .mint(
-                SyncKind::IssuanceMode,
-                &agent_hex,
-                &value,
-                owner_kp,
-                machine,
-            )
+    reconcile_issuance_modes(store, path, &modes, &owner_hex, owner_kp, machine).await;
+}
+
+/// #2182: publish or yield each mode statement of this device's journal,
+/// under the caller's `journal_apply` hold. For each agent whose last
+/// mode-stating line is a local issuance that states another mode or
+/// label than the register's record, sign that statement at its issuance
+/// second (the record version, see [`VersionedRecord::verify`]). It goes
+/// into the register when it wins under the Tier-1 rule; otherwise it
+/// lost to the register's record (a later issuance elsewhere), and this
+/// device appends that record's mode line, so its roster shows the
+/// winner too. A line that owner sync wrote states the register's value,
+/// so it publishes nothing.
+async fn reconcile_issuance_modes(
+    store: &OwnerSyncStore,
+    path: &Path,
+    statements: &[SyncValue],
+    owner_hex: &str,
+    owner_kp: &UserKeypair,
+    machine: MachineId,
+) {
+    for candidate in statements {
+        let SyncValue::IssuanceMode {
+            agent_id,
+            mode,
+            label,
+            ..
+        } = candidate
+        else {
+            continue;
+        };
+        let stored = store.stored_value(SyncKind::IssuanceMode, agent_id).await;
+        match &stored {
+            Some(value) if value == candidate => continue,
+            Some(SyncValue::IssuanceMode {
+                mode: stored_mode,
+                label: stored_label,
+                ..
+            }) if stored_mode == mode && stored_label == label => continue,
+            _ => {}
+        }
+        match store
+            .mint_mode_statement(agent_id, candidate, owner_kp, machine)
             .await
         {
-            tracing::warn!(target: "x0x::owner_sync", kind = ?SyncKind::IssuanceMode, error = %e, "mint failed");
+            Ok(true) => {}
+            Ok(false) => {
+                let Some(winner) = stored else { continue };
+                if let Err(e) = store
+                    .apply_mode_value(path, owner_hex, &winner, None, true, ())
+                    .await
+                {
+                    tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to append synced mode line");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "x0x::owner_sync", kind = ?SyncKind::IssuanceMode, error = %e, "mint failed");
+            }
         }
     }
 }
@@ -5942,44 +6054,40 @@ fn stated_modes<'a>(
     stated
 }
 
-/// #2182: the `IssuanceMode` value to publish for each agent whose stated
-/// mode or label ([`stated_modes`]) differs from the register's value, or
-/// that the register does not hold. `register` maps an agent to the
-/// `(mode, label)` of its register record.
-fn mode_values_to_mint(
-    lines: &[crate::profile::IssuedCertRecord],
-    owner_hex: &str,
-    register: &BTreeMap<String, (crate::profile::CertMode, Option<String>)>,
-) -> Vec<(String, SyncValue)> {
-    stated_modes(lines, owner_hex)
-        .into_iter()
-        .filter(|(agent, line)| register.get(agent) != Some(&(line.mode, line.label.clone())))
-        .map(|(agent, line)| {
-            (
-                agent,
-                SyncValue::IssuanceMode {
-                    agent_id: line.agent_id.clone(),
-                    cert_digest: line.cert_digest.clone(),
-                    issued_at: line.issued_at,
-                    not_after: line.not_after,
-                    mode: line.mode,
-                    label: line.label.clone(),
-                },
-            )
-        })
-        .collect()
+/// #2182: the `IssuanceMode` value a mode-stating journal line publishes.
+fn mode_statement(line: &crate::profile::IssuedCertRecord) -> SyncValue {
+    SyncValue::IssuanceMode {
+        agent_id: line.agent_id.clone(),
+        cert_digest: line.cert_digest.clone(),
+        issued_at: line.issued_at,
+        not_after: line.not_after,
+        mode: line.mode,
+        label: line.label.clone(),
+    }
 }
 
 /// #2182: the journal line for the register's `IssuanceMode` value, or
+/// `None` when this device needs none. The line states the mode
+/// ([`crate::profile::IssuedCertRecord::synced_mode`]) and repeats the
+/// certificate fields of the agent's last line, in file order, so the
+/// certificate the roster shows does not change. With no line for the
+/// agent it takes the certificate fields of `value`.
+///
 /// `None` when the journal already states that mode and label for the
-/// agent. The line states the mode ([`crate::profile::IssuedCertRecord::synced_mode`])
-/// and repeats the certificate fields of the agent's last line, in file
-/// order, so the certificate the roster shows does not change. With no
-/// line for the agent it takes the certificate fields of `value`.
+/// agent. Also `None`, unless `yield_local`, when the agent's last
+/// mode-stating line is a local issuance that the register did not hold
+/// before (`published` is the register's value before the commit) and
+/// whose issuance second is not before `value`'s: no reconcile has
+/// published it yet, and the next one does, at that second (see
+/// `reconcile_issuance_modes`). The same rule keeps an unpublished local
+/// certificate line in [`synced_line_needed`]. `yield_local` is the
+/// reconcile's own case: its statement lost to `value`.
 fn synced_mode_line(
     existing: &[crate::profile::IssuedCertRecord],
     owner_hex: &str,
     value: &SyncValue,
+    published: Option<&SyncValue>,
+    yield_local: bool,
 ) -> Option<crate::profile::IssuedCertRecord> {
     let SyncValue::IssuanceMode {
         agent_id,
@@ -5992,13 +6100,20 @@ fn synced_mode_line(
     else {
         return None;
     };
-    if existing
+    let stated = existing
         .iter()
         .rev()
-        .find(|line| line.user_id == owner_hex && line.agent_id == *agent_id && line.states_mode())
-        .is_some_and(|line| line.mode == *mode && line.label == *label)
-    {
-        return None;
+        .find(|line| line.user_id == owner_hex && line.agent_id == *agent_id && line.states_mode());
+    if let Some(line) = stated {
+        if line.mode == *mode && line.label == *label {
+            return None;
+        }
+        let unpublished_local = !line.synced_mode
+            && published != Some(&mode_statement(line))
+            && line.issued_at >= *issued_at;
+        if unpublished_local && !yield_local {
+            return None;
+        }
     }
     let last = existing
         .iter()
