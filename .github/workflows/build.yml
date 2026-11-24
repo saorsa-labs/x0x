@@ -172,6 +172,9 @@ jobs:
       - name: Build (cross)
         if: env.BUILD_CROSS == 'true'
         shell: bash
+        env:
+          # Same as the release.yml cross leg (#1172).
+          AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE: '16'
         run: |
           set -o pipefail
           cross build --locked --release --target ${{ env.BUILD_TARGET }} \

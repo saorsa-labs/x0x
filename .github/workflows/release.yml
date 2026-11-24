@@ -319,6 +319,11 @@ jobs:
         shell: bash
         env:
           BUILD_FEATURES: ${{ matrix.features }}
+          # jemalloc fixes its page size at build time, and configure cannot
+          # probe it when cross-compiling (it falls back to 4 KiB). 64 KiB
+          # pages also run on 4 and 16 KiB kernels. The target prefix keeps
+          # it off other targets; Cross.toml passes it into the container.
+          AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE: '16'
         run: |
           set -o pipefail
           cross build --locked --release --target ${{ matrix.target }} \
