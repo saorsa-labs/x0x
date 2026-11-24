@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -62,8 +63,12 @@ FAKE_X0XD = textwrap.dedent(
             assert self.headers["Authorization"] == "Bearer test-token"
             replies = scenario["announce"]
             n = len(calls.read_text().splitlines()) if calls.exists() else 0
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if raw:
+                assert self.headers["Content-Type"] == "application/json", self.headers
             with calls.open("a") as f:
-                f.write("announce\n")
+                f.write((raw.decode() or "{}") + "\n")
             status, body = replies[min(n, len(replies) - 1)]
             self.reply(status, body)
 
@@ -88,7 +93,7 @@ def refused(result: str):
 
 class AnnounceTests(unittest.TestCase):
     def run_script(
-        self, peers: int, announce: list, send_ready: int | None = None
+        self, peers: int, announce: list, send_ready: int | None = None, files: bool = False
     ) -> tuple[int, str, int]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -114,15 +119,23 @@ class AnnounceTests(unittest.TestCase):
                 ANNOUNCE_ATTEMPTS="3",
                 GITHUB_STEP_SUMMARY=str(summary),
             )
+            argv = [sys.executable, str(SCRIPT), "--x0xd", str(fake), "--version", "1.2.3",
+                    "--work-dir", str(tmp / "work")]
+            if files:
+                (tmp / "release-manifest.json").write_bytes(b'{"version":"1.2.3"}')
+                (tmp / "release-manifest.json.sig").write_bytes(bytes([0, 255, 10, 13]))
+                argv += ["--manifest", str(tmp / "release-manifest.json"),
+                         "--signature", str(tmp / "release-manifest.json.sig")]
             proc = subprocess.run(
-                [sys.executable, str(SCRIPT), "--x0xd", str(fake), "--version", "1.2.3",
-                 "--work-dir", str(tmp / "work")],
+                argv,
                 env=env,
                 capture_output=True,
                 text=True,
                 timeout=120,
             )
-            n = len(calls.read_text().splitlines()) if calls.exists() else 0
+            lines = calls.read_text().splitlines() if calls.exists() else []
+            self.bodies = [json.loads(line) for line in lines]
+            n = len(lines)
             self.summary = summary.read_text() if summary.exists() else ""
             return proc.returncode, proc.stdout + proc.stderr, n
 
@@ -131,6 +144,22 @@ class AnnounceTests(unittest.TestCase):
         self.assertEqual((code, calls), (0, 1), out)
         self.assertIn("announced on the x0x network", out)
         self.assertIn("Release 1.2.3 announced on the x0x network", self.summary)
+
+    def test_without_files_the_body_is_empty(self):
+        code, out, calls = self.run_script(3, [ok("announced", "1.2.3")])
+        self.assertEqual((code, calls), (0, 1), out)
+        self.assertEqual(self.bodies, [{}])
+
+    def test_downloaded_manifest_bytes_travel_in_the_body(self):
+        code, out, calls = self.run_script(
+            3, [refused("publish_failed"), ok("announced", "1.2.3")], files=True
+        )
+        self.assertEqual((code, calls), (0, 2), out)
+        expected = {
+            "manifest_b64": base64.b64encode(b'{"version":"1.2.3"}').decode(),
+            "signature_b64": base64.b64encode(bytes([0, 255, 10, 13])).decode(),
+        }
+        self.assertEqual(self.bodies, [expected, expected])
 
     def test_an_earlier_version_is_not_success_and_is_retried(self):
         code, out, calls = self.run_script(

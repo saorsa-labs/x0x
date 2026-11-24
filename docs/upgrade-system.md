@@ -2026,9 +2026,19 @@ fresh timestamp, so the announcer only relays bytes CI already signed.
 
 1. A successful announce in the last 300 s answers `already_announced`
    at once, before any GitHub request.
-2. It fetches the latest release manifest with `fetch_current_manifest`,
-   the same verified fetch as the boot broadcast, and checks the
-   manifest timestamp.
+2. With an empty body it fetches the latest release manifest with
+   `fetch_current_manifest`, the same verified fetch as the boot
+   broadcast, and checks the manifest timestamp. With a JSON body
+   `{"manifest_b64": ..., "signature_b64": ...}` (base64 of the release's
+   `release-manifest.json` and `release-manifest.json.sig`; CLI
+   `x0x upgrade --announce --manifest-file <f> --signature-file <f>`) it
+   makes no GitHub request and runs the same checks on those bytes
+   (`verify_eligible_manifest`: signature, channel, timestamp). The
+   published payload is byte-identical to a fetched one. Only one of the
+   two fields, bad base64 or an unknown field answers `400`
+   (`invalid_request`, or the generic invalid-JSON error), and a body
+   without `Content-Type: application/json` answers `415`; nothing falls
+   back to a fetch.
 3. It decides the result:
 
    | `result` | Status | When |
@@ -2037,7 +2047,8 @@ fresh timestamp, so the announcer only relays bytes CI already signed.
    | `already_announced` | 200 | This node announced within 300 s, or published the same bytes within 300 s by another path (boot broadcast, fallback poll, relay). Nothing is published. |
    | `nothing_newer` | 200 | This node runs a version newer than the latest release. Nothing is published. A node on the release's own version does announce it. |
    | `fetch_failed` | 502 | The GitHub release or its manifest assets could not be fetched. Nothing is published or recorded. |
-   | `verification_failed` | 502 | The signature or the manifest checks failed. Nothing is published or recorded. |
+   | `verification_failed` | 502 (400 for a manifest in the body) | The signature or the manifest checks failed. Nothing is published or recorded. |
+   | `invalid_request` | 400 | The body has only one of `manifest_b64` and `signature_b64`, or a value is not base64. Nothing is published or recorded. |
    | `publish_failed` | 502 | The publish failed or did not finish within 10 s. The announce's record is undone, so a retry is not refused. |
 
 4. Before it publishes, it records the payload in the self-published
@@ -2069,21 +2080,29 @@ When a release is promoted (the `release: published` event), the
 runs the announce from a short-lived node:
 
 1. It downloads the promoted `x0x-linux-x64-gnu.tar.gz` and checks it
-   against the release's `.sha256` asset.
+   against the release's `.sha256` asset. The same authenticated
+   download fetches `release-manifest.json` and its `.sig`; the token is
+   not in the environment of the step that runs `x0xd`.
 2. `.github/scripts/announce_promoted_release.py` starts that `x0xd` with
    a fresh identity in a temporary directory, on the `x0x.prod` plane, with
    `[update] enabled = false`, `--skip-update-check` and mDNS off. It holds
    no secret.
 3. It waits up to 180 s for at least one send-ready peer (`send_ready_peers`
    in `/health`), then
-   20 s more for topic membership, and calls `POST /upgrade/announce`.
+   20 s more for topic membership, and calls `POST /upgrade/announce`
+   with the downloaded manifest and signature in the body, so `x0xd`
+   makes no GitHub API request. On the v0.49.0 promotion (22 Nov 2026)
+   the route's own unauthenticated fetch from the runner's shared IP got
+   `403 rate limit exceeded` on all three attempts (#1169). An `x0xd`
+   older than the body ignores it and fetches as before.
 4. Success is `announced` or `already_announced` **with `version` equal to
    the promoted version**. The result alone is not enough: the 300 s
    refusal of a repeat is keyed on time, so `already_announced` can carry
    an earlier version. `fetch_failed`, `nothing_newer`, `publish_failed`
    and a wrong version are tried again after 305 s (past the 300 s
-   refusal), three attempts in all. GitHub's latest release can point at
-   the previous release for a short time after promotion.
+   refusal), three attempts in all. Without a body, GitHub's latest
+   release can point at the previous release for a short time after
+   promotion.
 5. After a success the node stays up 60 s so that peers can pull the
    payload, then stops.
 

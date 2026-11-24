@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The promotion announce makes no GitHub API request (#1169; A14 amendment
+  of 24 Nov 2026).** `POST /upgrade/announce` takes an optional JSON body
+  `{manifest_b64, signature_b64}` (CLI `x0x upgrade --announce
+  --manifest-file <f> --signature-file <f>`) and verifies those bytes with
+  the same signature and eligibility checks as a fetched manifest. An empty
+  body fetches as before. The promotion job downloads the signed manifest
+  with its token and passes it in the body: on the v0.49.0 promotion the
+  route's unauthenticated fetch from the hosted runner's shared IP got
+  `403 rate limit exceeded` on all three attempts.
 - **Wave 1 efficiency: raw-first DM default and a Full eager degree of 3
   (#2187; A06 and A07 amendments of 23 Nov 2026).**
   - `DmSendConfig::default()` (and so `Agent::send_direct`) now equals the

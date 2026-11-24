@@ -2793,34 +2793,122 @@ impl Drop for AnnounceRecord {
 /// it; a node already newer than the latest release has nothing to
 /// announce. A successful announce, or bytes this node published, within
 /// `RELEASE_REBROADCAST_INTERVAL` are not published again.
-pub(in crate::server) async fn announce_upgrade(State(state): State<Arc<AppState>>) -> Response {
+///
+/// An optional JSON body `{manifest_b64, signature_b64}` supplies the
+/// release's `release-manifest.json` and `.sig` bytes; the route then
+/// verifies those exactly as a fetched manifest and makes no GitHub
+/// request (#1169: the promotion job's unauthenticated API fetch hit
+/// GitHub's shared-IP rate limit). An empty body fetches as before.
+pub(in crate::server) async fn announce_upgrade(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: AnnounceUpgradeRequest = match super::super::parse_optional_json(&headers, &body) {
+        Ok(request) => request,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let supplied = match request.into_supplied() {
+        Ok(supplied) => supplied,
+        Err(error) => return announce_refusal(StatusCode::BAD_REQUEST, "invalid_request", error),
+    };
     let agent = Arc::clone(&state.agent);
-    announce_release(&state, move |payload| async move {
-        agent
-            .publish(RELEASE_TOPIC, payload)
-            .await
-            .map_err(|error| error.to_string())
-    })
+    announce_release(
+        &state,
+        supplied,
+        RELEASE_SIGNING_KEY,
+        move |payload| async move {
+            agent
+                .publish(RELEASE_TOPIC, payload)
+                .await
+                .map_err(|error| error.to_string())
+        },
+    )
     .await
 }
 
-async fn announce_release<Publish, PublishFuture>(state: &AppState, publish: Publish) -> Response
+/// `POST /upgrade/announce` body. Both fields or neither: base64 of the
+/// release's `release-manifest.json` and `release-manifest.json.sig`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::server) struct AnnounceUpgradeRequest {
+    #[serde(default)]
+    manifest_b64: Option<String>,
+    #[serde(default)]
+    signature_b64: Option<String>,
+}
+
+/// Signed manifest bytes supplied to `/upgrade/announce`, not yet verified.
+struct SuppliedManifest {
+    manifest_json: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+impl AnnounceUpgradeRequest {
+    fn into_supplied(self) -> Result<Option<SuppliedManifest>, String> {
+        use base64::Engine as _;
+        let decode = |field: &str, value: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(|error| format!("{field} is not base64: {error}"))
+        };
+        match (self.manifest_b64, self.signature_b64) {
+            (None, None) => Ok(None),
+            (Some(manifest), Some(signature)) => Ok(Some(SuppliedManifest {
+                manifest_json: decode("manifest_b64", &manifest)?,
+                signature: decode("signature_b64", &signature)?,
+            })),
+            _ => Err("manifest_b64 and signature_b64 must be given together".into()),
+        }
+    }
+}
+
+impl SuppliedManifest {
+    /// The same signature and eligibility checks as a fetched manifest
+    /// (`verify_eligible_manifest`, the monitor's funnel).
+    fn verify(self, trusted_key: &[u8]) -> Result<VerifiedRelease, x0x::upgrade::UpgradeError> {
+        let manifest = x0x::upgrade::manifest::verify_eligible_manifest(
+            &self.manifest_json,
+            &self.signature,
+            trusted_key,
+        )?;
+        let gossip_payload =
+            x0x::upgrade::manifest::encode_signed_manifest(&self.manifest_json, &self.signature);
+        Ok(VerifiedRelease {
+            manifest,
+            manifest_json: self.manifest_json,
+            signature: self.signature,
+            gossip_payload,
+        })
+    }
+}
+
+fn announce_refusal(status: StatusCode, result: &str, error: String) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "ok": false,
+            "result": result,
+            "current_version": x0x::VERSION,
+            "error": error
+        })),
+    )
+        .into_response()
+}
+
+async fn announce_release<Publish, PublishFuture>(
+    state: &AppState,
+    supplied: Option<SuppliedManifest>,
+    trusted_key: &[u8],
+    publish: Publish,
+) -> Response
 where
     Publish: FnOnce(Vec<u8>) -> PublishFuture,
     PublishFuture: Future<Output = Result<(), String>>,
 {
     let reply = |status: StatusCode, body: serde_json::Value| (status, Json(body)).into_response();
-    let refused = |result: &str, error: String| {
-        reply(
-            StatusCode::BAD_GATEWAY,
-            serde_json::json!({
-                "ok": false,
-                "result": result,
-                "current_version": x0x::VERSION,
-                "error": error
-            }),
-        )
-    };
+    let refused =
+        |result: &str, error: String| announce_refusal(StatusCode::BAD_GATEWAY, result, error);
     let outcome = |result: &str, version: &str| {
         reply(
             StatusCode::OK,
@@ -2840,17 +2928,34 @@ where
     if let Some(version) = recent {
         return outcome("already_announced", &version);
     }
-    let monitor = match UpgradeMonitor::new(&state.update_config.repo, "x0xd", x0x::VERSION) {
-        Ok(monitor) => monitor.with_include_prereleases(state.update_config.include_prereleases),
-        Err(error) => return refused("fetch_failed", error),
-    };
-    let release = match broadcast_fetch_current_manifest(&monitor).await {
-        Ok(Some(release)) => release,
-        Ok(None) => return refused("fetch_failed", "no release manifest found".into()),
-        Err(error @ x0x::upgrade::UpgradeError::ManifestFetchFailed(_)) => {
-            return refused("fetch_failed", error.to_string())
+    let release = match supplied {
+        Some(supplied) => match supplied.verify(trusted_key) {
+            Ok(release) => release,
+            Err(error) => {
+                return announce_refusal(
+                    StatusCode::BAD_REQUEST,
+                    "verification_failed",
+                    error.to_string(),
+                )
+            }
+        },
+        None => {
+            let monitor = match UpgradeMonitor::new(&state.update_config.repo, "x0xd", x0x::VERSION)
+            {
+                Ok(monitor) => {
+                    monitor.with_include_prereleases(state.update_config.include_prereleases)
+                }
+                Err(error) => return refused("fetch_failed", error),
+            };
+            match broadcast_fetch_current_manifest(&monitor).await {
+                Ok(Some(release)) => release,
+                Ok(None) => return refused("fetch_failed", "no release manifest found".into()),
+                Err(error @ x0x::upgrade::UpgradeError::ManifestFetchFailed(_)) => {
+                    return refused("fetch_failed", error.to_string())
+                }
+                Err(error) => return refused("verification_failed", error.to_string()),
+            }
         }
-        Err(error) => return refused("verification_failed", error.to_string()),
     };
     if let Err(error) = x0x::upgrade::monitor::validate_manifest_timestamp(&release.manifest) {
         return refused("verification_failed", error.to_string());
@@ -3955,8 +4060,15 @@ mod tests {
         ));
 
         let _feed = broadcast_feed_seam::install(Ok(Some(verified)));
-        let (status, body) =
-            route_response_json(announce_upgrade(State(Arc::clone(&a_state))).await).await;
+        let (status, body) = route_response_json(
+            announce_upgrade(
+                State(Arc::clone(&a_state)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["result"], serde_json::json!("announced"), "{body}");
 
@@ -5281,7 +5393,13 @@ mod tests {
             .subscribe(RELEASE_TOPIC)
             .await
             .expect("release topic subscription");
-        let announce = || announce_upgrade(State(Arc::clone(&state)));
+        let announce = || {
+            announce_upgrade(
+                State(Arc::clone(&state)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+        };
 
         for version in [version_newer_than_current(), x0x::VERSION.to_string()] {
             lock_announce_tracker(&state).last_announce = None;
@@ -5377,6 +5495,168 @@ mod tests {
         agent.shutdown().await;
     }
 
+    fn supplied_manifest(release: &VerifiedRelease) -> Option<SuppliedManifest> {
+        Some(SuppliedManifest {
+            manifest_json: release.manifest_json.clone(),
+            signature: release.signature.clone(),
+        })
+    }
+
+    /// #1169: the promotion job's announce failed three times on GitHub's
+    /// shared-IP rate limit. With the signed manifest supplied, the route
+    /// verifies and publishes those bytes and makes no GitHub request: the
+    /// fetch seam holds a fetch error that a fetch would return.
+    #[tokio::test]
+    async fn announce_route_publishes_a_supplied_manifest_without_a_fetch() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let mut release_topic = agent
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("release topic subscription");
+        let (key, release) = signed_release_for_this_platform();
+        let _feed = broadcast_feed_seam::install(Err(
+            x0x::upgrade::UpgradeError::ManifestFetchFailed("403 rate limit exceeded".into()),
+        ));
+
+        let publisher = Arc::clone(&agent);
+        let response = announce_release(
+            &state,
+            supplied_manifest(&release),
+            &key,
+            move |payload| async move {
+                publisher
+                    .publish(RELEASE_TOPIC, payload)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await;
+        let (status, body) = route_response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"], serde_json::json!("announced"), "{body}");
+        assert_eq!(
+            body["version"],
+            serde_json::json!(release.manifest.version),
+            "{body}"
+        );
+        let received = tokio::time::timeout(Duration::from_secs(5), release_topic.recv())
+            .await
+            .expect("the announce self-delivers within the timeout")
+            .expect("subscription still live");
+        assert_eq!(
+            &received.payload[..],
+            release.gossip_payload.as_slice(),
+            "the supplied bytes are published in the same framing as a fetched manifest"
+        );
+        assert!(
+            broadcast_feed_seam::take().is_some(),
+            "no GitHub fetch was made"
+        );
+        agent.shutdown().await;
+    }
+
+    /// A supplied manifest gets the same checks as a fetched one: a wrong
+    /// key, a stale timestamp, a half body or bad base64 publish nothing,
+    /// and none of them falls back to a GitHub fetch.
+    #[tokio::test]
+    async fn announce_route_refuses_an_unverified_supplied_manifest() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let mut release_topic = agent
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("release topic subscription");
+        let _feed = broadcast_feed_seam::install(Err(
+            x0x::upgrade::UpgradeError::ManifestFetchFailed("403 rate limit exceeded".into()),
+        ));
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let json_headers = || {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            headers
+        };
+        let post = |body: serde_json::Value| {
+            announce_upgrade(
+                State(Arc::clone(&state)),
+                json_headers(),
+                axum::body::Bytes::from(body.to_string()),
+            )
+        };
+
+        // Signed by a test key, not the release key: the production
+        // handler refuses it.
+        let (_, release) = signed_release_for_this_platform();
+        let (status, body) = route_response_json(
+            post(serde_json::json!({
+                "manifest_b64": b64(&release.manifest_json),
+                "signature_b64": b64(&release.signature),
+            }))
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["result"], serde_json::json!("verification_failed"));
+
+        // Correctly signed but stale.
+        let (key, secret) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .expect("test release key");
+        let mut stale = manifest_for_this_platform(&version_newer_than_current());
+        stale.timestamp = 1;
+        let manifest_json = serde_json::to_vec(&stale).expect("manifest json");
+        let signature =
+            x0x::upgrade::signature::sign_with_context(&secret.to_bytes(), &manifest_json)
+                .expect("sign");
+        let response = announce_release(
+            &state,
+            Some(SuppliedManifest {
+                manifest_json,
+                signature,
+            }),
+            &key.to_bytes(),
+            |_| async { Ok(()) },
+        )
+        .await;
+        let (status, body) = route_response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["result"], serde_json::json!("verification_failed"));
+
+        for request in [
+            serde_json::json!({ "manifest_b64": b64(&release.manifest_json) }),
+            serde_json::json!({ "manifest_b64": "%%", "signature_b64": "%%" }),
+        ] {
+            let (status, body) = route_response_json(post(request).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["result"], serde_json::json!("invalid_request"));
+        }
+        let (status, _) =
+            route_response_json(post(serde_json::json!({ "manifest": "x" })).await).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unknown fields are refused"
+        );
+
+        assert!(
+            broadcast_feed_seam::take().is_some(),
+            "no refusal fell back to a GitHub fetch"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), release_topic.recv())
+                .await
+                .is_err(),
+            "nothing was published"
+        );
+        agent.shutdown().await;
+    }
+
     /// The tracker side of an announce: the 300 s refusal, and an undo that
     /// removes only the announce's own write.
     #[test]
@@ -5435,13 +5715,18 @@ mod tests {
         let _feed = broadcast_feed_seam::install(Ok(Some(release)));
 
         let tracker = Arc::clone(&state.self_published_release_manifests);
-        let response = announce_release(&state, move |published| async move {
-            tracker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record_apply_route_payload(&published, Instant::now());
-            Err("mesh unavailable".to_string())
-        })
+        let response = announce_release(
+            &state,
+            None,
+            RELEASE_SIGNING_KEY,
+            move |published| async move {
+                tracker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record_apply_route_payload(&published, Instant::now());
+                Err("mesh unavailable".to_string())
+            },
+        )
         .await;
         let (status, body) = route_response_json(response).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
@@ -5470,7 +5755,7 @@ mod tests {
 
         let _feed = broadcast_feed_seam::install(Ok(Some(release.clone())));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let interrupted = announce_release(&state, move |_| {
+        let interrupted = announce_release(&state, None, RELEASE_SIGNING_KEY, move |_| {
             let _ = started_tx.send(());
             std::future::pending()
         });
@@ -5485,8 +5770,15 @@ mod tests {
         }
 
         let _feed = broadcast_feed_seam::install(Ok(Some(release)));
-        let (status, body) =
-            route_response_json(announce_upgrade(State(Arc::clone(&state))).await).await;
+        let (status, body) = route_response_json(
+            announce_upgrade(
+                State(Arc::clone(&state)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["result"], serde_json::json!("announced"), "{body}");
         agent.shutdown().await;
@@ -5525,8 +5817,15 @@ mod tests {
             );
 
             let _feed = broadcast_feed_seam::install(Ok(Some(verified)));
-            let (status, body) =
-                route_response_json(announce_upgrade(State(Arc::clone(&state))).await).await;
+            let (status, body) = route_response_json(
+                announce_upgrade(
+                    State(Arc::clone(&state)),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::new(),
+                )
+                .await,
+            )
+            .await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["result"], serde_json::json!("announced"), "{body}");
 

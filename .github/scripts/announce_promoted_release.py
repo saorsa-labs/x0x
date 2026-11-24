@@ -3,7 +3,11 @@
 
 Starts the promoted release's own x0xd with a fresh identity and self-update
 off, waits for it to join the network, calls `POST /upgrade/announce`, and
-checks that the answer names the promoted version. The route answers
+checks that the answer names the promoted version. With `--manifest` and
+`--signature` (the release's downloaded `release-manifest.json` and `.sig`),
+the body carries those bytes and x0xd makes no GitHub API request: a hosted
+runner's unauthenticated request hit GitHub's shared-IP rate limit (#1169).
+An x0xd older than the body ignores it and fetches as before. The route answers
 `already_announced` from a time-keyed record before it fetches anything, so
 that answer can carry an earlier version: the version in the body is
 compared, never the result alone.
@@ -15,6 +19,7 @@ no announce route (a release older than #1169 PR 1); 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import signal
@@ -46,9 +51,20 @@ def env_seconds(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
-def request(url: str, token: str | None = None, method: str = "GET", timeout: float = 10):
+def request(
+    url: str,
+    token: str | None = None,
+    method: str = "GET",
+    timeout: float = 10,
+    body: dict | None = None,
+):
     """Return (status, parsed JSON or None); status 0 means no answer."""
-    req = urllib.request.Request(url, method=method, data=b"" if method == "POST" else None)
+    data = None
+    if method == "POST":
+        data = json.dumps(body).encode() if body is not None else b""
+    req = urllib.request.Request(url, method=method, data=data)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
@@ -105,15 +121,29 @@ def judge(status: int, body, expected: str) -> str:
     return "fail"
 
 
-def announce(api: str, token: str, expected: str) -> int:
+def manifest_body(manifest: Path | None, signature: Path | None) -> dict | None:
+    """The announce body for the downloaded manifest, or None to let x0xd fetch."""
+    if manifest is None or signature is None:
+        return None
+    return {
+        "manifest_b64": base64.b64encode(manifest.read_bytes()).decode(),
+        "signature_b64": base64.b64encode(signature.read_bytes()).decode(),
+    }
+
+
+def announce(api: str, token: str, expected: str, body: dict | None = None) -> int:
     attempts = int(os.environ.get("ANNOUNCE_ATTEMPTS", 3))
     retry_wait = env_seconds("ANNOUNCE_RETRY_WAIT", 305)
     for attempt in range(1, attempts + 1):
-        status, body = request(f"{api}/upgrade/announce", token, method="POST", timeout=60)
-        print(f"attempt {attempt}: HTTP {status} {json.dumps(body)}", flush=True)
-        verdict = judge(status, body, expected)
+        status, answer = request(
+            f"{api}/upgrade/announce", token, method="POST", timeout=60, body=body
+        )
+        print(f"attempt {attempt}: HTTP {status} {json.dumps(answer)}", flush=True)
+        verdict = judge(status, answer, expected)
         if verdict == "ok":
-            report("notice", f"Release {expected} announced on the x0x network ({body['result']}).")
+            report(
+                "notice", f"Release {expected} announced on the x0x network ({answer['result']})."
+            )
             return 0
         if verdict == "absent":
             report(
@@ -142,7 +172,12 @@ def main() -> int:
     parser.add_argument("--x0xd", required=True, type=Path)
     parser.add_argument("--version", required=True, help="promoted version, without the v")
     parser.add_argument("--work-dir", type=Path)
+    parser.add_argument("--manifest", type=Path, help="downloaded release-manifest.json")
+    parser.add_argument("--signature", type=Path, help="downloaded release-manifest.json.sig")
     args = parser.parse_args()
+    if (args.manifest is None) != (args.signature is None):
+        parser.error("--manifest and --signature go together")
+    body = manifest_body(args.manifest, args.signature)
 
     work = args.work_dir or Path(tempfile.mkdtemp(prefix="x0x-announce-"))
     work.mkdir(parents=True, exist_ok=True)
@@ -188,7 +223,7 @@ def main() -> int:
         print(f"{peers} send-ready peer(s)", flush=True)
         # Topic membership follows the first connections by a few seconds.
         time.sleep(env_seconds("ANNOUNCE_SETTLE", 20))
-        code = announce(api, token, args.version)
+        code = announce(api, token, args.version, body)
         if code == 0:
             # Peers that heard only a lazy announcement pull the payload
             # from this node, so it stays up a little longer.
