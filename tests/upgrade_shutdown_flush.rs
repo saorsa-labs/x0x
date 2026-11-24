@@ -57,6 +57,21 @@ macro_rules! shutdown_flush_regression_tests {
             fn started_failure_and_authorization_failure_flush_logs_before_exit() {
                 use crate::upgrade::log_flush;
                 use tracing_subscriber::prelude::*;
+                // tracing-core caches callsite interest per process, and while
+                // exactly one dispatcher is live it rebuilds that cache from
+                // the calling thread's default. A sibling test thread with no
+                // subscriber can therefore cache the error! callsites this
+                // test asserts on as "never" and the events are dropped
+                // (#2200). A second live dispatcher makes the rebuild consult
+                // the registered dispatchers instead. It is never installed
+                // as anyone's default, so it receives no events.
+                let _second_live_dispatcher = tracing::Dispatch::new(
+                    tracing_subscriber::registry().with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::io::sink),
+                    ),
+                );
                 struct Sink(
                     Arc<std::sync::Mutex<Vec<u8>>>,
                     Arc<std::sync::Mutex<Vec<u8>>>,
