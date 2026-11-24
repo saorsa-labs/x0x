@@ -1041,7 +1041,8 @@ certificate leaves it unreachable for pinned messages. See
 
 **Issuance** takes `{ "agent_public_key": <hex ML-DSA-65 public key>,
 "mode": "acp"|"rider", "label"?: string, "not_after"?: unix-seconds }`.
-The harness generates and custodies the keypair; the daemon never sees
+A `label` longer than 256 bytes is refused with `400` (#2182: the label
+travels in owner sync, whose record values are bounded). The harness generates and custodies the keypair; the daemon never sees
 the secret. The record lands in the owner-scoped ADR-0036 issuance
 journal (`owner-cert-journal.jsonl`) with the mode, label, and the full
 certificate bytes (retained so revocation can present the exact ADR-0018
@@ -1549,9 +1550,10 @@ pointer is synced **and applied** — `OwnerSyncStore::canonical_home()` feeds
 is not adoption and not a roster merge: a device changes Home only through the
 owner-driven `POST /home/seat` + pinned join (#449, ADR-0060); sub-agent
 issuance journal lines are
-synced as the issuance fact only (digest + time) — `mode` defaults to `acp`,
-`label` is dropped, and **no certificate bytes travel Tier 1** (Tier-3
-boundary), so a synced roster row is not itself mint-capable for riders.
+synced as the issuance fact (digest + time), and the `mode` and `label` of an
+owner issuance sync as their own kind (0x06, protocol 4, #2182); **no
+certificate bytes travel Tier 1** (Tier-3 boundary), so a synced roster row
+is not itself mint-capable for riders.
 
 **DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
 machine is refused, and a live session from it stops at its next admission

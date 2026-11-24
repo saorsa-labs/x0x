@@ -3733,6 +3733,16 @@ impl OwnerSyncStore {
         let SyncValue::IssuanceMode { issued_at, .. } = desired else {
             return Ok(false);
         };
+        // A value over the limit is refused by every peer's `verify`, which
+        // aborts the whole session: it must never be stored.
+        let value_bytes = bincode::serialize(desired)
+            .map_err(|e| SyncError::BadSignature(format!("value encode: {e}")))?;
+        if value_bytes.len() > MAX_VALUE_BYTES {
+            return Err(SyncError::MalformedFrame(format!(
+                "value of {} bytes exceeds limit {MAX_VALUE_BYTES}",
+                value_bytes.len()
+            )));
+        }
         let clock = RecordClock {
             version: *issued_at,
             signed_at_ms: now_unix_ms(),

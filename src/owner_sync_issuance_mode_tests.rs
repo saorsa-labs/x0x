@@ -419,6 +419,40 @@ async fn a_third_device_gets_the_mode_through_another_device() {
     assert_eq!(mode_record(&c).await, mode_record(&a).await);
 }
 
+/// A statement whose value is over `MAX_VALUE_BYTES` is never stored:
+/// every peer would refuse it and abort the whole session. The other
+/// kinds keep syncing.
+#[tokio::test]
+async fn an_oversize_label_is_not_stored_and_sessions_still_sync() {
+    let (_dir, a, b) = pair().await;
+    let big = "x".repeat(MAX_VALUE_BYTES + 1);
+    append(&a, &issued("d1", 100, CertMode::Rider, Some(&big))).await;
+    reconcile(&a).await;
+    assert_eq!(
+        mode_record(&a).await,
+        None,
+        "the oversize statement is not stored"
+    );
+    a.store
+        .commit_batch(
+            vec![VersionedRecord::sign(
+                SyncKind::MachineNames,
+                &hex::encode(machine(1).0),
+                &names_value("n"),
+                super::tests::clock(1, 1, 1),
+                &owner_kp(OWNER_SEED),
+            )
+            .expect("sign")],
+            &owner_kp(OWNER_SEED).user_id(),
+        )
+        .await
+        .expect("names record");
+    complete(session(&a, &b).await);
+    let held = b.store.records_snapshot().await;
+    assert!(held.iter().any(|r| r.kind == SyncKind::MachineNames));
+    assert!(held.iter().any(|r| r.kind == SyncKind::IssuanceJournal));
+}
+
 /// A peer that speaks only protocol 3 (a released build) refuses a
 /// protocol-4 `Hello`; the next session runs at 3 and completes. Kind 0x06
 /// never crosses to it, and the older kinds still do.

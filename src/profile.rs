@@ -358,6 +358,11 @@ pub enum CertMode {
     Rider,
 }
 
+/// Largest `label` of an owner issuance, in bytes (#2182). The label
+/// travels in owner sync, whose record values are bounded; a larger label
+/// is refused at `POST /owner/agents/issue`.
+pub const MAX_ISSUE_LABEL_BYTES: usize = 256;
+
 /// File name of the owner certificate journal, in the instance data dir
 /// (sibling of `agent.cert`).
 pub const CERT_JOURNAL_FILE: &str = "owner-cert-journal.jsonl";

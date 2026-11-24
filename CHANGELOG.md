@@ -153,7 +153,8 @@ All notable changes to this project will be documented in this file.
   modes converge on the issuance with the later `issued_at`, whatever
   order they sync in; in the same second the Tier-1 tie-break decides.
   Limit: a re-issue on a device whose clock is behind the issuance it
-  replaces loses on every device. Mode records are stored in
+  replaces loses on every device. `POST /owner/agents/issue` now refuses a `label`
+  longer than 256 bytes with `400`. Mode records are stored in
   `sync/issuance_mode_records.json`, so a rolled-back build still starts.
 - **TreeKEM Welcome transfer: a slow chunk ack no longer holds the
   joiner's Welcome listener (#2202, refs #2189).** The joiner sent each
