@@ -3390,7 +3390,11 @@ async fn refreshed_handoff_dispatch(
 /// §2 (L170–L173) outcome. Every `DmError` variant is matched by name,
 /// so a new variant must be classified here before the code builds.
 ///
-/// - `Ok` reached an authenticated exchange: `ExchangeReached`.
+/// - `Ok` reached an authenticated exchange: `ExchangeReached`. Since
+///   #2187 `send_direct` tries raw QUIC first for a connected peer, so `Ok`
+///   can be a transport-only receive-pipeline ACK (the recipient's reader
+///   drained the bytes), with no application ACK and no
+///   `RecipientRejected` refusal possible on that path.
 /// - `RecipientUpgradeRequired` is a definitive current eligibility
 ///   failure — the recipient's current verified advert lacks
 ///   `eviction_handoff_v1`, the same evidence as the pre-send

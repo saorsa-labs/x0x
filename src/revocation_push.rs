@@ -462,17 +462,7 @@ async fn push_grant_revocation_to(
             }
         }
     }
-    let config = crate::dm::DmSendConfig {
-        // ADR 0080 §3: no ACK of any kind is waited for, and a send that
-        // returns success ends this push. The send layer's own retry loop
-        // republishes even after a successful publish when no ACK is
-        // required, so it is OFF here; local-error retries run below.
-        max_retries: 0,
-        require_gossip_ack: false,
-        require_durable_app_ack: false,
-        prefer_raw_quic_if_connected: true,
-        ..crate::dm::DmSendConfig::default()
-    };
+    let config = revocation_push_send_config();
     let sent = send_push_with_local_retries(|attempt| {
         let payload = payload.clone();
         let config = config.clone();
@@ -518,6 +508,25 @@ where
             Err(e) if attempt >= GRANT_REVOCATION_PUSH_SEND_RETRIES => return Err(e),
             Err(_) => attempt += 1,
         }
+    }
+}
+
+/// The send configuration for one grant revocation push.
+///
+/// ADR 0080 §3: no ACK of any kind is waited for, and a send that returns
+/// success ends the push. The send layer's own retry loop republishes even
+/// after a successful publish when no ACK is required, so it is off here;
+/// local-error retries run in the caller. Since #2187 the default config
+/// carries a raw-QUIC receive-pipeline ACK, so raw stays fire-and-forget here
+/// explicitly.
+fn revocation_push_send_config() -> crate::dm::DmSendConfig {
+    crate::dm::DmSendConfig {
+        max_retries: 0,
+        require_gossip_ack: false,
+        require_durable_app_ack: false,
+        prefer_raw_quic_if_connected: true,
+        raw_quic_receive_ack_timeout: None,
+        ..crate::dm::DmSendConfig::default()
     }
 }
 

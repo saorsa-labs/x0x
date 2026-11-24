@@ -977,7 +977,7 @@ struct RejectedReadiness {
 /// # Degree note
 /// Harness agents are built with `Agent::builder()` which produces Leaf
 /// nodes; the default `leaf_max_eager_degree = 2` is the right ceiling here.
-/// Full or relay nodes would need `FULL_EAGER_DEGREE_CEILING = 6`.
+/// Full or relay nodes would need `FULL_EAGER_DEGREE_CEILING = 3` (#2187).
 fn check_eager_mesh_for_diamond(
     observed: &serde_json::Value,
     identities: Option<[[u8; 32]; 4]>,
@@ -2086,9 +2086,20 @@ fn prepare_measurement() -> MeasurementPreparation {
 }
 
 fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
-    // crates.io 0.5.96 retains the reviewed outbound meter, per-peer wire
-    // lengths and key-cache accounting. Its pubsub `src/` is byte-identical
-    // to 0.5.95 (registry sources compared); its manifest moves only the
+    // crates.io 0.5.97 (#2187 Wave 1) retains the reviewed outbound meter,
+    // per-peer wire lengths and key-cache accounting definitions. Its pubsub
+    // `src/` changes: the published crate is byte-identical to the sg
+    // release 4e6d852, the squash of sg PR #138 head 45803673 (dual Fable +
+    // Opus exact-head review, 22-23 Nov 2026); the meter review is the #2187
+    // gate. Verbatim origin-signed IWANT/AE repair changes who signs, not the
+    // meter: one attempt per peer, bytes stay the final per-peer frame
+    // length. Critical key-refs-once-acked changes Full/Ref frame sizes per
+    // peer, which the premise already measures. The pre-verify payload-replay
+    // drop and tombstones are inbound only. Duplicate-prune backoff and the
+    // `min(preferred, 1)` cap change eager attempt counts only. The key-cache
+    // ACK token bucket stays on the reserved control topic.
+    // crates.io 0.5.96 retained the same accounting. Its pubsub `src/` is
+    // byte-identical to 0.5.95 (registry sources compared); its manifest moved only the
     // family pins, for the crdt-sync OR-Set undo log (`OrSet::begin_undo`).
     // 0.5.95's pubsub `src/` is byte-identical
     // to 0.5.94; its manifest moved only the
@@ -2112,10 +2123,10 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
     // byte-identical to 0.5.89, which changed only payload replay refusal
     // relative to 0.5.88. Refused replays and claim changes can move
     // attempt counts without changing the meter.
-    const REGISTRY_PUBSUB_VERSION: &str = "0.5.96";
+    const REGISTRY_PUBSUB_VERSION: &str = "0.5.97";
     const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const REGISTRY_PUBSUB_SHA: &str =
-        "38a50439dd6021f2ed922ddc0ab49d2763280673a2efcd273280315eeb252f98";
+        "e6d5c8ba47be8bf091220e2eec882915b941e1a4d75f74b734d79c1f72876954";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
     // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
@@ -2139,7 +2150,7 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
 #[test]
 fn controlled_load_producer_allowlist_is_exact() {
     let registry: toml::Value = toml::from_str(
-        "version = '0.5.96'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '38a50439dd6021f2ed922ddc0ab49d2763280673a2efcd273280315eeb252f98'",
+        "version = '0.5.97'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'e6d5c8ba47be8bf091220e2eec882915b941e1a4d75f74b734d79c1f72876954'",
     )
     .expect("registry fixture");
     let git_accounting: toml::Value = toml::from_str(
@@ -2195,7 +2206,13 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("replaced registry fixture");
     assert!(!reviewed_pubsub_producer(&replaced_registry));
-    // 0.5.95 has the same pubsub sources as 0.5.96 but is superseded.
+    // 0.5.96 was the reviewed producer before 0.5.97 and is superseded.
+    let superseded_previous: toml::Value = toml::from_str(
+        "version = '0.5.96'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '38a50439dd6021f2ed922ddc0ab49d2763280673a2efcd273280315eeb252f98'",
+    )
+    .expect("0.5.96 registry fixture");
+    assert!(!reviewed_pubsub_producer(&superseded_previous));
+    // 0.5.95 has the same pubsub sources as 0.5.96 and is superseded.
     let replaced_previous: toml::Value = toml::from_str(
         "version = '0.5.95'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'e4a433ec9d2b31bc1f47a12c512c14fb3bdcb765ccd393183d88d5a51948ece6'",
     )

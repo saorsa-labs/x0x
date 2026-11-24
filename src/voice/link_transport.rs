@@ -1141,7 +1141,25 @@ async fn send_advert_frame(
     // frames queue (and evict) behind a stuck ack, which is exactly the
     // sequential-startup deadlock this bounds away. A timed-out attempt
     // is abandoned; the peer's retry cadence re-covers it.
-    match tokio::time::timeout(ADVERT_SEND_BOUND, agent.send_direct(remote, payload)).await {
+    // Gossip-first (#2187): ADVERT_SEND_BOUND (5 s) is shorter than the 8 s
+    // raw receive-ACK wait of the default config, so raw-first could starve
+    // the gossip fallback on a stuck direct connection. This keeps the
+    // pre-#2187 path for this bounded control message.
+    // The last-resort raw send to an inbox-less peer is also kept ACK-free:
+    // waiting up to 8 s for a receive ACK would overrun the 5 s bound, and
+    // pre-#2187 this send was fire-and-forget by design (the advert cadence
+    // retries it).
+    let config = crate::dm::DmSendConfig {
+        prefer_raw_quic_if_connected: false,
+        raw_quic_receive_ack_timeout: None,
+        ..crate::dm::DmSendConfig::default()
+    };
+    match tokio::time::timeout(
+        ADVERT_SEND_BOUND,
+        agent.send_direct_with_config(remote, payload, config),
+    )
+    .await
+    {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("advert send exceeded bound; abandoned".to_owned()),

@@ -1017,8 +1017,10 @@ pub(in crate::server) async fn delegate_group_authority(
         .into_response()
 }
 
-/// Best-effort DM notification of a new delegation (ADR-0030 hardened
-/// durable-ACK path). Returns a machine-readable status string.
+/// Best-effort DM notification of a new delegation. Since #2187 the default
+/// send config tries raw QUIC (with the receive-pipeline ACK) before the
+/// gossip-inbox path, so the returned machine-readable status string reports
+/// the path the send actually took ([`delegation_notification_label`]).
 async fn notify_delegate(
     state: &AppState,
     to: x0x::identity::AgentId,
@@ -1036,7 +1038,7 @@ async fn notify_delegate(
         .send_direct_with_config(&to, payload, config)
         .await
     {
-        Ok(_) => "durable_ack".to_string(),
+        Ok(receipt) => delegation_notification_label(receipt.path).to_string(),
         Err(e) => {
             tracing::warn!(
                 delegate = %hex::encode(to.as_bytes()),
@@ -1044,6 +1046,23 @@ async fn notify_delegate(
             );
             format!("unreachable:{e}")
         }
+    }
+}
+
+/// The `notification` label for a delegation handoff DM that returned Ok.
+///
+/// Only the gossip-inbox path waits for the recipient's application ACK, so
+/// only it keeps the historical `"durable_ack"` label. Since #2187 the
+/// default send config prefers raw QUIC, whose receipt certifies transport
+/// delivery only (`"raw_quic_acked"`: the remote reader drained the bytes),
+/// so it must not be reported as an application ACK.
+fn delegation_notification_label(path: x0x::dm::DmPath) -> &'static str {
+    match path {
+        x0x::dm::DmPath::GossipInbox => "durable_ack",
+        x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
+        x0x::dm::DmPath::RawQuic => "raw_quic",
+        x0x::dm::DmPath::Relayed { .. } => "relayed",
+        x0x::dm::DmPath::Loopback => "loopback",
     }
 }
 
@@ -1243,6 +1262,30 @@ fn not_found(msg: impl std::fmt::Display) -> axum::response::Response {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn notification_label_reports_application_ack_only_for_gossip_inbox() {
+        // Why (#2187): the default send config now prefers raw QUIC, whose
+        // receipt is transport-level. Only the gossip-inbox path waited for
+        // the delegate's application ACK, so only it may say "durable_ack".
+        use x0x::dm::DmPath;
+        assert_eq!(
+            delegation_notification_label(DmPath::GossipInbox),
+            "durable_ack"
+        );
+        assert_eq!(
+            delegation_notification_label(DmPath::RawQuicAcked),
+            "raw_quic_acked"
+        );
+        assert_eq!(delegation_notification_label(DmPath::RawQuic), "raw_quic");
+        assert_eq!(
+            delegation_notification_label(DmPath::Relayed {
+                via: x0x::identity::AgentId([7; 32]),
+            }),
+            "relayed"
+        );
+        assert_eq!(delegation_notification_label(DmPath::Loopback), "loopback");
+    }
 
     fn envelope(id: [u8; 16], group: &str) -> x0x::delegation::SignedDelegation {
         let kp = x0x::identity::AgentKeypair::generate().unwrap();

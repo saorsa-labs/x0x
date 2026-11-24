@@ -47,14 +47,14 @@
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "68c55208d247f33ba24cc7c83a5d0726b8efb54b41dcbb7a0ab3eb209a9cf1fd"
+      "sha256": "dea21916d45932381184430d2eddd1cd7b3377ffc61306fbbd3c0365893dbec4"
     },
     {
       "id": "A07",
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
       "title": "Messages Receipts History and Retry",
-      "sha256": "a86003fbfac2227341dcea7e5c40ffa158397a97c3cac53411cb513fc80a0cb9"
+      "sha256": "f724bbbef0dfd70be24165623e3dbfa775b508a24a08a3741a4ddca2da156a6a"
     },
     {
       "id": "A08",
