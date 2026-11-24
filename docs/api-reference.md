@@ -1041,7 +1041,8 @@ certificate leaves it unreachable for pinned messages. See
 
 **Issuance** takes `{ "agent_public_key": <hex ML-DSA-65 public key>,
 "mode": "acp"|"rider", "label"?: string, "not_after"?: unix-seconds }`.
-The harness generates and custodies the keypair; the daemon never sees
+A `label` longer than 256 bytes is refused with `400` (#2182: the label
+travels in owner sync, whose record values are bounded). The harness generates and custodies the keypair; the daemon never sees
 the secret. The record lands in the owner-scoped ADR-0036 issuance
 journal (`owner-cert-journal.jsonl`) with the mode, label, and the full
 certificate bytes (retained so revocation can present the exact ADR-0018
@@ -1234,10 +1235,16 @@ agents). `mode` and `journal_label` come from the owner's last
 `POST /owner/agents/issue` line for the agent in journal file order, not
 from the certificate the row shows: a renewed or live-announced certificate
 keeps a rider `"rider"` with its label; a later issuance in the other mode
-changes it (#2158). Owner sync does not carry the mode (#2182): a rider
-re-issued as ACP on another owner device stays `"rider"` on this one, so
-placement minting pins it to this machine and `POST /report` refuses it
-as a target (fail closed).
+changes it (#2158). Owner sync carries the mode and label (Tier-1 kind
+0x06, SyncV1 protocol 4, #2182): an issuance on another owner device adds
+a journal line here that states its mode and label and keeps the
+certificate the row shows, so a rider re-issued as ACP elsewhere shows
+`"acp"` here. When two owner devices state different modes, both end on
+the issuance with the later `issued_at`, whatever order they sync in; in
+the same second the Tier-1 tie-break decides (latest signing time, then
+greatest writer machine). A re-issue on a device whose clock is behind
+the issuance it replaces loses on every device. A peer on protocol 3 or 2 does not receive the mode, and
+there a rider re-issued as ACP on another device stays `"rider"`.
 
 ## Home (ADR-0038)
 
@@ -1523,7 +1530,9 @@ each naming the other's machine id (plus itself), or no session is ever
 established. After that, enrollments and removals sync (Tier-1 kind 0x05,
 SyncV1 protocol 3, #1107): a machine enrolled or removed on one device is
 enrolled or removed on every owner device that syncs with it. A peer on
-protocol 2 does not receive them.
+protocol 2 does not receive them. The hosting mode and label of an owner
+issuance sync as Tier-1 kind 0x06 (SyncV1 protocol 4, #2182); a peer on
+protocol 3 or 2 does not receive them.
 
 **Trust prerequisite:** SyncV1 rides ADR-0022 byte streams through the same
 stream gate as every other protocol — each side's peer-trust decision for the
@@ -1541,9 +1550,10 @@ pointer is synced **and applied** — `OwnerSyncStore::canonical_home()` feeds
 is not adoption and not a roster merge: a device changes Home only through the
 owner-driven `POST /home/seat` + pinned join (#449, ADR-0060); sub-agent
 issuance journal lines are
-synced as the issuance fact only (digest + time) — `mode` defaults to `acp`,
-`label` is dropped, and **no certificate bytes travel Tier 1** (Tier-3
-boundary), so a synced roster row is not itself mint-capable for riders.
+synced as the issuance fact (digest + time), and the `mode` and `label` of an
+owner issuance sync as their own kind (0x06, protocol 4, #2182); **no
+certificate bytes travel Tier 1** (Tier-3 boundary), so a synced roster row
+is not itself mint-capable for riders.
 
 **DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
 machine is refused, and a live session from it stops at its next admission

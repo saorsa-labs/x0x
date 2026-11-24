@@ -616,6 +616,9 @@ fn prefix_and_capability_bit_are_pinned() {
 fn push_send_config_waits_for_no_ack() {
     let config = revocation_push_send_config();
     assert_eq!(config.raw_quic_receive_ack_timeout, None);
+    // The direct fast path dials, as before #2187.
+    assert!(config.prefer_raw_quic_if_connected);
+    assert!(config.dial_for_raw_quic);
     assert!(!config.require_gossip_ack);
     assert!(!config.require_durable_app_ack);
     assert_eq!(config.max_retries, 0);

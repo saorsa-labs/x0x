@@ -333,6 +333,14 @@ pub struct IssuedCertRecord {
     /// the durable copy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_b64: Option<String>,
+    /// `true` on a line that owner sync wrote for a hosting mode and label
+    /// set on another owner device (#2182). Such a line states `mode` and
+    /// `label` (see [`Self::states_mode`]) and repeats the certificate
+    /// fields of the agent's last line, so it does not change the
+    /// certificate the roster shows. Absent on every other line; a build
+    /// without the field ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synced_mode: bool,
 }
 
 /// Hosting mode of a certified sub-agent (ADR-0039): an ACP-attached
@@ -349,6 +357,11 @@ pub enum CertMode {
     /// which signs on the sub-agent's behalf with provenance marks.
     Rider,
 }
+
+/// Largest `label` of an owner issuance, in bytes (#2182). The label
+/// travels in owner sync, whose record values are bounded; a larger label
+/// is refused at `POST /owner/agents/issue`.
+pub const MAX_ISSUE_LABEL_BYTES: usize = 256;
 
 /// File name of the owner certificate journal, in the instance data dir
 /// (sibling of `agent.cert`).
@@ -397,6 +410,7 @@ impl IssuedCertRecord {
             mode: CertMode::Acp,
             label: None,
             cert_b64: None,
+            synced_mode: false,
         })
     }
 
@@ -426,6 +440,7 @@ impl IssuedCertRecord {
             mode,
             label,
             cert_b64,
+            synced_mode: false,
         })
     }
 
@@ -433,14 +448,19 @@ impl IssuedCertRecord {
     ///
     /// Only an owner-directed issuance ([`Self::from_cert_with_mode`],
     /// written by `POST /owner/agents/issue`, which keeps the certificate
-    /// bytes) states them; a rider line or a labelled line always does. A
-    /// line written for the daemon's own issuance, on first sight of a live
-    /// certificate, or by owner sync has the default `Acp`, no label and no
+    /// bytes) states them; a rider line, a labelled line, and a line that
+    /// owner sync wrote for a mode set on another owner device
+    /// ([`Self::synced_mode`], #2182) always do. A line written for the
+    /// daemon's own issuance, on first sight of a live certificate, or by
+    /// owner sync for a certificate has the default `Acp`, no label and no
     /// certificate bytes: it records a certificate, not a mode, so it must
     /// not reset a rider to `Acp`.
     #[must_use]
     pub fn states_mode(&self) -> bool {
-        self.mode == CertMode::Rider || self.label.is_some() || self.cert_b64.is_some()
+        self.mode == CertMode::Rider
+            || self.label.is_some()
+            || self.cert_b64.is_some()
+            || self.synced_mode
     }
 
     /// Append one record as a JSONL line (creates the file on first write;
@@ -826,6 +846,7 @@ mod tests {
             mode: CertMode::Acp,
             label: None,
             cert_b64: None,
+            synced_mode: false,
         };
         IssuedCertRecord::append(&path, &line("d1")).await.unwrap();
 
@@ -889,6 +910,7 @@ mod tests {
             mode: CertMode::Acp,
             label: None,
             cert_b64: None,
+            synced_mode: false,
         };
         IssuedCertRecord::append(&path, &line("d1")).await.unwrap();
         let (deciding_tx, deciding_rx) = std::sync::mpsc::channel();
@@ -1031,6 +1053,7 @@ mod tests {
             mode: CertMode::Acp,
             label: None,
             cert_b64: None,
+            synced_mode: false,
         };
         let r2 = IssuedCertRecord {
             user_id: "07".repeat(32),
@@ -1041,6 +1064,7 @@ mod tests {
             mode: CertMode::Rider,
             label: Some("ci-agent".into()),
             cert_b64: None,
+            synced_mode: false,
         };
         IssuedCertRecord::append(&path, &r1).await.unwrap();
         IssuedCertRecord::append(&path, &r2).await.unwrap();

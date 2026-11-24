@@ -4205,11 +4205,35 @@ mod tests {
         }
     }
 
+    /// Keeps the capture subscriber installed and a second dispatcher
+    /// registered for the test's duration.
+    struct WarnLogGuard {
+        _default: tracing::subscriber::DefaultGuard,
+        _second_live_dispatcher: tracing::Dispatch,
+    }
+
     /// Install a thread-local WARN-level fmt subscriber writing into a
     /// [`LogCapture`]. The guard is thread-scoped and `#[tokio::test]` runs
     /// the body on the current-thread runtime, so every event the gate emits
     /// lands in the buffer without cross-test interference.
-    fn capture_warn_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+    ///
+    /// tracing-core caches callsite interest per process, and while exactly
+    /// one dispatcher is live it rebuilds that cache from the calling
+    /// thread's default: a sibling test thread with no subscriber could
+    /// otherwise cache the warn! callsites this capture asserts on as
+    /// `never` and drop the events (#2200). The second dispatcher makes the
+    /// rebuild consult the registered dispatchers instead; it is never
+    /// installed as anyone's default and writes to a sink.
+    fn capture_warn_logs() -> (LogCapture, WarnLogGuard) {
+        use tracing_subscriber::prelude::*;
+
+        let second_live_dispatcher = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::io::sink),
+            ),
+        );
         let capture = LogCapture::default();
         let writer = capture.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -4217,8 +4241,14 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (capture, guard)
+        let default = tracing::subscriber::set_default(subscriber);
+        (
+            capture,
+            WarnLogGuard {
+                _default: default,
+                _second_live_dispatcher: second_live_dispatcher,
+            },
+        )
     }
 
     /// Frame a header through the real async codec pair the QUIC stream uses

@@ -6,6 +6,42 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Wave 1 efficiency: raw-first DM default and a Full eager degree of 3
+  (#2187; A06 and A07 amendments of 23 Nov 2026).**
+  - `DmSendConfig::default()` (and so `Agent::send_direct`) now equals the
+    `POST /direct/send` default: `prefer_raw_quic_if_connected = true` and
+    `raw_quic_receive_ack_timeout = Some(DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT)`
+    (8 s). A send to a peer with a live direct connection goes over raw QUIC
+    and succeeds only when the recipient's reader drains the bytes; a peer
+    with no live connection goes straight to the gossip-inbox path. The raw
+    receipt is transport-level: it carries no application ACK and no
+    `RecipientRejected` refusal. Callers that need either set
+    `prefer_raw_quic_if_connected = false`.
+  - New public field `DmSendConfig::dial_for_raw_quic` (default `false`):
+    the preferred raw attempt dials a peer with no live connection, as
+    before #2187. File transfer, `POST /direct/send`, A2A and the grant
+    revocation push set it. New public constant
+    `x0x::dm::DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT` (8 s).
+  - The worst-case absolute deadline of a default send grows from 38.75 s to
+    54.75 s (4 s unknown-RTT attempt timeout), because each raw stage now
+    counts two 8 s receive-ACK waits plus the 0.25 s grace.
+  - The receive-pipeline ACK is ant-quic's ACK-v2, added in ant-quic 0.27.8
+    (x0x 0.19.27). A peer that does not advertise it answers `NotSupported`
+    at once; x0x then uses the gossip inbox, or, for a peer with no gossip
+    inbox (x0x from before the inbox), reports `PeerDisconnected` where the
+    old fire-and-forget raw send reported success.
+  - The delegation-create response's `notification` field gains the values
+    `raw_quic_acked`, `raw_quic`, `relayed` and `loopback`; `durable_ack`
+    now means the gossip-inbox path only. Additive; no request change.
+  - Full and relay nodes use a PlumTree eager-degree ceiling of 3 (was 6),
+    which halves `relay_forward` egress (E0-b, #2189). Leaf nodes are
+    unchanged.
+  - All `saorsa-gossip-*` crates are pinned at `=0.5.97` (was `=0.5.96`),
+    which carries the Wave 1 crate-side changes. No wire format change.
+  - **Semver:** `DmSendConfig` is public, all its fields are public, and it
+    is not `#[non_exhaustive]`, so the new field breaks struct literals that
+    list every field (`..Default::default()` keeps working). The next
+    release must be a minor version bump, not a patch.
 - **Release builds of `x0xd` use jemalloc on Linux and macOS (#1172).**
   `release.yml` and the matching `build.yml` legs build `linux-x64-gnu`,
   `linux-x64-musl`, `linux-arm64-gnu`, `macos-x64` and `macos-arm64` with
@@ -149,6 +185,25 @@ All notable changes to this project will be documented in this file.
   drops nothing. Fetch requests and base-roster frames are handled as
   before. No wire change.
 
+- **Owner sync carries the roster mode and label (#2182; A02 and A04
+  amendments of 24 Nov 2026).** A hosting mode (`acp`/`rider`) or label set
+  by `POST /owner/agents/issue` on one owner device now reaches the owner's
+  other devices: `GET /owner/agents` and placement minting there follow
+  it. The `POST /report` target rule is unchanged: an agent that any
+  journal line records as a rider, a synced line included, is still
+  refused, so an ACP agent re-issued as a rider elsewhere is refused here,
+  and a rider re-issued as ACP stays refused. It travels as a new Tier-1
+  kind (0x06) in SyncV1 protocol 4. A device on protocol 3 or 2 refuses the
+  first protocol-4 session and syncs the older kinds at its own version
+  from the next one, without the mode. The receiving device appends a
+  journal line marked `synced_mode` that keeps the certificate the roster
+  shows; an older build ignores the marker. Two devices that set different
+  modes converge on the issuance with the later `issued_at`, whatever
+  order they sync in; in the same second the Tier-1 tie-break decides.
+  Limit: a re-issue on a device whose clock is behind the issuance it
+  replaces loses on every device. `POST /owner/agents/issue` now refuses a `label`
+  longer than 256 bytes with `400`. Mode records are stored in
+  `sync/issuance_mode_records.json`, so a rolled-back build still starts.
 - **TreeKEM Welcome transfer: a slow chunk ack no longer holds the
   joiner's Welcome listener (#2202, refs #2189).** The joiner sent each
   `ChunkAck` inside the single Welcome listener loop and waited for its
