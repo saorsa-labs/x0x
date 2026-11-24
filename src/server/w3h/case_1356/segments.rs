@@ -54,8 +54,15 @@
 //! them to J page by page (a direct message, not on the metadata topic).
 //! So the case also empties A's catch-up log for the group after the
 //! renames, as an A restart does. With the hold and the empty log, only
-//! the join result moves J, and A sends it after the seal, so J is still
-//! at r when the case reads it after the seal.
+//! the join result moves J.
+//!
+//! **Join-result hold until the read.** The join result of these runs is
+//! too large for one direct message, so A sends J a control-blob reference
+//! and J pulls the chunks. J asks for its result every 2 s, so its next ask
+//! can reach A after the seal and before the case reads J. J can then move
+//! past r before the read (train 151: `r=7 J=8`). The case therefore drops
+//! A's control-blob frames to J from before the seal until it has read J's
+//! head, and then lets them pass. J's next ask after that gets the result.
 //!
 //! **Observations.** J's head and `recovery` state at each poll, and A's
 //! answers to J from J's direct message stream (decoded with
@@ -68,6 +75,7 @@ use crate::groups::recovery::{
     decode_message, AttestAnswer, GroupRecoveryMessageV1, ATA_MAX_LINKS,
     RESPONDER_PER_REQUESTER_INTERVAL,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const LABELS: &[&str] = &["A", "M1", "M2", "J"];
 const FINAL: &str = "a_64_link_segment_then_the_terminal_or_a_second_ata_from_r_plus_64";
@@ -206,6 +214,35 @@ async fn empty_catchup_log_on_a(sim: &Sim, group: &str) -> Result<()> {
     Ok(())
 }
 
+/// The JSON `type` prefix of every control-blob frame (reference, chunk).
+const BLOB_TYPE: &[u8] = b"\"type\":\"control_blob_";
+
+/// Drops A's control-blob frames to J while the returned flag is set.
+fn hold_join_result_from_a(sim: &Sim) -> Result<Arc<AtomicBool>> {
+    use crate::network::sim::{Fault, LaneClass};
+    let a = sim.peer("A")?.0;
+    let j = sim.peer("J")?.0;
+    let held = Arc::new(AtomicBool::new(true));
+    let rule_held = Arc::clone(&held);
+    sim.fabric().add_rule(move |write| {
+        let blob_to_j = write.lane.src == a
+            && write.lane.dst == j
+            && matches!(write.lane.class, LaneClass::Direct | LaneClass::RelayedDm)
+            && write
+                .bytes
+                .windows(BLOB_TYPE.len())
+                .any(|window| window == BLOB_TYPE);
+        if blob_to_j && rule_held.load(Ordering::SeqCst) {
+            Fault::Drop
+        } else {
+            Fault::Pass
+        }
+    });
+    sim.fabric()
+        .mark("fault: A's control-blob frames to J held until J is read".to_string());
+    Ok(held)
+}
+
 /// One run: A renames `renames` times after the mint, then seals J.
 async fn gap_run(sim: &Sim, renames: usize) -> Result<Run> {
     let (group, _) = s0(sim, LABELS, true, &[]).await?;
@@ -225,6 +262,7 @@ async fn gap_run(sim: &Sim, renames: usize) -> Result<Run> {
     let since = sim
         .fabric()
         .mark_indexed(format!("case: J redeems I across {} links", renames + 1));
+    let join_result_held = hold_join_result_from_a(sim)?;
     let sealed = seal_j(sim, &link, &group).await?;
     let want = run.base + renames as u64 + 1;
     ensure!(
@@ -233,6 +271,9 @@ async fn gap_run(sim: &Sim, renames: usize) -> Result<Run> {
         sealed.state_revision
     );
     run.head_at_seal = view(sim, "J", &group).await?.state_revision;
+    join_result_held.store(false, Ordering::SeqCst);
+    sim.fabric()
+        .mark("fault: A's control-blob frames to J pass".to_string());
     run.terminal = sealed.state_revision;
     let _ = sim
         .until(
