@@ -1,4 +1,6 @@
 //! #1238: per-group apply lanes for the shared direct metadata listener.
+//! #2207: the join-result listener uses the same lanes for its `Result`,
+//! `Refused` and `Pending` applies ([`run_join_result_listener`]).
 //!
 //! One direct-message subscription carries the named-group metadata events
 //! of every group. An apply can wait on the network: a seating `MemberAdded`
@@ -75,8 +77,9 @@ use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    apply_listener_metadata_event, named_group_metadata_event_group_id,
-    named_group_metadata_event_kind, AppState, NamedGroupMetadataEvent,
+    apply_join_result_shielded, apply_listener_metadata_event, dispatch_join_result_message,
+    join_result_apply_group, named_group_metadata_event_group_id, named_group_metadata_event_kind,
+    AppState, JoinResultMessage, NamedGroupMetadataEvent,
 };
 use crate as x0x;
 use x0x::identity::AgentId;
@@ -253,6 +256,89 @@ fn listener_spawn(state: &Arc<AppState>) -> SpawnFn {
     Arc::new(move |worker: BoxFuture<()>| state.spawn_detached_with_abort(worker).is_some())
 }
 
+/// The join-result listener (spawned once by the server; `rx` is its
+/// direct-message subscription).
+///
+/// #2207: a `Result` apply can wait in a Welcome fetch for up to
+/// `WELCOME_FETCH_TIMEOUT` (115 s). When this listener awaited each apply
+/// inline, every other join-result frame waited behind it, for every group.
+/// Now a `Result`, `Refused` or `Pending` goes to the lane of its group,
+/// with the same order rule and bounds as the direct metadata lanes (see
+/// the module documentation): the frames of one group still apply one at a
+/// time, in arrival order, through the same shielded apply (#1275). Every
+/// other frame is handled by [`dispatch_join_result_message`], which hands
+/// it off this loop at once.
+///
+/// It stops when the subscription closes or shutdown starts.
+pub(in crate::server) async fn run_join_result_listener(
+    state: Arc<AppState>,
+    mut rx: x0x::direct::DirectMessageReceiver,
+) {
+    let mut lanes = GroupLanes::new(
+        LaneLimits::JOIN_RESULT,
+        state.shutdown_started.clone(),
+        join_result_apply(&state),
+        listener_spawn(&state),
+    );
+    loop {
+        let msg = tokio::select! {
+            biased;
+            () = state.shutdown_started.cancelled() => break,
+            msg = rx.recv() => msg,
+        };
+        let Some(msg) = msg else { break };
+        let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
+            continue;
+        };
+        let Ok(join_msg) = crate::wire_compat::reject_unknown("JoinResultMessage", join_msg) else {
+            continue;
+        };
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "direct_classified_join_result",
+            sender = %hex::encode(msg.sender.as_bytes()),
+            len = msg.payload.len(),
+            verified = msg.verified,
+        );
+        let Some(group_id) = join_result_apply_group(&join_msg) else {
+            if !dispatch_join_result_message(&state, &msg.sender, msg.verified, join_msg).await {
+                break;
+            }
+            continue;
+        };
+        let key = lane_key(&state, &group_id).await;
+        let item = JoinResultItem {
+            msg: join_msg,
+            group_id,
+            sender: msg.sender,
+            verified: msg.verified,
+        };
+        if lanes.dispatch(key, item).await == Dispatched::Stopped {
+            break;
+        }
+    }
+}
+
+/// One `Result`, `Refused` or `Pending`, as the join-result listener
+/// received it.
+struct JoinResultItem {
+    msg: JoinResultMessage,
+    group_id: String,
+    sender: AgentId,
+    verified: bool,
+}
+
+fn join_result_apply(state: &Arc<AppState>) -> ApplyFn<JoinResultItem> {
+    let state = Arc::clone(state);
+    Arc::new(move |item: JoinResultItem| {
+        let state = Arc::clone(&state);
+        Box::pin(async move {
+            apply_join_result_shielded(&state, item.sender, item.verified, item.msg, item.group_id)
+                .await
+        })
+    })
+}
+
 /// The spellings of `group_id`, resolved as the membership lock resolves
 /// them (`group_membership_lock`): the map key, then a stable id or MLS id
 /// match.
@@ -301,6 +387,8 @@ impl LaneKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LaneLimits {
+    /// The listener, for logs.
+    name: &'static str,
     queue_cap: usize,
     max_lanes: usize,
     idle_exit: Duration,
@@ -308,6 +396,14 @@ struct LaneLimits {
 
 impl LaneLimits {
     const DIRECT_METADATA: Self = Self {
+        name: "direct metadata",
+        queue_cap: LANE_QUEUE_CAP,
+        max_lanes: MAX_LANES,
+        idle_exit: LANE_IDLE_EXIT,
+    };
+
+    const JOIN_RESULT: Self = Self {
+        name: "join result",
         queue_cap: LANE_QUEUE_CAP,
         max_lanes: MAX_LANES,
         idle_exit: LANE_IDLE_EXIT,
@@ -552,6 +648,7 @@ impl<T: Send + 'static> GroupLanes<T> {
                 counters: LaneCounters::default(),
             }),
             limits: LaneLimits {
+                name: limits.name,
                 queue_cap: limits.queue_cap.max(1),
                 max_lanes: limits.max_lanes.max(1),
                 idle_exit: limits.idle_exit,
@@ -583,8 +680,9 @@ impl<T: Send + 'static> GroupLanes<T> {
                         .queue_full_waits
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
+                        listener = self.limits.name,
                         queue_cap = self.limits.queue_cap,
-                        "direct metadata lane is full; the listener waits for space"
+                        "a group lane is full; the listener waits for space"
                     );
                     item
                 }
@@ -608,8 +706,9 @@ impl<T: Send + 'static> GroupLanes<T> {
             }
         }
         tracing::warn!(
-            "direct metadata lanes closed twice outside shutdown; the listener stops and this \
-             event is not applied"
+            listener = self.limits.name,
+            "group lanes closed twice outside shutdown; the listener stops and this event is \
+             not applied"
         );
         Dispatched::Stopped
     }
@@ -647,8 +746,9 @@ impl<T: Send + 'static> GroupLanes<T> {
                             .lane_slot_waits
                             .fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(
+                            listener = self.limits.name,
                             max_lanes = self.limits.max_lanes,
-                            "every direct metadata lane is busy; the listener waits for one"
+                            "every group lane is busy; the listener waits for one"
                         );
                     }
                     tokio::select! {
@@ -786,7 +886,7 @@ async fn run_lane<T: Send + 'static>(
                 .failed_applies
                 .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                "a direct metadata apply did not complete; its lane goes on with the next event"
+                "a group lane apply did not complete; its lane goes on with the next event"
             );
         }
     }
@@ -808,6 +908,7 @@ mod tests {
     const QUIET: Duration = Duration::from_millis(300);
 
     const ROOMY: LaneLimits = LaneLimits {
+        name: "test",
         queue_cap: 8,
         max_lanes: 8,
         idle_exit: Duration::from_secs(60),
@@ -1270,6 +1371,7 @@ mod tests {
             queue_cap: 2,
             max_lanes: 3,
             idle_exit: Duration::from_millis(50),
+            ..ROOMY
         };
         let mut r = rig(limits);
         for n in 0..EVENTS {

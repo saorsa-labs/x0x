@@ -137,6 +137,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Join results: a slow apply for one group no longer holds the joiner's
+  join-result listener (#2207, refs #2202).** The listener applied each
+  `Result`, `Refused` and `Pending` inline, and a `Result` apply can wait in
+  its Welcome fetch for up to 115 s, so the join-result frames of every
+  other group waited behind it. These frames now go to per-group lanes, the
+  same bounded lanes as the direct metadata listener (#1238): the frames of
+  one group still apply one at a time, in arrival order, through the same
+  shielded apply; different groups apply at the same time. At most 16 lanes
+  are live and 32 frames wait in one lane; at a bound the listener waits and
+  drops nothing. Fetch requests and base-roster frames are handled as
+  before. No wire change.
+
 - **TreeKEM Welcome transfer: a slow chunk ack no longer holds the
   joiner's Welcome listener (#2202, refs #2189).** The joiner sent each
   `ChunkAck` inside the single Welcome listener loop and waited for its

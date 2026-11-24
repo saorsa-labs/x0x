@@ -80,15 +80,14 @@ use routes::{
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
     delete_machine, direct_cancel, direct_connections, direct_message_send_config, direct_receipt,
     direct_send, discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
-    discovered_machine, discovered_machines, dispatch_join_result_message,
-    dispatch_welcome_blob_message, dm_diagnostics, enroll_device, evaluate_trust, exec_cancel,
-    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
-    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
-    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
-    get_constitution, get_constitution_json, get_group_card, get_group_join_status,
-    get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
-    get_mls_group, get_named_group, get_named_group_members, get_onboard, get_profile,
-    get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
+    discovered_machine, discovered_machines, dispatch_welcome_blob_message, dm_diagnostics,
+    enroll_device, evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions,
+    file_accept_handler, file_reject_handler, file_send_handler, file_transfer_status_handler,
+    file_transfers_handler, find_agent, forward_add, forward_list, forward_remove,
+    get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json, get_group_card,
+    get_group_join_status, get_group_public_messages, get_group_state, get_group_state_commits,
+    get_kv_value, get_mls_group, get_named_group, get_named_group_members, get_onboard,
+    get_profile, get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
     handle_control_blob_message, handle_file_message, health, history_diagnostics, history_list,
     history_message, history_policy, history_purge, history_retain, history_scopes, history_search,
     history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
@@ -109,24 +108,24 @@ use routes::{
     relay_diagnostics, remove_mls_member, remove_named_group_member,
     replay_pending_causal_approvals, requester_offer_step, restore_treekem_groups, revoke_contact,
     run_direct_metadata_listener, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
-    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
-    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
-    send_group_public_message, set_group_display_name, shutdown_handler,
-    spawn_directory_resubscribe, spawn_global_discovery_listener,
+    run_join_result_listener, run_startup_update_check, save_named_groups_checked,
+    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
+    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
+    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
+    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
     update_contact, update_group_policy, update_member_role, update_named_group, update_profile,
     update_task, upgrade_diagnostics, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage,
-    ControlBlobState, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
-    PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
-    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
+    ControlBlobState, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
+    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
+    StartupUpdateCheckRuntime, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+    KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -2316,40 +2315,10 @@ async fn serve_with_options_inner(
         &state,
     ))));
 
-    {
-        let join_result_state = Arc::clone(&state);
-        bg_tasks.push(spawn_built(move || async move {
-            let mut rx = join_result_state.agent.subscribe_direct();
-            loop {
-                let Some(msg) = rx.recv().await else { break };
-                let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
-                    continue;
-                };
-                let Ok(join_msg) =
-                    crate::wire_compat::reject_unknown("JoinResultMessage", join_msg)
-                else {
-                    continue;
-                };
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "direct_classified_join_result",
-                    sender = %hex::encode(msg.sender.as_bytes()),
-                    len = msg.payload.len(),
-                    verified = msg.verified,
-                );
-                if !dispatch_join_result_message(
-                    &join_result_state,
-                    &msg.sender,
-                    msg.verified,
-                    join_msg,
-                )
-                .await
-                {
-                    break;
-                }
-            }
-        }));
-    }
+    bg_tasks.push(tokio::spawn(run_join_result_listener(
+        Arc::clone(&state),
+        state.agent.subscribe_direct(),
+    )));
 
     {
         let welcome_state = Arc::clone(&state);
