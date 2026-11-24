@@ -351,6 +351,14 @@ enum Commands {
         /// staggered update path, as if a peer had announced it.
         #[arg(long, conflicts_with_all = ["check", "apply", "force", "clear_hold"])]
         announce: bool,
+        /// With --announce, publish this downloaded release-manifest.json
+        /// instead of fetching the latest release from GitHub. Needs
+        /// --signature-file; the daemon verifies both as for a fetch.
+        #[arg(long, requires_all = ["announce", "signature_file"])]
+        manifest_file: Option<PathBuf>,
+        /// The release-manifest.json.sig that goes with --manifest-file.
+        #[arg(long, requires_all = ["announce", "manifest_file"])]
+        signature_file: Option<PathBuf>,
         /// Release version for --clear-hold.
         #[arg(requires = "clear_hold")]
         version: Option<String>,
@@ -3590,8 +3598,28 @@ async fn run(
                 .await
             }
         },
-        Commands::Upgrade { announce: true, .. } => {
-            let response = client.post_empty("/upgrade/announce").await?;
+        Commands::Upgrade {
+            announce: true,
+            manifest_file,
+            signature_file,
+            ..
+        } => {
+            let response = match (manifest_file, signature_file) {
+                (Some(manifest), Some(signature)) => {
+                    use base64::Engine as _;
+                    let read = |path: &Path| {
+                        std::fs::read(path)
+                            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                            .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))
+                    };
+                    let body = serde_json::json!({
+                        "manifest_b64": read(manifest.as_path())?,
+                        "signature_b64": read(signature.as_path())?,
+                    });
+                    client.post("/upgrade/announce", &body).await?
+                }
+                _ => client.post_empty("/upgrade/announce").await?,
+            };
             x0x::cli::print_value(client.format(), &response);
             Ok(())
         }

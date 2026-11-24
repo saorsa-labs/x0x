@@ -330,8 +330,13 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # The signed manifest comes from this authenticated download, so
+          # the announcing x0xd makes no unauthenticated GitHub API request
+          # from the runner's shared IP (#1169: 403 rate limit). x0xd
+          # verifies its ML-DSA-65 signature before it publishes it.
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir announce \
-            --pattern x0x-linux-x64-gnu.tar.gz --pattern x0x-linux-x64-gnu.tar.gz.sha256
+            --pattern x0x-linux-x64-gnu.tar.gz --pattern x0x-linux-x64-gnu.tar.gz.sha256 \
+            --pattern release-manifest.json --pattern release-manifest.json.sig
           cd announce
           sha256sum -c x0x-linux-x64-gnu.tar.gz.sha256
           tar xzf x0x-linux-x64-gnu.tar.gz
@@ -345,6 +350,8 @@ jobs:
           python3 .github/scripts/announce_promoted_release.py \
             --x0xd announce/x0x-linux-x64-gnu/x0xd \
             --version "${RELEASE_TAG#v}" \
+            --manifest announce/release-manifest.json \
+            --signature announce/release-manifest.json.sig \
             --work-dir "$RUNNER_TEMP/x0x-announce"
 
   # ============================================================

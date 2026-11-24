@@ -3418,11 +3418,25 @@
     {
       "category": "upgrade",
       "cli_name": "upgrade --announce",
-      "description": "Authenticated: fetch the latest release manifest, verify its ML-DSA-65 signature and timestamp, and publish it on x0x/release (#1169); needs no signing key; this node installs only through its normal staggered gossip path",
+      "description": "Authenticated: fetch the latest release manifest (or take the signed manifest bytes from the optional body), verify its ML-DSA-65 signature and timestamp, and publish it on x0x/release (#1169); needs no signing key; this node installs only through its normal staggered gossip path",
       "method": "POST",
       "path": "/upgrade/announce",
       "request": {
-        "kind": "none"
+        "fields": [
+          {
+            "cli": "--manifest-file",
+            "in": "body",
+            "name": "manifest_b64",
+            "required": false
+          },
+          {
+            "cli": "--signature-file",
+            "in": "body",
+            "name": "signature_b64",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
