@@ -35,6 +35,13 @@
       "wire": {
         "bincode": "04000000"
       }
+    },
+    {
+      "input": "IssuanceMode",
+      "variant": "IssuanceMode",
+      "wire": {
+        "bincode": "05000000"
+      }
     }
   ],
   "type": "SyncKind"

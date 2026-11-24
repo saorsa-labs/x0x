@@ -589,6 +589,7 @@ mod tests {
             mode: crate::profile::CertMode::Acp,
             label: None,
             cert_b64: None,
+            synced_mode: false,
         };
         // Higher issued_at than the real record: only the owner filter can
         // keep it out of the roster.

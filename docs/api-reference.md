@@ -1234,10 +1234,15 @@ agents). `mode` and `journal_label` come from the owner's last
 `POST /owner/agents/issue` line for the agent in journal file order, not
 from the certificate the row shows: a renewed or live-announced certificate
 keeps a rider `"rider"` with its label; a later issuance in the other mode
-changes it (#2158). Owner sync does not carry the mode (#2182): a rider
-re-issued as ACP on another owner device stays `"rider"` on this one, so
-placement minting pins it to this machine and `POST /report` refuses it
-as a target (fail closed).
+changes it (#2158). Owner sync carries the mode and label (Tier-1 kind
+0x06, SyncV1 protocol 4, #2182): an issuance on another owner device adds
+a journal line here that states its mode and label and keeps the
+certificate the row shows, so a rider re-issued as ACP elsewhere shows
+`"acp"` here. When two owner devices state different modes before they
+sync, both keep the record that wins under the Tier-1 rule (highest
+version, then latest signing time, then greatest writer machine); a later
+issuance wins. A peer on protocol 3 or 2 does not receive the mode, and
+there a rider re-issued as ACP on another device stays `"rider"`.
 
 ## Home (ADR-0038)
 
@@ -1523,7 +1528,9 @@ each naming the other's machine id (plus itself), or no session is ever
 established. After that, enrollments and removals sync (Tier-1 kind 0x05,
 SyncV1 protocol 3, #1107): a machine enrolled or removed on one device is
 enrolled or removed on every owner device that syncs with it. A peer on
-protocol 2 does not receive them.
+protocol 2 does not receive them. The hosting mode and label of an owner
+issuance sync as Tier-1 kind 0x06 (SyncV1 protocol 4, #2182); a peer on
+protocol 3 or 2 does not receive them.
 
 **Trust prerequisite:** SyncV1 rides ADR-0022 byte streams through the same
 stream gate as every other protocol — each side's peer-trust decision for the

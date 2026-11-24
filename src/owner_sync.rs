@@ -1,10 +1,11 @@
 //! ADR-0041 Tier-1 cross-machine owner-state sync.
 //!
-//! Tier 1 replicates exactly five kinds of small owner-signed state between
+//! Tier 1 replicates exactly six kinds of small owner-signed state between
 //! the owner's machines over ADR-0022 byte streams ([`crate::streams`]):
 //! the owner profile, per-machine agent/machine names, the Home roster +
-//! policy pointer, the sub-agent issuance journal, and the owner device set
-//! (kind 0x05, #1107; protocol 3 only). Tier 2 (history
+//! policy pointer, the sub-agent issuance journal, the owner device set
+//! (kind 0x05, #1107; protocol 3 and later) and the hosting mode and label
+//! of an owner issuance (kind 0x06, #2182; protocol 4 only). Tier 2 (history
 //! backfill) and Tier 3 (never-replicates state) are out of scope here.
 //!
 //! # Trust model — same-owner, enrolled machines, key possession
@@ -69,9 +70,9 @@
 //!
 //! # Tier-3 boundary (gapcheck blocker 32 scope note)
 //!
-//! The sync surface serializes ONLY the five Tier-1 kinds: [`crate::owner_sync::SyncKind`] and
+//! The sync surface serializes ONLY the six Tier-1 kinds: [`crate::owner_sync::SyncKind`] and
 //! [`crate::owner_sync::SyncValue`] are closed enums with no catch-all. A record whose kind tag
-//! is not one of the five fails to decode, and a record whose kind does not
+//! is not one of the six fails to decode, and a record whose kind does not
 //! match its value variant is rejected whole.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -100,9 +101,10 @@ const PROOF_MSG_PREFIX: &[u8] = b"x0x-adr0041-proof-v1";
 /// Wire protocol version for the SyncV1 handshake. Bumped to 2 in review
 /// R2 (Hello carries a nonce; `Proof` frame added; vectors/records paged).
 /// Bumped to 3 for [`SyncKind::DeviceEnrollment`] (#1107; A02 paragraph of
-/// 13 Nov 2026). A session runs at the lower of the two `Hello` versions;
-/// see `negotiated_protocol`.
-pub const SYNC_PROTOCOL_VERSION: u32 = 3;
+/// 13 Nov 2026). Bumped to 4 for [`SyncKind::IssuanceMode`] (#2182; A02
+/// paragraph of 24 Nov 2026). A session runs at the lower of the two
+/// `Hello` versions; see `negotiated_protocol`.
+pub const SYNC_PROTOCOL_VERSION: u32 = 4;
 
 /// The oldest SyncV1 protocol version this node still completes a session
 /// with. A protocol-2 session carries only the four kinds protocol 2 knows.
@@ -111,6 +113,11 @@ pub const MIN_SYNC_PROTOCOL_VERSION: u32 = 2;
 /// The first protocol version that carries [`SyncKind::DeviceEnrollment`].
 /// A session below it never sends or accepts a record of that kind.
 pub const DEVICE_ENROLLMENT_PROTOCOL_VERSION: u32 = 3;
+
+/// The first protocol version that carries [`SyncKind::IssuanceMode`]
+/// (#2182). A session below it never sends or accepts a record of that
+/// kind.
+pub const ISSUANCE_MODE_PROTOCOL_VERSION: u32 = 4;
 
 /// The protocol version a session runs at, given the version this side sent
 /// in its `Hello` and the version the peer sent: the lower of the two. A
@@ -187,6 +194,11 @@ const RECORDS_FILE: &str = "records.json";
 /// binary built before kind 0x05 can still decode that file and start after
 /// a rollback. Both files are one register in memory.
 const ENROLLMENT_RECORDS_FILE: &str = "enrollment_records.json";
+/// File holding the winning [`SyncKind::IssuanceMode`] records, inside
+/// `<data_dir>/sync/` (#2182). They are kept out of [`RECORDS_FILE`] and
+/// [`ENROLLMENT_RECORDS_FILE`] so a binary built before kind 0x06 can still
+/// decode those files and start after a rollback.
+const MODE_RECORDS_FILE: &str = "issuance_mode_records.json";
 /// File holding the `IssuanceJournal` records of a commit in progress,
 /// inside `<data_dir>/sync/` (#1542, see `recover_journal_commit`).
 const JOURNAL_INTENT_FILE: &str = "journal-intent.json";
@@ -223,17 +235,23 @@ pub enum SyncKind {
     /// ([`DEVICE_ENROLLMENT_PROTOCOL_VERSION`]). Declared last so the
     /// encoding of the four older kinds does not change.
     DeviceEnrollment = 0x05,
+    /// Hosting mode and label of an owner issuance — key = agent id hex
+    /// (#2182). Carried only in a protocol-4 session
+    /// ([`ISSUANCE_MODE_PROTOCOL_VERSION`]). Declared last so the encoding
+    /// of the older kinds does not change.
+    IssuanceMode = 0x06,
 }
 
 impl SyncKind {
-    /// All Tier-1 kinds. Length 5 is a load-bearing constant: Tier 3 states
+    /// All Tier-1 kinds. Length 6 is a load-bearing constant: Tier 3 states
     /// that no other state can be emitted.
-    pub const ALL: [SyncKind; 5] = [
+    pub const ALL: [SyncKind; 6] = [
         SyncKind::OwnerProfile,
         SyncKind::MachineNames,
         SyncKind::HomePointer,
         SyncKind::IssuanceJournal,
         SyncKind::DeviceEnrollment,
+        SyncKind::IssuanceMode,
     ];
 
     /// Whether a session at protocol `version` carries this kind.
@@ -245,6 +263,21 @@ impl SyncKind {
             | SyncKind::HomePointer
             | SyncKind::IssuanceJournal => true,
             SyncKind::DeviceEnrollment => version >= DEVICE_ENROLLMENT_PROTOCOL_VERSION,
+            SyncKind::IssuanceMode => version >= ISSUANCE_MODE_PROTOCOL_VERSION,
+        }
+    }
+
+    /// The register file that holds records of this kind. Each kind added
+    /// after protocol 2 has its own file, so a rolled-back binary never
+    /// reads a kind it cannot decode (#1107, #2182).
+    const fn records_file(self) -> &'static str {
+        match self {
+            SyncKind::OwnerProfile
+            | SyncKind::MachineNames
+            | SyncKind::HomePointer
+            | SyncKind::IssuanceJournal => RECORDS_FILE,
+            SyncKind::DeviceEnrollment => ENROLLMENT_RECORDS_FILE,
+            SyncKind::IssuanceMode => MODE_RECORDS_FILE,
         }
     }
 
@@ -257,6 +290,7 @@ impl SyncKind {
             0x03 => Some(Self::HomePointer),
             0x04 => Some(Self::IssuanceJournal),
             0x05 => Some(Self::DeviceEnrollment),
+            0x06 => Some(Self::IssuanceMode),
             _ => None,
         }
     }
@@ -316,6 +350,18 @@ pub enum SyncValue {
     /// #1107). Declared last so the encoding of the older values does not
     /// change. The record version is [`device_enrollment_version`].
     DeviceEnrollment { state: DeviceEnrollmentState },
+    /// The hosting mode and label that an owner issuance stated for one
+    /// agent (key = agent id hex; #2182), with the certificate fields of
+    /// that issuance. Declared last so the encoding of the older values
+    /// does not change. No certificate bytes travel (Tier-3 boundary).
+    IssuanceMode {
+        agent_id: String,
+        cert_digest: String,
+        issued_at: u64,
+        not_after: Option<u64>,
+        mode: crate::profile::CertMode,
+        label: Option<String>,
+    },
 }
 
 /// The state a [`SyncValue::DeviceEnrollment`] record carries (#1107).
@@ -410,6 +456,7 @@ impl SyncValue {
             SyncValue::HomePointer { .. } => SyncKind::HomePointer,
             SyncValue::IssuanceJournal { .. } => SyncKind::IssuanceJournal,
             SyncValue::DeviceEnrollment { .. } => SyncKind::DeviceEnrollment,
+            SyncValue::IssuanceMode { .. } => SyncKind::IssuanceMode,
         }
     }
 }
@@ -553,6 +600,13 @@ impl VersionedRecord {
         }
         if let SyncValue::DeviceEnrollment { state } = &self.value {
             check_device_enrollment_shape(&self.key, state, &self.clock)?;
+        }
+        if let SyncValue::IssuanceMode { agent_id, .. } = &self.value {
+            if *agent_id != self.key {
+                return Err(SyncError::MalformedFrame(
+                    "issuance mode names another agent than its key".into(),
+                ));
+            }
         }
         if self.key.len() > MAX_KEY_BYTES {
             return Err(SyncError::MalformedFrame(format!(
@@ -1411,6 +1465,7 @@ impl OwnerSyncStore {
         for file in [
             RECORDS_FILE,
             ENROLLMENT_RECORDS_FILE,
+            MODE_RECORDS_FILE,
             DEVICES_FILE,
             APPLY_PENDING_FILE,
             TOMBSTONES_FILE,
@@ -1427,6 +1482,8 @@ impl OwnerSyncStore {
         let persisted_records: PersistedRecords = Self::load_json(&dir.join(RECORDS_FILE)).await?;
         let persisted_enrollment_records: PersistedRecords =
             Self::load_json(&dir.join(ENROLLMENT_RECORDS_FILE)).await?;
+        let persisted_mode_records: PersistedRecords =
+            Self::load_json(&dir.join(MODE_RECORDS_FILE)).await?;
         let persisted_devices: PersistedDevices = Self::load_json(&dir.join(DEVICES_FILE)).await?;
         let pending_apply: PersistedPendingApplies =
             Self::load_json(&dir.join(APPLY_PENDING_FILE)).await?;
@@ -1440,13 +1497,15 @@ impl OwnerSyncStore {
                 persisted_tombstones.version
             )));
         }
-        // #1107: one register from the two files. A key in both files
-        // keeps the record that wins under the merge rule (`classify`).
+        // #1107, #2182: one register from the register files. A key in
+        // more than one file keeps the record that wins under the merge
+        // rule (`classify`).
         let mut records = RecordMap::new();
         for record in persisted_records
             .records
             .into_iter()
             .chain(persisted_enrollment_records.records)
+            .chain(persisted_mode_records.records)
         {
             let key = (record.kind, record.key.clone());
             let wins = records
@@ -1622,61 +1681,76 @@ impl OwnerSyncStore {
         Ok(())
     }
 
-    /// #1107: write both register files (`enrollment` only when it
-    /// changes). Both temp files are staged before any rename, and
-    /// `RECORDS_FILE` is renamed first (see `replace_records`). The error
-    /// holds a count of the renames: 0 = no file is renamed; 1 =
-    /// `RECORDS_FILE` is renamed, but the enrollment rename failed; 2 =
-    /// every requested rename is done (one file when `enrollment` is
-    /// `None`), and a later fsync failed. The `fail_*` flags are test
-    /// injections.
+    /// #1107, #2182: write the register files. `RECORDS_FILE` is always
+    /// written; each later-kind file in `extras` is written only when it
+    /// changes. Every temp file is staged before any rename, and
+    /// `RECORDS_FILE` is renamed first, then `extras` in order (see
+    /// `replace_records`). The error holds the files that were renamed:
+    /// none = no file is renamed and the disk is as before; otherwise the
+    /// disk holds the new bytes of exactly those files. The `fail_*` flags
+    /// are test injections; the stage and rename ones apply to
+    /// `ENROLLMENT_RECORDS_FILE` only.
     async fn write_register_files(
         records: (&Path, &[u8]),
-        enrollment: Option<(&Path, &[u8])>,
+        extras: &[(&'static str, PathBuf, Vec<u8>)],
         fail_stage_enrollment: bool,
         fail_second_rename: bool,
         fail_after_rename: bool,
-    ) -> Result<(), (u8, std::io::Error)> {
+    ) -> Result<(), (Vec<&'static str>, std::io::Error)> {
         let injected = |what: &str| std::io::Error::other(format!("injected {what} failure"));
         let tmp = Self::stage_file(records.0, records.1)
             .await
-            .map_err(|e| (0, e))?;
-        let tmp_enrollment = match enrollment {
-            Some(_) if fail_stage_enrollment => Err(injected("enrollment stage")),
-            Some((path, bytes)) => Self::stage_file(path, bytes).await.map(|t| Some((t, path))),
-            None => Ok(None),
-        };
-        let tmp_enrollment = match tmp_enrollment {
-            Ok(staged) => staged,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err((0, e));
+            .map_err(|e| (Vec::new(), e))?;
+        let mut staged: Vec<(&'static str, PathBuf, &Path)> = Vec::new();
+        for (file, path, bytes) in extras {
+            let result = if *file == ENROLLMENT_RECORDS_FILE && fail_stage_enrollment {
+                Err(injected("enrollment stage"))
+            } else {
+                Self::stage_file(path, bytes).await
+            };
+            match result {
+                Ok(tmp_extra) => staged.push((file, tmp_extra, path.as_path())),
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    for (_, tmp_extra, _) in &staged {
+                        let _ = tokio::fs::remove_file(tmp_extra).await;
+                    }
+                    return Err((Vec::new(), e));
+                }
             }
-        };
+        }
         if let Err(e) = crate::profile::rename_file(&tmp, records.0).await {
             let _ = tokio::fs::remove_file(&tmp).await;
-            if let Some((staged, _)) = &tmp_enrollment {
-                let _ = tokio::fs::remove_file(staged).await;
+            for (_, tmp_extra, _) in &staged {
+                let _ = tokio::fs::remove_file(tmp_extra).await;
             }
-            return Err((0, e));
+            return Err((Vec::new(), e));
         }
-        if let Some((staged, path)) = &tmp_enrollment {
-            let renamed = if fail_second_rename {
+        let mut renamed = vec![RECORDS_FILE];
+        for (index, (file, tmp_extra, path)) in staged.iter().enumerate() {
+            let result = if *file == ENROLLMENT_RECORDS_FILE && fail_second_rename {
                 Err(injected("second rename"))
             } else {
-                crate::profile::rename_file(staged, path).await
+                crate::profile::rename_file(tmp_extra, path).await
             };
-            if let Err(e) = renamed {
-                let _ = tokio::fs::remove_file(staged).await;
-                return Err((1, e));
+            if let Err(e) = result {
+                for (_, left, _) in &staged[index..] {
+                    let _ = tokio::fs::remove_file(left).await;
+                }
+                return Err((renamed, e));
             }
+            renamed.push(file);
         }
         if fail_after_rename {
-            return Err((2, injected("post-rename fsync")));
+            return Err((renamed, injected("post-rename fsync")));
         }
-        Self::sync_renamed(records.0).await.map_err(|e| (2, e))?;
-        if let Some((_, path)) = tmp_enrollment {
-            Self::sync_renamed(path).await.map_err(|e| (2, e))?;
+        Self::sync_renamed(records.0)
+            .await
+            .map_err(|e| (renamed.clone(), e))?;
+        for (_, _, path) in &staged {
+            Self::sync_renamed(path)
+                .await
+                .map_err(|e| (renamed.clone(), e))?;
         }
         Ok(())
     }
@@ -1797,17 +1871,18 @@ impl OwnerSyncStore {
 
     /// Write `next` as the register, then make it the register in memory,
     /// in one task (`run_to_completion`) that owns `records` and `held`.
-    /// #1107: kind 0x05 records go to `ENROLLMENT_RECORDS_FILE`, so no
-    /// file an older binary reads holds one. `RECORDS_FILE` is renamed
-    /// first. A stop between the two renames stores the older kinds only:
-    /// every kind 0x05 record on disk is one whose commit renamed both
-    /// files (it returned the record as accepted, or `Poisoned` when a
-    /// later fsync failed). A later session delivers the missing records
-    /// again as new.
+    /// #1107, #2182: each kind added after protocol 2 goes to its own file
+    /// ([`SyncKind::records_file`]), so no file an older binary reads holds
+    /// one. `RECORDS_FILE` is renamed first, then each changed later-kind
+    /// file. A stop between the renames stores only the files renamed
+    /// before it: every later-kind record on disk is one whose commit
+    /// renamed its file (it returned the record as accepted, or `Poisoned`
+    /// when a later step failed). A later session delivers the missing
+    /// records again as new.
     ///
     /// # Errors
     ///
-    /// [`SyncError::Io`] before the first rename: memory and both files
+    /// [`SyncError::Io`] before the first rename: memory and every file
     /// stay as they were. [`SyncError::Poisoned`] after a rename: memory
     /// takes what the disk holds, and the store is poisoned.
     async fn replace_records<H: Send + 'static>(
@@ -1816,9 +1891,9 @@ impl OwnerSyncStore {
         next: RecordMap,
         held: H,
     ) -> Result<H, SyncError> {
-        let part = |map: &RecordMap, enrollment: bool| -> Vec<VersionedRecord> {
+        let part = |map: &RecordMap, file: &str| -> Vec<VersionedRecord> {
             map.values()
-                .filter(|r| (r.kind == SyncKind::DeviceEnrollment) == enrollment)
+                .filter(|r| r.kind.records_file() == file)
                 .cloned()
                 .collect()
         };
@@ -1826,13 +1901,18 @@ impl OwnerSyncStore {
             serde_json::to_vec(&PersistedRecords { records })
                 .map_err(|e| SyncError::Io(format!("encode records: {e}")))
         };
-        let bytes = encode(part(&next, false))?;
-        let enrollments = part(&next, true);
-        let enrollment_bytes = if enrollments == part(&records, true) {
-            None
-        } else {
-            Some(encode(enrollments)?)
-        };
+        let bytes = encode(part(&next, RECORDS_FILE))?;
+        let mut extras: Vec<(&'static str, PathBuf, Vec<u8>)> = Vec::new();
+        for file in [ENROLLMENT_RECORDS_FILE, MODE_RECORDS_FILE] {
+            let wanted = part(&next, file);
+            if wanted != part(&records, file) {
+                extras.push((file, self.dir.join(file), encode(wanted)?));
+            }
+        }
+        #[cfg(test)]
+        let enrollment_changes = extras
+            .iter()
+            .any(|(file, _, _)| *file == ENROLLMENT_RECORDS_FILE);
         #[cfg(test)]
         if self
             .fail_next_register_write
@@ -1844,7 +1924,7 @@ impl OwnerSyncStore {
         // enrollment change.
         #[cfg(test)]
         let consume = |flag: &std::sync::atomic::AtomicBool| {
-            enrollment_bytes.is_some() && flag.swap(false, std::sync::atomic::Ordering::Relaxed)
+            enrollment_changes && flag.swap(false, std::sync::atomic::Ordering::Relaxed)
         };
         #[cfg(test)]
         let (fail_stage, fail_second_rename, pause) = (
@@ -1858,10 +1938,7 @@ impl OwnerSyncStore {
         #[cfg(not(test))]
         let (fail_stage, fail_second_rename) = (false, false);
         let fail_after_rename = self.fail_after_rename_for_testing();
-        let (records_path, enrollment_path) = (
-            self.dir.join(RECORDS_FILE),
-            self.dir.join(ENROLLMENT_RECORDS_FILE),
-        );
+        let records_path = self.dir.join(RECORDS_FILE);
         let poisoned = Arc::clone(&self.poisoned);
         let generation = Arc::clone(&self.generation_tx);
         self.run_to_completion(async move {
@@ -1870,12 +1947,9 @@ impl OwnerSyncStore {
                 let _ = reached.send(());
                 let _ = release.await;
             }
-            let enrollment = enrollment_bytes
-                .as_deref()
-                .map(|bytes| (enrollment_path.as_path(), bytes));
             let failed = match Self::write_register_files(
                 (&records_path, &bytes),
-                enrollment,
+                &extras,
                 fail_stage,
                 fail_second_rename,
                 fail_after_rename,
@@ -1883,20 +1957,25 @@ impl OwnerSyncStore {
             .await
             {
                 Ok(()) => None,
-                Err((0, io)) => return Err(SyncError::Io(format!("persist register: {io}"))),
+                Err((renamed, io)) if renamed.is_empty() => {
+                    return Err(SyncError::Io(format!("persist register: {io}")));
+                }
                 Err(failed) => Some(failed),
             };
             // Memory takes what the disk holds, even when it is not
             // durable. Never roll memory back below an advanced disk.
-            if matches!(failed, Some((1, _))) {
-                // Only `RECORDS_FILE` is new: the old kind 0x05 part stays.
-                records.retain(|(kind, _), _| *kind == SyncKind::DeviceEnrollment);
-                records.extend(
-                    next.into_iter()
-                        .filter(|((kind, _), _)| *kind != SyncKind::DeviceEnrollment),
-                );
-            } else {
-                *records = next;
+            match &failed {
+                Some((renamed, _)) => {
+                    let written = |kind: &SyncKind| {
+                        let file = kind.records_file();
+                        renamed.contains(&file)
+                            || !extras.iter().any(|(changed, _, _)| *changed == file)
+                    };
+                    // A file that was not renamed keeps its old part.
+                    records.retain(|(kind, _), _| !written(kind));
+                    records.extend(next.into_iter().filter(|((kind, _), _)| written(kind)));
+                }
+                None => *records = next,
             }
             Self::kick_generation(&generation);
             if let Some((_, io)) = failed {
@@ -2198,6 +2277,42 @@ impl OwnerSyncStore {
                     )
                 })
             },
+        )
+        .await?;
+        Ok(held)
+    }
+
+    /// #2182: append the mode line for the register's `IssuanceMode` value
+    /// `value` to the journal file at `path` when this device needs it
+    /// ([`synced_mode_line`]). `held` holds `journal_apply`, as for
+    /// [`Self::apply_journal_value`], and comes back after the append.
+    ///
+    /// # Errors
+    ///
+    /// The IO error of a failed append. The caller must not then persist
+    /// `value` to the register.
+    async fn apply_mode_value<H: Send + 'static>(
+        &self,
+        path: &Path,
+        owner_hex: &str,
+        value: &SyncValue,
+        held: H,
+    ) -> std::io::Result<H> {
+        #[cfg(test)]
+        if self
+            .fail_journal_append
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(std::io::Error::other("injected append failure"));
+        }
+        let custody = self
+            .write_custody()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let (_, (_, held)) = crate::profile::IssuedCertRecord::append_when(
+            path,
+            (custody, held),
+            |existing| async move { synced_mode_line(&existing, owner_hex, value) },
         )
         .await?;
         Ok(held)
@@ -2794,10 +2909,12 @@ impl OwnerSyncStore {
         }
         // #1542: a batch that can change the IssuanceJournal register holds
         // `journal_apply` until its accepted values are in the journal file.
-        let journal = self
-            .journal_file
-            .get()
-            .filter(|_| batch.iter().any(|r| r.kind == SyncKind::IssuanceJournal));
+        // #2182: so does a batch that can change an IssuanceMode record.
+        let journal = self.journal_file.get().filter(|_| {
+            batch
+                .iter()
+                .any(|r| matches!(r.kind, SyncKind::IssuanceJournal | SyncKind::IssuanceMode))
+        });
         let held = match journal {
             Some(_) => {
                 let guard = Arc::clone(&self.journal_apply).lock_owned().await;
@@ -2921,9 +3038,12 @@ impl OwnerSyncStore {
         // #1542: the journal file first, then the register (see
         // `journal_apply`). A failed append commits nothing; a later
         // session delivers the records again.
-        let updates = match journal {
-            Some(_) => Self::journal_updates(&records, &next, &touched),
-            None => Vec::new(),
+        let (updates, mode_updates) = match journal {
+            Some(_) => (
+                Self::journal_updates(&records, &next, &touched, SyncKind::IssuanceJournal),
+                Self::journal_updates(&records, &next, &touched, SyncKind::IssuanceMode),
+            ),
+            None => (Vec::new(), Vec::new()),
         };
         let mut hold = (records, canonical_gate, revocations, held);
         if let Some(path) = journal.filter(|_| !updates.is_empty()) {
@@ -2933,13 +3053,13 @@ impl OwnerSyncStore {
             // (see `recover_journal_commit`). The intent holds every
             // accepted record of the four older kinds, not only the
             // journal ones, so the recovery commits all of that part or
-            // none of it. #1107: it never holds a kind 0x05 record (a
-            // binary built before kind 0x05 cannot decode one); after a
-            // stop, a later session delivers those again as new.
+            // none of it. #1107, #2182: it never holds a kind 0x05 or 0x06
+            // record (a binary built before them cannot decode one); after
+            // a stop, a later session delivers those again as new.
             let intent: Vec<VersionedRecord> = outcome
                 .accepted
                 .iter()
-                .filter(|r| r.kind != SyncKind::DeviceEnrollment)
+                .filter(|r| r.kind.records_file() == RECORDS_FILE)
                 .cloned()
                 .collect();
             hold = self.persist_journal_intent(hold, intent).await?;
@@ -2957,6 +3077,22 @@ impl OwnerSyncStore {
                 return Err(SyncError::Io("stopped between writes".into()));
             }
         }
+        // #2182: the mode lines after the certificate lines, so each one
+        // repeats the certificate of the agent's last line. They need no
+        // intent: a mode line marks itself (`synced_mode`), and a stop
+        // before the register write only means a later session delivers
+        // the record again, whose line is then already there.
+        if let Some(path) = journal.filter(|_| !mode_updates.is_empty()) {
+            let owner_hex = hex::encode(owner.0);
+            for (record, _) in &mode_updates {
+                hold = self
+                    .apply_mode_value(path, &owner_hex, &record.value, hold)
+                    .await
+                    .map_err(|e| {
+                        SyncError::Io(format!("failed to append synced mode line: {e}"))
+                    })?;
+            }
+        }
         // #1545: the obligation to apply the names before the register
         // holds them (see `pending_apply`).
         let (records, canonical_gate, revocations, held) =
@@ -2971,16 +3107,18 @@ impl OwnerSyncStore {
         Ok((outcome, held))
     }
 
-    /// The `IssuanceJournal` records a committed batch changed: each is the
-    /// key's record now, with the value the register held before the batch.
+    /// The `kind` records (`IssuanceJournal` or `IssuanceMode`) a committed
+    /// batch changed: each is the key's record now, with the value the
+    /// register held before the batch.
     fn journal_updates(
         before: &RecordMap,
         after: &RecordMap,
         touched: &BTreeSet<(SyncKind, String)>,
+        kind: SyncKind,
     ) -> Vec<(VersionedRecord, Option<SyncValue>)> {
         touched
             .iter()
-            .filter(|(kind, _)| *kind == SyncKind::IssuanceJournal)
+            .filter(|(touched_kind, _)| *touched_kind == kind)
             .filter_map(|key| {
                 let now = after.get(key)?;
                 let previous = before.get(key).map(|r| r.value.clone());
@@ -5606,6 +5744,8 @@ pub(crate) fn local_names_of(
         // #1107: device enrollment records are applied to the device set
         // (PR 2 of #1107), never to the local names.
         SyncValue::DeviceEnrollment { .. } => None,
+        // #2182: `commit_batch` writes mode lines to the journal file.
+        SyncValue::IssuanceMode { .. } => None,
     }
 }
 
@@ -5654,6 +5794,24 @@ async fn mint_journal_lines(
     };
     #[cfg(test)]
     store.pause_after_journal_read().await;
+    // #2182: publish each mode or label stated here that the register
+    // does not hold. A line that owner sync wrote for the register's
+    // value states the same, so it publishes nothing.
+    let register: BTreeMap<String, (crate::profile::CertMode, Option<String>)> = store
+        .records_snapshot()
+        .await
+        .into_iter()
+        .filter_map(|record| match record.value {
+            SyncValue::IssuanceMode {
+                agent_id,
+                mode,
+                label,
+                ..
+            } => Some((agent_id, (mode, label))),
+            _ => None,
+        })
+        .collect();
+    let modes = mode_values_to_mint(&lines, &owner_hex, &register);
     for (agent_hex, value) in latest_journal_values(lines, &owner_hex) {
         if let Err(e) = store
             .mint(
@@ -5666,6 +5824,20 @@ async fn mint_journal_lines(
             .await
         {
             tracing::warn!(target: "x0x::owner_sync", kind = ?SyncKind::IssuanceJournal, error = %e, "mint failed");
+        }
+    }
+    for (agent_hex, value) in modes {
+        if let Err(e) = store
+            .mint(
+                SyncKind::IssuanceMode,
+                &agent_hex,
+                &value,
+                owner_kp,
+                machine,
+            )
+            .await
+        {
+            tracing::warn!(target: "x0x::owner_sync", kind = ?SyncKind::IssuanceMode, error = %e, "mint failed");
         }
     }
 }
@@ -5742,14 +5914,111 @@ fn synced_journal_line(
         cert_digest,
         issued_at,
         not_after,
-        // ADR-0039 fields are not part of the Tier-1 sync value: a synced
-        // line records the issuance fact (digest, time and expiry); mode
-        // defaults to Acp (the pre-ADR-0039 line shape) and no certificate
-        // bytes travel Tier 1 (Tier-3 boundary).
+        // A certificate line records the issuance fact (digest, time and
+        // expiry) and states no mode; the mode and label travel in their
+        // own kind (`IssuanceMode`, #2182) and get their own line. No
+        // certificate bytes travel Tier 1 (Tier-3 boundary).
         mode: crate::profile::CertMode::Acp,
         label: None,
         cert_b64: None,
+        synced_mode: false,
     }
+}
+
+/// #2182: the hosting mode and label that this owner's journal states for
+/// each agent: those of the agent's last line, in file order, that states
+/// them ([`crate::profile::IssuedCertRecord::states_mode`]), the same line
+/// the owner roster reads. Agents with no such line are absent.
+fn stated_modes<'a>(
+    lines: &'a [crate::profile::IssuedCertRecord],
+    owner_hex: &str,
+) -> BTreeMap<String, &'a crate::profile::IssuedCertRecord> {
+    let mut stated = BTreeMap::new();
+    for line in lines {
+        if line.user_id == owner_hex && line.states_mode() {
+            stated.insert(line.agent_id.clone(), line);
+        }
+    }
+    stated
+}
+
+/// #2182: the `IssuanceMode` value to publish for each agent whose stated
+/// mode or label ([`stated_modes`]) differs from the register's value, or
+/// that the register does not hold. `register` maps an agent to the
+/// `(mode, label)` of its register record.
+fn mode_values_to_mint(
+    lines: &[crate::profile::IssuedCertRecord],
+    owner_hex: &str,
+    register: &BTreeMap<String, (crate::profile::CertMode, Option<String>)>,
+) -> Vec<(String, SyncValue)> {
+    stated_modes(lines, owner_hex)
+        .into_iter()
+        .filter(|(agent, line)| register.get(agent) != Some(&(line.mode, line.label.clone())))
+        .map(|(agent, line)| {
+            (
+                agent,
+                SyncValue::IssuanceMode {
+                    agent_id: line.agent_id.clone(),
+                    cert_digest: line.cert_digest.clone(),
+                    issued_at: line.issued_at,
+                    not_after: line.not_after,
+                    mode: line.mode,
+                    label: line.label.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// #2182: the journal line for the register's `IssuanceMode` value, or
+/// `None` when the journal already states that mode and label for the
+/// agent. The line states the mode ([`crate::profile::IssuedCertRecord::synced_mode`])
+/// and repeats the certificate fields of the agent's last line, in file
+/// order, so the certificate the roster shows does not change. With no
+/// line for the agent it takes the certificate fields of `value`.
+fn synced_mode_line(
+    existing: &[crate::profile::IssuedCertRecord],
+    owner_hex: &str,
+    value: &SyncValue,
+) -> Option<crate::profile::IssuedCertRecord> {
+    let SyncValue::IssuanceMode {
+        agent_id,
+        cert_digest,
+        issued_at,
+        not_after,
+        mode,
+        label,
+    } = value
+    else {
+        return None;
+    };
+    if existing
+        .iter()
+        .rev()
+        .find(|line| line.user_id == owner_hex && line.agent_id == *agent_id && line.states_mode())
+        .is_some_and(|line| line.mode == *mode && line.label == *label)
+    {
+        return None;
+    }
+    let last = existing
+        .iter()
+        .rev()
+        .find(|line| line.user_id == owner_hex && line.agent_id == *agent_id);
+    let (cert_digest, issued_at, not_after) = match last {
+        Some(line) => (line.cert_digest.clone(), line.issued_at, line.not_after),
+        None => (cert_digest.clone(), *issued_at, *not_after),
+    };
+    Some(crate::profile::IssuedCertRecord {
+        user_id: owner_hex.to_string(),
+        agent_id: agent_id.clone(),
+        cert_digest,
+        issued_at,
+        not_after,
+        mode: *mode,
+        label: label.clone(),
+        cert_b64: None,
+        synced_mode: true,
+    })
 }
 
 /// The `IssuanceJournal` value each agent's latest journal line mints:
@@ -5820,6 +6089,10 @@ mod device_enrollment_tests;
 #[cfg(test)]
 #[path = "owner_sync_register_write_tests.rs"]
 mod register_write_tests;
+
+#[cfg(test)]
+#[path = "owner_sync_issuance_mode_tests.rs"]
+mod issuance_mode_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6337,21 +6610,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier3_surface_is_exactly_the_five_kinds() {
+    async fn tier3_surface_is_exactly_the_six_kinds() {
         // WHY: blocker 32 — the sync surface serializes ONLY Tier-1 kinds;
         // every other kind tag is undecodable (deny-by-default allowlist).
-        // #1107 added the fifth, `DeviceEnrollment`.
-        assert_eq!(SyncKind::ALL.len(), 5);
+        // #1107 added the fifth, `DeviceEnrollment`; #2182 the sixth,
+        // `IssuanceMode`.
+        assert_eq!(SyncKind::ALL.len(), 6);
         for byte in 0u8..=255 {
             let decoded = SyncKind::from_u8(byte);
             let known = SyncKind::ALL.iter().any(|k| k.as_u8() == byte);
             assert_eq!(
                 decoded.is_some(),
                 known,
-                "kind tag 0x{byte:02x} must decode iff it is one of the five kinds"
+                "kind tag 0x{byte:02x} must decode iff it is one of the six kinds"
             );
         }
-        // Every one of the five kinds must round-trip through the wire
+        // Every one of the six kinds must round-trip through the wire
         // value enum — these are the only shapes a record can carry.
         let owner = owner_kp(1);
         for kind in SyncKind::ALL {
@@ -6382,11 +6656,22 @@ mod tests {
                         state: DeviceEnrollmentState::Removed { deleted_at_ms: 1 },
                     }
                 }
+                SyncKind::IssuanceMode => {
+                    key = "a".into();
+                    SyncValue::IssuanceMode {
+                        agent_id: "a".into(),
+                        cert_digest: "d".into(),
+                        issued_at: 1,
+                        not_after: None,
+                        mode: crate::profile::CertMode::Rider,
+                        label: Some("l".into()),
+                    }
+                }
             };
             assert_eq!(value.kind(), kind);
             let record = VersionedRecord::sign(kind, &key, &value, clock(version, 1, 1), &owner)
                 .expect("sign");
-            record.verify().expect("all five kinds verify");
+            record.verify().expect("all six kinds verify");
         }
 
         // Behavioral Tier-3 check: kind/value coherence is enforced, so no
@@ -6409,7 +6694,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_kind_tag_fails_record_decode() {
         // WHY: Tier-3 allowlist — bincode deserialization of SyncKind with
-        // an out-of-range discriminant fails, so no sixth kind can arrive.
+        // an out-of-range discriminant fails, so no seventh kind can arrive.
         let bad = bincode::serialize(&SyncKind::OwnerProfile).expect("encode");
         // A u8-repr enum serializes as its tag; corrupt it to 0x2A.
         let mut hostile = bad;
@@ -6721,6 +7006,7 @@ mod tests {
                 mode: crate::profile::CertMode::Acp,
                 label: label.map(str::to_string),
                 cert_b64: None,
+                synced_mode: false,
             }
         };
         // A pre-fix synced line for d1 (no expiry), then the renewal d2.
@@ -8336,6 +8622,7 @@ mod issuance_journal_sync_tests {
             mode: crate::profile::CertMode::Acp,
             label: None,
             cert_b64: None,
+            synced_mode: false,
         }
     }
 
@@ -8490,6 +8777,7 @@ mod issuance_journal_sync_tests {
             mode: crate::profile::CertMode::Acp,
             label: None,
             cert_b64: None,
+            synced_mode: false,
         };
         async fn reconcile(device: &Device, owner: &UserKeypair) {
             mint_journal_lines(&device.store, &device.journal, owner, device.machine).await;
@@ -8633,6 +8921,7 @@ mod issuance_journal_sync_tests {
                     mode: crate::profile::CertMode::Acp,
                     label: None,
                     cert_b64: None,
+                    synced_mode: false,
                 };
                 crate::profile::IssuedCertRecord::append(&journal, &renewed)
                     .await
@@ -8845,6 +9134,7 @@ mod issuance_journal_sync_tests {
                 mode: crate::profile::CertMode::Acp,
                 label: Some("renewed".to_string()),
                 cert_b64: None,
+                synced_mode: false,
             },
         )
         .await
@@ -9021,6 +9311,7 @@ mod issuance_journal_sync_tests {
             mode: crate::profile::CertMode::Acp,
             label: None,
             cert_b64: None,
+            synced_mode: false,
         }
     }
 
