@@ -64,13 +64,13 @@ async fn send_frame(state: &AppState, peer: &AgentId, frame: &CallFrame) -> Resu
 }
 
 /// Upper bound on detached call-frame sends in flight. The listener and
-/// sweeper emit at most one frame per call event, and a legitimate load is
-/// bounded by `MAX_LIVE_CALLS` live plus `MAX_ENDED_RETAINED` ended calls,
-/// i.e. tens of sends. Each send can hold its task for up to ~16.25 s (the
-/// worst-case raw receive-pipeline ACK wait; see `DmSendConfig`
-/// `raw_quic_receive_ack_timeout`) on a silent peer, so 256 still absorbs a
-/// burst of ~16 frames/s from silent peers while capping what a remote
-/// invite flood can pin.
+/// sweeper emit at most one frame per call event, so legitimate call-frame
+/// load is single digits per second. `send_frame` uses
+/// `DmSendConfig::default()`, whose full send budget is 54.75 s (pinned by
+/// `ordinary_send_budget_of_the_default_config_counts_the_raw_ack` in
+/// `dm_evidence.rs`), so on silent peers the cap drains at ~4.7 frames/s.
+/// That is ample for legitimate load while it caps what a remote invite
+/// flood can pin.
 const MAX_INFLIGHT_CALL_FRAME_SENDS: usize = 256;
 
 static CALL_FRAME_SEND_SLOTS: tokio::sync::Semaphore =
@@ -421,5 +421,74 @@ mod tests {
             call_error_response(&CallError::TooManyCalls).status(),
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    fn test_frame() -> CallFrame {
+        CallFrame::Invite {
+            call_id: "ab".repeat(16),
+            media: MediaKinds {
+                audio: true,
+                video: false,
+            },
+        }
+    }
+
+    fn detached_task_count(state: &AppState) -> Option<usize> {
+        state
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Vec::len)
+    }
+
+    // WHY: at the in-flight cap a frame is shed without a task, and the
+    // shed path takes no permit, so the cap recovers once sends finish.
+    #[tokio::test]
+    async fn frame_send_is_shed_at_cap_without_leaking_a_permit() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let snapshot = CALL_FRAME_SEND_SLOTS.available_permits();
+        let held = CALL_FRAME_SEND_SLOTS
+            .try_acquire_many(u32::try_from(snapshot).expect("permit count fits u32"))
+            .expect("acquire every free permit");
+        assert_eq!(CALL_FRAME_SEND_SLOTS.available_permits(), 0);
+        let tasks_before = detached_task_count(&state);
+
+        spawn_frame_send(&state, AgentId([7; 32]), test_frame(), "test send");
+
+        assert_eq!(CALL_FRAME_SEND_SLOTS.available_permits(), 0);
+        assert_eq!(
+            detached_task_count(&state),
+            tasks_before,
+            "a shed frame must not spawn a send task"
+        );
+        drop(held);
+        assert_eq!(CALL_FRAME_SEND_SLOTS.available_permits(), snapshot);
+    }
+
+    // WHY: when shutdown has closed detached-task admission the future is
+    // dropped unstarted; the permit it owns must go back to the pool.
+    #[tokio::test]
+    async fn shutdown_refused_frame_send_returns_its_permit() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let running = state
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("admission starts open");
+        assert!(running.is_empty());
+        assert!(state.detached_admission_closed());
+        let snapshot = CALL_FRAME_SEND_SLOTS.available_permits();
+
+        spawn_frame_send(&state, AgentId([7; 32]), test_frame(), "test send");
+
+        assert_eq!(CALL_FRAME_SEND_SLOTS.available_permits(), snapshot);
     }
 }

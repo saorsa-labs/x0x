@@ -173,6 +173,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Call-frame sends are bounded (#2211).** At most 256 detached call-frame
+  sends are in flight; a frame over the cap is shed with a debug log, and a
+  send refused at daemon shutdown is now logged.
 - **Owner sync carries the roster mode and label (#2182; A02 and A04
   amendments of 24 Nov 2026).** A hosting mode (`acp`/`rider`) or label set
   by `POST /owner/agents/issue` on one owner device now reaches the owner's
