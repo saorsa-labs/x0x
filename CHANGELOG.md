@@ -173,6 +173,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Join results: a slow apply for one group no longer holds the joiner's
+  join-result listener (#2207, refs #2202).** The listener applied each
+  `Result`, `Refused` and `Pending` inline, and a `Result` apply can wait in
+  its Welcome fetch for up to 115 s, so the join-result frames of every
+  other group waited behind it. These frames now go to per-group lanes, the
+  same bounded lanes as the direct metadata listener (#1238): the frames of
+  one group still apply one at a time, in arrival order, through the same
+  shielded apply; different groups apply at the same time. At most 16 lanes
+  are live and 32 frames wait in one lane; at a bound the listener waits and
+  drops nothing. Fetch requests and base-roster frames are handled as
+  before. No wire change.
+
 - **Owner sync carries the roster mode and label (#2182; A02 and A04
   amendments of 24 Nov 2026).** A hosting mode (`acp`/`rider`) or label set
   by `POST /owner/agents/issue` on one owner device now reaches the owner's
