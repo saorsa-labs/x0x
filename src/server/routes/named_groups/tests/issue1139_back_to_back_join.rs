@@ -1546,6 +1546,7 @@ async fn issue1139_authority_competing_commit_in_gap_suppresses_carry() -> Resul
     let mut competing = s.add_j1.commit.clone();
     competing.state_hash = "ff".repeat(32);
     let removed = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: s.stable_group_id.clone(),
         revision: r1,
         actor: hex::encode(s.authority_id.as_bytes()),

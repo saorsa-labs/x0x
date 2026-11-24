@@ -258,7 +258,7 @@ daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/health` | `x0x health` | Health probe with the M1 structured verdict (#1380); the node-specific detail is gated to loopback/authenticated callers (see the privacy boundary below) |
-| GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings, `gui_idle_timeout_secs` (effective GUI session idle timeout) |
+| GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings, `gui_idle_timeout_secs` (effective GUI session idle timeout), `allocator` (#1172) |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/report` | `x0x report [--deliver-to <agent_id>]` | Authenticated (durable owner only). Builds a redacted problem-report bundle and stores it as `<data_dir>/reports/x0x-report-<unix-secs>.json` (mode 0600, directory 0700). Without `deliver_to` nothing is sent. One report per minute per daemon (`429` with `retry_after_secs`); the newest 10 bundles are kept and older ones deleted. `201` body: `path`, `file_name`, `schema`, `created_unix`, `size_bytes`, `log_lines`, `log_lines_dropped_for_size`, `older_reports_deleted`, `sent: false`, `delivery` (#1354 slices 2 and 3; see below). Optional JSON body `{"deliver_to": "<agent_id hex>"}` (CLI `--deliver-to`) also queues a sent copy to that owner device; `delivery` is then `{outcome: "queued", agent_id, logical_id, request_id, deliver_until_ms, size_bytes}`, else `null` |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6). Response: `session_token`, `expires_in`, `idle_timeout_secs`; a mint counts as user activity |
@@ -295,7 +295,8 @@ curl http://127.0.0.1:12700/health
 #       "identity":           { "state": "ok", "agent": true, "machine": true, "user_present": false },
 #       "upgrade":            { "state": "ok", "checks_enabled": true, "update_available": false,
 #                              "latest_version": null, "checked_age_secs": 254,
-#                              "handoff_pending": false, "failed_artifact": false }
+#                              "handoff_pending": false, "failed_artifact": false,
+#                              "journal": null, "companion_failure": null }
 #     }
 #   }
 # }
@@ -316,6 +317,24 @@ verdict. The legacy `status`/`degraded_reason` fields keep their exact
 peer-only semantics; the verdict is additive only — a client must ignore
 unknown fields, and later x0x versions may add `verdict` fields without a
 version bump.
+
+`inputs.upgrade.journal` (#2012) is `null` without a host journal, else
+`{phase, cause, failed_attempt}`: the journal's phase (snake case), its cause
+class (`failed`, `interrupted` or `null`; never the cause text), and
+`failed_attempt`, `true` when a cause is recorded or the phase is `restored`
+or `recovery_failed`. A failed attempt makes the upgrade input `degraded`
+with a reason that names the phase and the cause. `x0x doctor` warns on the
+same journal, from `GET /diagnostics/upgrade` `plan`.
+
+`inputs.upgrade.companion_failure` (#2012) is `null`, or `{version, detail,
+failures, last_unix, pair_mixed}` when the last apply of a release newer than
+the running one failed on the sibling `x0x` (`detail` is the apply's error and
+names the path; `pair_mixed` is true when the daemon could not be restored).
+It degrades the upgrade input. It is gated detail: the redacted body leaves it
+out, as it does `latest_version`, and the redacted reason names neither the
+release nor the count. `inputs.upgrade.companion_record_unreadable` is true
+when that record exists but cannot be read (also degraded; it holds no
+release).
 
 `reasons` carries one sentence per non-`ok` input. Each input object has a
 `state` badge (`ok`/`degraded`/`error`) plus its fields:
@@ -546,9 +565,19 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 #     "down_bps":       { "total": 0.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0 },
 #     "window_secs": 60.0
 #   },
-#   "egress_budget_warning": null
+#   "egress_budget_warning": null,
+#   "allocator": { "name": "system", "jemalloc": null }
 # }
 ```
+
+`allocator` (#1172) names the process's global allocator: `"jemalloc"`
+when `x0x::allocator::GlobalJemalloc` is installed (as in an `x0xd` built
+with `--features jemalloc`), otherwise `"system"`. An embedder built with
+the feature but without that global allocator reports `"system"`.
+Release builds do not enable jemalloc yet. For jemalloc, `jemalloc` holds
+the options read back from jemalloc at run time (`background_thread`,
+`dirty_decay_ms`, `muzzy_decay_ms`); it is `null` for the system allocator.
+The values are read once and cached, because jemalloc fixes them at start.
 
 `bandwidth` shows the transport bytes of this process. `sent_bytes` and
 `received_bytes` are totals since start; a read does not clear them.
@@ -2373,8 +2402,16 @@ every wait. A wait always names its cause; it does not stop silently.
     `{"state": "waiting_for_recovery_member" | "waiting_for_receiver_upgrade", "promoted_member", "mandate_id", "parent_head", "advert"}`
     until the promoted member commits. On the promoted member,
     `promoted_member` is `{"state", "named", "parent_head"}`; `state` is
-    `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
-    lists each Active member whose current advert lacks bit 7),
+    `mandate_received`, `waiting_for_receiver_upgrade` (the D76 hold:
+    `named` lists each member the frame will be written to whose current
+    advert lacks the frame's bit, and `capability` is `owner_recovery_v1`,
+    or `owner_recovery_v2` when the recovery needs the V2 body because it
+    excludes the held creator's leaf or removes two or more leaves; #2139.
+    Revoked and expiry-due seats are never written the frame and never hold
+    it. Nothing is committed while it holds, and V1 is never sent instead of
+    a needed V2), `recovery_commit_failed` (#2139: an attempt failed after
+    its checks, for example no TreeKEM group loaded or a seal failure; it is
+    retried and the daemon log names the cause),
     `waiting_for_member_key_package`, `waiting_for_member_eviction`
     (#1973: the recovery seal was refused),
     `waiting_for_creator_certificate_renewal` (#2120: the creator's own
@@ -2393,7 +2430,24 @@ every wait. A wait always names its cause; it does not stop silently.
     `named` still lists the failing seats, not the hold. The wait
     clears when the hold ends. After the commit,
     `receiver_upgrade_members` lists the stranded members with
-    `gap_revision`.
+    `gap_revision`, `advert` (`lacking` or `unknown`) and `capability` (the
+    frame's bit). A member with no current advert is stranded, not a hold:
+    when it upgrades, the delivery round or its catch-up request writes it
+    the frame. On a node whose own seat a V2 recovery excluded,
+    `owner_recovery.local_seat` is `{"state": "excluded_by_owner_recovery",
+    "result_head", "remedy": "admin_removes_then_local_leave_and_new_invite"}`
+    (restored after a restart from the durable received frame). In that
+    state `DELETE /groups/:id` answers `{"ok": true, "left", "local_only":
+    true, "excluded_by_owner_recovery": true}`: it drops only the local copy
+    and seals nothing. After an admin's removal of the seat, a fresh invite
+    starts an ordinary join; the admission is the existing join path, and
+    the owner must re-certify the creator first (an owner-certified add
+    needs a valid certificate). A named invite (`POST /groups/:id/invite`
+    whose intended joiner is an agent whose seat is still Active with no
+    leaf) answers 409 `{"ok": false, "error": "remove_leafless_seat_first",
+    "agent_id"}`. An open invite mints normally; the creator's join on it
+    before the removal meets the inviter's existing already-a-member
+    refusal, and it can join again after the removal.
 
 **New status codes.**
 
@@ -2401,6 +2455,7 @@ every wait. A wait always names its cause; it does not stop silently.
 |---|---|---|
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
+| `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id` (TreeKEM group, a seated target whose committed KeyPackage provably names no leaf in this node's tree, such as a creator an owner recovery V2 excluded; #2197) | `200 OK` / `409 Conflict` | The removal or ban is roster-only: no TreeKEM commit, no epoch or binding change. The removal answers the usual body with `"roster_only": true` and no `epoch`, and its `MemberRemoved` event carries `target_key_package_b64` (the target's committed KeyPackage; receivers accept it only when it hashes to the committed hash); the ban answers `{"ok": true, "revision", "roster_only": true}`. While another Active or Pending member's current verified advert lacks bit 23 (`owner_recovery_v2`) it answers 409 `{"ok": false, "error": "waiting_for_receiver_upgrade", "capability": "owner_recovery_v2", "members": [...]}`; a member with no current advert does not hold it. The explicit seal's eviction of such a seat is roster-only too. |
 | `POST /groups/:id/ban/:agent_id` (TreeKEM group, target with no seat and no leaf) | `200 OK` / `409 Conflict` | #1540: the ban is roster-only — no TreeKEM commit, no epoch change — and answers `{"ok": true, "revision", "roster_only": true}`. While another Active member's current verified advert lacks application bit 17 (`roster_only_ban_v1`) it answers 409 `{"ok": false, "error": "waiting_for_receiver_upgrade", "capability": "roster_only_ban_v1", "members": [<agent hex>...]}` and changes nothing. |
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` (TreeKEM group) | `500 Internal Server Error` | #2135: `{"ok": false, "error": "treekem_rollback_failed", "detail"}`. The TreeKEM commit was made, the seal was refused, and the tree could not be restored. The daemon unloads the group's tree before it answers, so later TreeKEM operations on the group answer 424 "TreeKEM group not loaded" until the durable tree, which never held the commit, is reloaded (a daemon restart or the next rebind). This reply and an error log are the only places that name the failure. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
@@ -2650,6 +2705,22 @@ legacy-decoded container:
   `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
   member holds the commit while a known Active member's current advert
   lacks bit 7 (D76).
+
+- `X0XORC2` — owner recovery V2 (#2139, bit 23 `owner_recovery_v2`). The
+  same postcard frame type; only its third variant, `CommitV2`, travels
+  under this prefix, and `CommitV2` under `X0XORC1` (or another variant
+  under `X0XORC2`) is `malformed`. The body is a complete V1 body plus the
+  excluded seats and the author's exclusion anchor, signed in domain
+  `x0x.owner-recovery.commit.v2`; its one TreeKEM commit removes the leafed
+  revoked admins' and the excluded creator's leaves together, with the
+  binding `treekem:epoch=<n>:commit=<blake3>`. The receiver checks the
+  removed leaves as a set against those seats' leaves on its own tree. The
+  same typed refusals apply, plus `recovery_exclusion_unproven`: the anchor
+  is more than 300 s ahead of the receiver's clock, or the receiver lacks an
+  excluded seat's certificate bytes (it asks for them); the frame is kept
+  and retried, not refused. A 0.49.x node does not route this prefix to
+  owner recovery and applies nothing; an author downgraded to 0.49.x can
+  resend a saved V2 frame to bit-7 members.
 
 DM history does not record these frames: they are protocol traffic. A user
 message that only starts with the same letters stays history.
@@ -4190,6 +4261,8 @@ environment or free-text causes.
 | `holds` | Entries `{version, kind, cause, clearable}`. `kind` is `failed_release` (see `x0x upgrade --clear-hold`), `recovery_failed` (never clearable) or `unresolved_probe_record` (no local clear can run: an unresolved `.pending` terminalization marker beside the probe record, or a probe record barrier failure latched in this daemon process; never clearable, `cause` is `null`). `clearable` is `true` only when `x0x upgrade --clear-hold` would clear the hold: a `.pending` marker or a probe barrier failure in this daemon process makes every hold not clearable |
 | `last_hold_clear` | `{version, cause, cleared_at_unix}` from the most recent local clear receipt, or `null` |
 | `backups` | Backup files beside the daemon and its sibling CLI: `{artifact, name, size_bytes, modified_unix}`, `artifact` `daemon` or `cli`, at most 32. Names are `<binary>.backup` (legacy) or `<binary>.backup-<version>-<transaction>` (pair apply) |
+| `launcher_gate` | (#2012) The prepare producer's last gate decision in this daemon process: `{open, reason, plan_anchor}`, or `null` before the first `x0xd` apply since the daemon started. `open` is `false` in this release on every host (the launcher is dormant); `reason` says why, and `plan_anchor` is the anchor path the unit names, or `null`. `x0x doctor` copies it into its upgrade check's evidence |
+| `companion_failure` | (#2012) `null`, `{"record": "unreadable"}` for a record that cannot be read (it holds no release), or `{version, detail, failures, last_unix, pair_mixed}` from `<data_root>/upgrade-companion-failure.json` when the last apply of a release newer than the running one failed on the sibling `x0x`. That release is not applied again, by any apply including `POST /upgrade/apply`, before `last_unix` plus 30 minutes doubled per further failure (at most 24 hours); removing the file allows a retry at once; a successful apply removes it. `x0x doctor` warns on it with the path and the remedy |
 | `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `probe terminalization record unreadable`, `hold clear receipt unreadable`, `journal record unreadable`, `handoff record unreadable`, `boot record unreadable`); several are joined with `; ` |
 
 Probe records and holds exist only on Unix installs. On Windows the fields are

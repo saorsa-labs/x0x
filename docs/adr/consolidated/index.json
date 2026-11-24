@@ -47,7 +47,7 @@
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "fbb8823425607104056908a433af47d41d17bb9296000ed4d44bd91c11b4ca27"
+      "sha256": "68c55208d247f33ba24cc7c83a5d0726b8efb54b41dcbb7a0ab3eb209a9cf1fd"
     },
     {
       "id": "A07",
@@ -61,14 +61,14 @@
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "a4a7004c7efccb9daf143ca3538b835ccff061efe4dc3a30a06df61632d7246f"
+      "sha256": "e23a24f40821f5401b1ac71ac1e7dfd67becbf44e62aebd41e3da309f8874195"
     },
     {
       "id": "A09",
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "41b37ad5b3f15ec1ecb3d57203331def99e935016ae1350693c11677d40b342e"
+      "sha256": "8631ff9e1c8a485c0db68cc8a17d53b6e6b2eb64f8de56fd9f32b74106239f66"
     },
     {
       "id": "A10",
@@ -82,7 +82,7 @@
       "revision": 1,
       "path": "A11-r01-local-api-applications-and-human-interface.md",
       "title": "Local API Applications and Human Interface",
-      "sha256": "6509da2f14edb3f274ca5f51d386de2a003f13dc72cf010a25e803004b676a9b"
+      "sha256": "f1737ef1ac559825de0dd75651e212b34586a8e051866408beed236c85b83982"
     },
     {
       "id": "A12",
@@ -103,14 +103,14 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "2266b69f7e836a9814113cdbc1c598b593f4941cda00d2890a3e3828d7b830d7"
+      "sha256": "bcb484b59cb580ca70c49691a2c866ead37d591e3701a0bd88084144a4dac6ee"
     },
     {
       "id": "A15",
       "revision": 1,
       "path": "A15-r01-compatibility-validation-and-decision-rules.md",
       "title": "Compatibility Validation and Decision Rules",
-      "sha256": "8824560ae901d3473c68a65fc7cdf7a775a1f6d43d9102acdc0716f13069dedb"
+      "sha256": "de794573f5d7ef81674feb999254d92d5e01dc29cc00da0bff857e343b3a3853"
     }
   ]
 }

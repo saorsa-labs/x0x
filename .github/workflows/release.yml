@@ -203,6 +203,7 @@ jobs:
             archive: tar.gz
             binary: x0xd
             features: jemalloc
+            launcher: true
 
           - platform: linux-x64-musl
             os: ubuntu-latest
@@ -211,6 +212,7 @@ jobs:
             archive: tar.gz
             binary: x0xd
             features: jemalloc
+            launcher: false
 
           - platform: linux-arm64-gnu
             os: ubuntu-latest
@@ -219,6 +221,7 @@ jobs:
             archive: tar.gz
             binary: x0xd
             features: jemalloc
+            launcher: true
 
           - platform: macos-x64
             os: macos-15
@@ -227,6 +230,7 @@ jobs:
             archive: tar.gz
             binary: x0xd
             features: jemalloc
+            launcher: true
 
           - platform: macos-arm64
             os: macos-15
@@ -235,6 +239,7 @@ jobs:
             archive: tar.gz
             binary: x0xd
             features: jemalloc
+            launcher: true
 
           - platform: windows-x64
             os: windows-latest
@@ -244,6 +249,7 @@ jobs:
             binary: x0xd.exe
             # jemalloc does not support MSVC: system allocator.
             features: ''
+            launcher: false
 
     steps:
       - uses: actions/checkout@v5
@@ -320,6 +326,26 @@ jobs:
             --bin x0xd --bin x0x --message-format=json-render-diagnostics \
             | tee "${RUNNER_TEMP}/release-${{ matrix.platform }}-build.jsonl"
 
+      # The stable launcher (#2012) is its own build, after the x0xd/x0x one,
+      # so the build messages that the custody and packaged signing gates
+      # read name only x0xd and x0x. The m2-launcher feature changes no
+      # library code; it only enables the x0x-launcher bin. It ships as its
+      # own archive, x0x-launcher-<platform>.tar.gz, outside the release
+      # custody and manifest set, signed with ML-DSA-65 and GPG below.
+      - name: Build launcher (native)
+        if: ${{ matrix.launcher && !matrix.cross }}
+        shell: bash
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} \
+            --features m2-launcher --bin x0x-launcher
+
+      - name: Build launcher (cross)
+        if: ${{ matrix.launcher && matrix.cross }}
+        shell: bash
+        run: |
+          cross build --locked --release --target ${{ matrix.target }} \
+            --features m2-launcher --bin x0x-launcher
+
       # ---- macOS Code Signing & Notarization ----
       - name: Import macOS signing certificate
         if: startsWith(matrix.platform, 'macos')
@@ -346,7 +372,7 @@ jobs:
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
-          for bin in x0xd x0x; do
+          for bin in x0xd x0x x0x-launcher; do
             BINARY="target/${{ matrix.target }}/release/${bin}"
             if [ -f "$BINARY" ]; then
               codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$BINARY"
@@ -370,7 +396,7 @@ jobs:
           MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
           MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
         run: |
-          for bin in x0xd x0x; do
+          for bin in x0xd x0x x0x-launcher; do
             BINARY="target/${{ matrix.target }}/release/${bin}"
             if [ -f "$BINARY" ]; then
               ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize-${bin}.zip"
@@ -398,6 +424,7 @@ jobs:
           strip target/${{ matrix.target }}/release/${{ matrix.binary }}
           strip target/${{ matrix.target }}/release/x0xd
           strip target/${{ matrix.target }}/release/x0x
+          strip target/${{ matrix.target }}/release/x0x-launcher
 
       - name: Capture final packaged binary custody
         shell: bash
@@ -455,6 +482,34 @@ jobs:
           else
             $hash_cmd "x0x-${{ matrix.platform }}.tar.gz" > "x0x-${{ matrix.platform }}.tar.gz.sha256"
           fi
+
+      - name: Package launcher (tar.gz)
+        if: ${{ matrix.launcher }}
+        shell: bash
+        run: |
+          STAGING="x0x-launcher-${{ matrix.platform }}"
+          LAUNCHER="target/${{ matrix.target }}/release/x0x-launcher"
+          CUSTODY="${RUNNER_TEMP}/release-${{ matrix.platform }}-custody"
+          test -f "$LAUNCHER"
+          mkdir -p "$STAGING"
+          cp "$LAUNCHER" "$STAGING/x0x-launcher"
+          cp "$CUSTODY/Cargo.lock" "$STAGING/"
+          cp LICENSE* "$STAGING/" 2>/dev/null || true
+          COPYFILE_DISABLE=1 tar czf "$STAGING.tar.gz" "$STAGING"
+          hash_cmd="sha256sum"
+          if ! command -v sha256sum &>/dev/null; then
+            hash_cmd="shasum -a 256"
+          fi
+          $hash_cmd "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
+
+      - name: Upload launcher artifacts
+        if: ${{ matrix.launcher }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: launcher-${{ matrix.platform }}
+          path: |
+            x0x-launcher-${{ matrix.platform }}.*
+          if-no-files-found: error
 
       # ADR 0094: execute the exact archive members, including cross targets.
       # An unsupported execution environment fails this gate; it is never skipped.
@@ -569,6 +624,29 @@ jobs:
             echo "Signed: $archive"
           done
 
+      - name: Download launcher artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: launcher-artifacts
+          pattern: launcher-*
+
+      # Own signing context: a launcher signature never verifies as a
+      # release-archive signature, or the other way round.
+      - name: Sign launcher archives with ML-DSA-65
+        run: |
+          found=0
+          for archive in launcher-artifacts/launcher-*/x0x-launcher-*.tar.gz; do
+            [ -f "$archive" ] || continue
+            ./target/release/x0x-keygen sign \
+              --key /tmp/release-signing.secret \
+              --input "$archive" \
+              --output "${archive}.sig" \
+              --context "x0x-launcher-v1"
+            echo "Signed: $archive"
+            found=$((found + 1))
+          done
+          [ "$found" -eq 4 ] || { echo "expected 4 launcher archives, found $found"; exit 1; }
+
       - name: Generate and sign release manifest
         run: |
           # Collect all archives AND their ML-DSA-65 signatures into a flat
@@ -604,6 +682,13 @@ jobs:
         with:
           name: ml-dsa-signatures
           path: artifacts/release-*/*.sig
+          if-no-files-found: error
+
+      - name: Upload launcher signatures
+        uses: actions/upload-artifact@v5
+        with:
+          name: ml-dsa-launcher-signatures
+          path: launcher-artifacts/launcher-*/*.sig
           if-no-files-found: error
 
       - name: Upload release manifest
@@ -648,6 +733,18 @@ jobs:
           name: ml-dsa-signatures
           path: artifacts
 
+      - name: Download launcher artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          pattern: launcher-*
+
+      - name: Download launcher ML-DSA-65 signatures
+        uses: actions/download-artifact@v5
+        with:
+          name: ml-dsa-launcher-signatures
+          path: artifacts
+
       - name: Download release manifest
         uses: actions/download-artifact@v5
         with:
@@ -686,7 +783,7 @@ jobs:
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip; do
+          for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip artifacts/launcher-*/*.tar.gz; do
             [ -f "$archive" ] || continue
             gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
               --detach-sign --armor --output "${archive}.asc" "$archive" <<< "$GPG_PASSPHRASE"
@@ -696,7 +793,7 @@ jobs:
         run: |
           mkdir -p release-files
           # Copy archives, checksums, GPG signatures, and ML-DSA-65 signatures
-          for dir in artifacts/release-*/; do
+          for dir in artifacts/release-*/ artifacts/launcher-*/; do
             cp "$dir"/*.tar.gz release-files/ 2>/dev/null || true
             cp "$dir"/*.zip release-files/ 2>/dev/null || true
             cp "$dir"/*.sha256 release-files/ 2>/dev/null || true
@@ -761,6 +858,8 @@ jobs:
             | macOS x64 (Intel) | `x0x-macos-x64.tar.gz` | ML-DSA-65 + Apple + GPG |
             | macOS ARM64 (Apple Silicon) | `x0x-macos-arm64.tar.gz` | ML-DSA-65 + Apple + GPG |
             | Windows x64 | `x0x-windows-x64.zip` | ML-DSA-65 + GPG |
+
+            The stable launcher (opt-in, still dormant: it only runs x0xd) ships as its own signed archive for Linux x64 (glibc), Linux ARM64 and macOS: `x0x-launcher-<platform>.tar.gz`, with `.sha256`, `.sig` (ML-DSA-65) and `.asc` (GPG). `.deployment/install.sh --launcher` with no path fetches and verifies it.
 
             All binaries are signed with ML-DSA-65 (post-quantum, `.sig` files) and GPG (`.asc` files). macOS binaries are additionally signed with Apple Developer ID and notarized.
 

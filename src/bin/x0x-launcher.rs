@@ -34,6 +34,20 @@ fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     {
         let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        if argv.len() == 1 && argv[0] == launcher::contract::CAPABILITIES_FLAG {
+            // A checked write: a closed stdout is an error exit (74,
+            // `EX_IOERR`), never a panic.
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let written = launcher::contract::capabilities()
+                .iter()
+                .try_for_each(|capability| writeln!(out, "{capability}"))
+                .and_then(|()| out.flush());
+            return match written {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(_) => std::process::ExitCode::from(74),
+            };
+        }
         let args = match launcher::issuer::launcher_argv(&argv) {
             Ok(args) => args,
             Err(error) => {

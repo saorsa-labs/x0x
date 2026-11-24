@@ -4587,6 +4587,7 @@ mod daemon_tests {
         leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
         let leave_commit = leaving.seal_commit(&leaver_kp, ng::now_millis_u64())?;
         let leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.clone(),
             revision,
             actor: leaver_hex.clone(),
@@ -4794,6 +4795,7 @@ mod daemon_tests {
         leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
         let leave_commit = leaving.seal_commit(&leaver_kp, ng::now_millis_u64())?;
         let leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.clone(),
             revision,
             actor: leaver_hex.clone(),
@@ -5119,6 +5121,7 @@ mod daemon_tests {
         leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
         let leave_commit = leaving.seal_commit(&leaver_kp, ng::now_millis_u64())?;
         let leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: group_id.clone(),
             revision,
             actor: leaver_hex.clone(),
@@ -5645,6 +5648,7 @@ mod daemon_tests {
         leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
         let leave_commit = leaving.seal_commit(&fx.leaver_kp, ng::now_millis_u64())?;
         let second_leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: fx.group_id.clone(),
             revision,
             actor: leaver_hex.clone(),
@@ -9209,6 +9213,7 @@ mod daemon_tests {
         let b_commit = b_next.seal_commit(&b_kp, 0).context("seal B's removal")?;
         let b_head = b_commit.state_hash.clone();
         let b_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: fx.group_id.clone(),
             revision: b_next.roster_revision,
             actor: b_hex.clone(),
@@ -9416,6 +9421,7 @@ mod daemon_tests {
         let b_commit = b_next.seal_commit(&b_kp, 0).context("seal B's removal")?;
         let b_head = b_commit.state_hash.clone();
         let b_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: fx.group_id.clone(),
             revision: b_next.roster_revision,
             actor: b_hex.clone(),
@@ -10978,6 +10984,7 @@ mod daemon_tests {
             .context("seal B's removal")?;
         let b_rotation_head = b_commit.state_hash.clone();
         let b_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: fx.group_id.clone(),
             revision: b_rotation.roster_revision,
             actor: b_hex.clone(),
@@ -11146,6 +11153,7 @@ mod daemon_tests {
             .seal_commit(author_kp, 0)
             .context("seal the author's removal")?;
         let held_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: fx.group_id.clone(),
             revision: held_next.roster_revision,
             actor: admin_hex.clone(),
@@ -11327,6 +11335,7 @@ mod daemon_tests {
             &fx.replica,
             &fx.stable,
             ng::NamedGroupMetadataEvent::MemberRemoved {
+                target_key_package_b64: None,
                 group_id: fx.group_id.clone(),
                 revision: l_next.roster_revision,
                 actor: l_hex.clone(),

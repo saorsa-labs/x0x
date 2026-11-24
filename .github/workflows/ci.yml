@@ -279,6 +279,9 @@ jobs:
       - name: Coverage Gate step controls
         run: bash scripts/ci/test_coverage_gate.sh
 
+      - name: Windows flush-owner acceptance controls
+        run: python3 -B scripts/ci/test_windows_flush_acceptance.py -v
+
       - name: Train bundle skip condition
         run: python3 -B scripts/ci/test_train_bundle_skip.py -v
 

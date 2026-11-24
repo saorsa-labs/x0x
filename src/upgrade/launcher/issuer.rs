@@ -187,6 +187,30 @@ fn issue_held(
         *held = daemon.map(|(_, lock)| lock);
         return Ok(None);
     };
+    if interrupted_swap(record.phase) {
+        // A transaction that stopped before its CLI swap was recorded: its
+        // producer is gone (it holds the install locks until it exits, and
+        // this start holds the daemon lock). Settle it, then let the next
+        // start read the settled journal (#2012).
+        no_authority(args, &root)?;
+        let anchor = read_checked_anchor(args, owners)?;
+        if anchor.anchor().daemon_target != record.plan.daemon.target_path
+            || anchor.anchor().cli_target != record.plan.cli.target_path
+        {
+            return Err(other_install(
+                &record,
+                &anchor.anchor().daemon_target,
+                &anchor.anchor().cli_target,
+            ));
+        }
+        drop(daemon);
+        settle_interrupted_swap(&args.host_root, &root, record_uid, &record, owners, &anchor)?;
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "an interrupted update was settled (the previous pair is installed and the host \
+             journal is superseded); the next start reads it",
+        ));
+    }
     let passthrough = if owns_trial(record.phase)? {
         retired && committed_trial(args, &root, record.phase)?
     } else {
@@ -196,30 +220,47 @@ fn issue_held(
     if passthrough {
         if let Some((canonical, _)) = &daemon {
             if *canonical != record.plan.daemon.target_path {
-                return Err(start::refused(
-                    "the launcher's daemon is not the host journal's daemon target",
+                return Err(other_install(
+                    &record,
+                    canonical,
+                    &record.plan.cli.target_path,
                 ));
             }
         }
         *held = daemon.map(|(_, lock)| lock);
         return Ok(None);
     }
+    // The plan must name the anchored install before any lock file is
+    // created at the plan's daemon target (#2171 fourth review): a journal
+    // of another install pair, or one written by anything else that runs
+    // as this account, cannot make the start create a lock file beside a
+    // path the anchor does not approve.
+    let anchor = read_checked_anchor(args, owners)?;
+    if anchor.anchor().daemon_target != record.plan.daemon.target_path
+        || anchor.anchor().cli_target != record.plan.cli.target_path
+    {
+        return Err(other_install(
+            &record,
+            &anchor.anchor().daemon_target,
+            &anchor.anchor().cli_target,
+        ));
+    }
     // The journal and its binding are read under the install lock of the
     // journal plan's daemon target (#2171 review). A producer stages, and
-    // removes an old transaction's binding, only while it holds that lock:
-    // `stage` refuses a plan for another install pair over a journal in
-    // this data root, so every stage here takes this same lock. When the
-    // lock taken above is not that one (the daemon is missing, or the
+    // removes an old transaction's binding, only while it holds that lock
+    // and the data root's stage lock: `stage` refuses a plan for another
+    // install pair over a journal in this data root, so every stage that
+    // can write here while this journal exists takes this same lock. When
+    // the lock taken above is not that one (the daemon is missing, or the
     // argv names another file), take it now and read the journal again
     // under it. A lock that cannot be taken is a failed read (75), never a
     // refusal from a torn read.
-    let plan_lock = match &daemon {
-        Some((canonical, _)) if *canonical == record.plan.daemon.target_path => None,
-        _ => Some(plan_daemon_lock(
-            &record.plan.daemon.target_path,
-            DAEMON_LOCK_WAIT,
-        )?),
-    };
+    let own_lock = daemon
+        .as_ref()
+        .map(|(canonical, lock)| (canonical.as_path(), lock));
+    #[cfg(test)]
+    tests::before_plan_lock();
+    let plan_lock = plan_daemon_lock(&record.plan.daemon.target_path, own_lock, DAEMON_LOCK_WAIT)?;
     let record = if plan_lock.is_some() {
         match read_journal(&root, record_uid)? {
             Some(again) if serde_json::to_vec(&again)? == serde_json::to_vec(&record)? => again,
@@ -235,7 +276,7 @@ fn issue_held(
     };
     #[cfg(test)]
     tests::before_binding_read();
-    check_binding(args, &root, &record, owners)?;
+    check_binding(&root, &record, owners, &anchor)?;
     drop(plan_lock);
     drop(daemon);
     let participant = record
@@ -270,6 +311,103 @@ fn issue_held(
         host,
         instance: args.instance.clone(),
     }))
+}
+
+/// A journal phase before `SwappedCli` that is not settled: the producer
+/// stopped (crash, power loss or kill) between its Staged write and its
+/// SwappedCli write. A daemon swap may have happened without its record
+/// (#2012 crash row), and a CLI swap without its record.
+fn interrupted_swap(phase: journal::Phase) -> bool {
+    use journal::Phase::*;
+    matches!(phase, Staged | Probed | Prepared | SwappedDaemon)
+}
+
+/// Settle an interrupted swap (#2012): under the host lock (CLI lock, then
+/// daemon lock, never one held while waiting for the other, bounded by
+/// `DAEMON_LOCK_WAIT`), with the journal read again and byte-identical and
+/// its binding checked against the anchor, restore every target that holds
+/// the candidate from its backup (which must hold the previous release; the
+/// backup stays), then write `Superseded`. A target that holds neither the
+/// previous nor the candidate release, or a backup that does not hold the
+/// previous release, is a typed refusal (78) and nothing is written. An I/O
+/// error is a failed read (75).
+fn settle_interrupted_swap(
+    host_root: &Path,
+    root: &File,
+    uid: u32,
+    record: &journal::JournalRecord,
+    owners: Owners,
+    anchor: &plan_binding::Anchored,
+) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + DAEMON_LOCK_WAIT;
+    let _locks = loop {
+        let cli = recovery::lock(&record.plan.cli.target_path)?;
+        let daemon = recovery::lock(&record.plan.daemon.target_path)?;
+        if same_file(file_id(&cli.metadata()?), file_id(&daemon.metadata()?)) {
+            return Err(start::refused("install locks alias"));
+        }
+        // A refused daemon lock drops the CLI lock (both files close) before
+        // the wait.
+        if cli.try_lock().is_ok() && daemon.try_lock().is_ok() {
+            break (cli, daemon);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the host lock is held by another holder",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    #[cfg(test)]
+    tests::before_settle();
+    let current = match read_journal(root, uid)? {
+        Some(again) if serde_json::to_vec(&again)? == serde_json::to_vec(record)? => again,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the host journal changed while its install lock was taken",
+            ))
+        }
+    };
+    check_binding(root, &current, owners, anchor)?;
+    let mut next = current.clone();
+    for (artifact, progress) in [
+        (&current.plan.daemon, &mut next.daemon_progress),
+        (&current.plan.cli, &mut next.cli_progress),
+    ] {
+        let observed = filesystem::hash(&artifact.target_path)?;
+        if observed == artifact.previous_sha256 {
+            continue;
+        }
+        if observed != artifact.candidate_sha256 {
+            return Err(start::refused(format!(
+                "an interrupted update left {} holding neither the previous nor the candidate \
+                 release; restore it by hand",
+                artifact.target_path.display()
+            )));
+        }
+        if filesystem::hash(&artifact.backup_path)? != artifact.previous_sha256 {
+            return Err(start::refused(format!(
+                "an interrupted update left {} swapped, but its backup {} does not hold the \
+                 previous release; restore it by hand",
+                artifact.target_path.display(),
+                artifact.backup_path.display()
+            )));
+        }
+        filesystem::restore_one(artifact)?;
+        if filesystem::hash(&artifact.target_path)? != artifact.previous_sha256 {
+            return Err(io::Error::other("restore hash mismatch"));
+        }
+        progress.restored = true;
+        progress.observed_sha256 = Some(artifact.previous_sha256);
+    }
+    next.phase = journal::Phase::Superseded;
+    next.sequence = next
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| start::refused("journal sequence exhausted"))?;
+    journal::write_record(&host_root.join(journal::JOURNAL_FILE_NAME), &next)
 }
 
 /// How long a start waits for the daemon install lock before it gives up
@@ -374,11 +512,20 @@ fn daemon_lock_with(
 }
 
 /// The install lock of the journal plan's daemon target, taken within
-/// `wait`. The lock file is created beside the target even when the
+/// `wait`, or `None` when `held` (the daemon lock this start already holds,
+/// with its daemon's canonical path) is that same lock: the same path, or
+/// a lock file that is the same file through another path (a plan target
+/// that names the install through a symlinked directory). Taking a second
+/// lock on the same file would wait on the start's own lock (#2171 fourth
+/// review). The lock file is created beside the target even when the
 /// binary itself is missing. Every failure (no directory, no access, a
 /// lock held past the wait) is a failed read, so the start is retried; a
 /// read under no lock could see a torn journal and binding.
-fn plan_daemon_lock(target: &Path, wait: std::time::Duration) -> io::Result<File> {
+fn plan_daemon_lock(
+    target: &Path,
+    held: Option<(&Path, &File)>,
+    wait: std::time::Duration,
+) -> io::Result<Option<File>> {
     let retry = |error: io::Error| {
         io::Error::new(
             io::ErrorKind::Interrupted,
@@ -388,11 +535,23 @@ fn plan_daemon_lock(target: &Path, wait: std::time::Duration) -> io::Result<File
             ),
         )
     };
+    if held.is_some_and(|(canonical, _)| canonical == target) {
+        return Ok(None);
+    }
     let lock = recovery::lock(target).map_err(retry)?;
+    if let Some((_, held)) = held {
+        let (a, b) = (
+            held.metadata().map_err(retry)?,
+            lock.metadata().map_err(retry)?,
+        );
+        if same_file(file_id(&a), file_id(&b)) {
+            return Ok(None);
+        }
+    }
     let deadline = std::time::Instant::now() + wait;
     loop {
         match lock.try_lock() {
-            Ok(()) => return Ok(lock),
+            Ok(()) => return Ok(Some(lock)),
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -402,6 +561,17 @@ fn plan_daemon_lock(target: &Path, wait: std::time::Duration) -> io::Result<File
             Err(std::fs::TryLockError::Error(error)) => return Err(retry(error)),
         }
     }
+}
+
+/// Two files are one file only when both the device and the inode are
+/// equal: inode numbers repeat across file systems.
+fn same_file(a: (u64, u64), b: (u64, u64)) -> bool {
+    a == b
+}
+
+/// The (device, inode) pair that names one file.
+fn file_id(metadata: &std::fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
 }
 
 /// Before a passthrough `exec` of a trial-form start that holds no lock
@@ -471,32 +641,37 @@ fn read_journal(root: &File, uid: u32) -> io::Result<Option<journal::JournalReco
     }
 }
 
-/// The journal's integrity binding (#2012, B4). The argv must name a plan
-/// anchor; the anchor must be root's and unchangeable by the launcher's
-/// account (`plan_binding::read_anchor`); the plan binding beside the
-/// journal must be a 0600 regular file of the launcher's account, read
-/// through the checked host root; and it must bind this journal's
-/// transaction, generation and plan to that anchor, whose install the plan
-/// names exactly. Every failure is a typed refusal (78): none of them
-/// clears by itself. Only an I/O error while reading is a failed read (75).
-fn check_binding(
-    args: &TrialArgs,
-    root: &File,
-    record: &journal::JournalRecord,
-    owners: Owners,
-) -> io::Result<()> {
+/// The plan anchor the argv names (#2012, B4): root's and unchangeable by
+/// the launcher's account (`plan_binding::read_anchor`). No `--plan-anchor`,
+/// and every failed check, is a typed refusal (78): none of them clears by
+/// itself. Only an I/O error while reading is a failed read (75).
+fn read_checked_anchor(args: &TrialArgs, owners: Owners) -> io::Result<plan_binding::Anchored> {
     let Some(anchor_path) = &args.plan_anchor else {
         return Err(start::refused(
             "a launcher trial needs --plan-anchor; this unit can only pass through",
         ));
     };
-    let anchor = plan_binding::read_anchor(anchor_path, owners.anchor).map_err(|error| {
+    plan_binding::read_anchor(anchor_path, owners.anchor).map_err(|error| {
         if fixed(&error) {
             start::refused(format!("plan anchor {}: {error}", anchor_path.display()))
         } else {
             error
         }
-    })?;
+    })
+}
+
+/// The journal's integrity binding (#2012, B4): the plan binding beside the
+/// journal must be a 0600 regular file of the launcher's account, read
+/// through the checked host root, and it must bind this journal's
+/// transaction, generation and plan to `anchor`, whose install the plan
+/// names exactly. Every failure is a typed refusal (78); only an I/O error
+/// while reading is a failed read (75).
+fn check_binding(
+    root: &File,
+    record: &journal::JournalRecord,
+    owners: Owners,
+    anchor: &plan_binding::Anchored,
+) -> io::Result<()> {
     let name = plan_binding::binding_file_name(&record.transaction_id);
     let bytes = match read_owned_at(root, &name, owners.record) {
         Ok(bytes) => bytes,
@@ -510,6 +685,23 @@ fn check_binding(
     anchor
         .verify(&binding, record)
         .map_err(|error| start::refused(error.to_string()))
+}
+
+/// The typed refusal for a host journal of another install pair in this
+/// data root (`contract::REFUSAL_OTHER_INSTALL`): `x0x doctor` names the
+/// remedy for it (docs/upgrade-system.md, "Moving a data root to another
+/// install").
+fn other_install(record: &journal::JournalRecord, daemon: &Path, cli: &Path) -> io::Error {
+    start::refused(format!(
+        "{}: the host journal ({:?}, transaction {}) is for the install {} with {}, not {} with {}",
+        contract::REFUSAL_OTHER_INSTALL,
+        record.phase,
+        record.transaction_id,
+        record.plan.daemon.target_path.display(),
+        record.plan.cli.target_path.display(),
+        daemon.display(),
+        cli.display()
+    ))
 }
 
 /// An error no restart changes: a missing, symlinked, foreign or malformed
@@ -601,11 +793,11 @@ fn read_trial(root: &File) -> io::Result<Option<Trial>> {
         .map_err(|_| start::refused("trial record is unreadable"))
 }
 
-/// Whether the journal phase gives the launcher trial authority. Before
-/// any swap the installed bytes are unchanged and idle or superseded
-/// records are history (an ordinary start, unless a trial is unfinished).
-/// A daemon swapped without its CLI is a mixed pair the launcher must not
-/// start or guess at.
+/// Whether the journal phase gives the launcher trial authority. Idle and
+/// superseded records are history (an ordinary start, unless a trial is
+/// unfinished). `issue_held` settles the interrupted phases (Staged to
+/// SwappedDaemon) before it asks; they stay here as refusals for any other
+/// caller.
 fn owns_trial(phase: journal::Phase) -> io::Result<bool> {
     use journal::Phase::*;
     match phase {
@@ -727,6 +919,30 @@ mod tests {
             const { std::cell::RefCell::new(None) };
     }
 
+    thread_local! {
+        /// Runs once, on this thread, after the start's first journal read
+        /// and before it takes the plan's daemon lock.
+        static BEFORE_PLAN_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_plan_lock() {
+        if let Some(hook) = BEFORE_PLAN_LOCK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    pub(super) fn before_settle() {
+        if let Some(hook) = BEFORE_SETTLE.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    thread_local! {
+        pub(super) static BEFORE_SETTLE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     pub(super) fn before_binding_read() {
         if let Some(hook) = BEFORE_BINDING_READ.with(|hook| hook.borrow_mut().take()) {
             hook();
@@ -803,11 +1019,20 @@ mod tests {
                         assert_eq!(issued.host.root(), root, "{phase:?} {step:?}")
                     }
                     // The rename landed before the failure: the new Staged
-                    // journal is an ordinary start.
-                    Ok(None) => assert!(
-                        matches!(step, journal::BarrierStep::DirectorySync),
-                        "{phase:?} {step:?}"
-                    ),
+                    // journal is an interrupted transaction over the
+                    // installed bytes, which the start settles (#2012).
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        assert!(
+                            matches!(step, journal::BarrierStep::DirectorySync),
+                            "{phase:?} {step:?}"
+                        );
+                        assert!(issue_as(&args, &command, effective_uid())
+                            .unwrap()
+                            .is_none());
+                    }
+                    Ok(None) => {
+                        panic!("{phase:?} {step:?}: a Staged journal is never a passthrough")
+                    }
                     Err(error) => panic!("{phase:?} {step:?}: {error}"),
                 }
             }
@@ -880,12 +1105,155 @@ mod tests {
             .exists());
     }
 
+    /// Replace the journal in `root` with `record`, as a writer would.
+    fn rewrite(root: &Path, record: &journal::JournalRecord) {
+        let path = root.join(journal::JOURNAL_FILE_NAME);
+        std::fs::remove_file(&path).unwrap();
+        journal::write_record(&path, record).unwrap();
+    }
+
+    /// Point `record`'s plan, and every participant, at the daemon `target`.
+    fn retarget(record: &mut journal::JournalRecord, target: PathBuf) {
+        for participant in &mut record.plan.participants {
+            participant.executable = target.clone();
+            participant.argv[0] = target.to_string_lossy().into_owned();
+        }
+        record.plan.daemon.target_path = target;
+    }
+
+    /// #2171 fourth review: when the argv names another daemon file than the
+    /// journal plan's target, the start reads the binding under the lock of
+    /// the PLAN's daemon target, not the argv's: a same-pair stage cannot
+    /// run before the binding read.
+    #[test]
+    fn the_binding_is_read_under_the_plans_lock_not_the_argvs() {
+        let (dir, root, record) = rooted(journal::Phase::HostCommitted);
+        let (args, mut command) = matching(&record);
+        let other = dir.path().canonicalize().unwrap().join("argv-x0xd");
+        std::fs::write(&other, b"").unwrap();
+        command.executable = other.into_os_string();
+        let (hook_root, hook_record) = (root.clone(), record.clone());
+        let staged = race_before_binding_read(move || {
+            stage_over(&hook_root, &hook_record, "tx-racer", None)
+        });
+        let _ = issue_as(&args, &command, effective_uid());
+        assert_eq!(
+            staged.get(),
+            Some(false),
+            "the racing stage got the plan's lock"
+        );
+        assert!(root
+            .join(plan_binding::binding_file_name(&record.transaction_id))
+            .exists());
+    }
+
+    /// #2171 fourth review: a journal that changes between the start's
+    /// first read and the plan's daemon lock is a failed read (75), both
+    /// when a new transaction replaced it and when the same transaction
+    /// moved on. The read under the lock is what the start uses.
+    #[test]
+    fn a_journal_that_changes_before_the_plans_lock_is_a_failed_read() {
+        for same_transaction in [false, true] {
+            let (_dir, root, record) = rooted(journal::Phase::HostCommitted);
+            let (args, command) = matching(&record);
+            // No daemon, so the start holds no lock until the plan's.
+            std::fs::remove_file(&record.plan.daemon.target_path).unwrap();
+            let (hook_root, hook_record) = (root.clone(), record.clone());
+            BEFORE_PLAN_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if same_transaction {
+                        let mut moved = hook_record.clone();
+                        moved.sequence += 1;
+                        rewrite(&hook_root, &moved);
+                    } else {
+                        stage_over(&hook_root, &hook_record, "tx-racer", None).unwrap();
+                    }
+                }))
+            });
+            let error = issue_as(&args, &command, effective_uid())
+                .err()
+                .expect("a changed journal is an error");
+            let case = format!("same transaction {same_transaction}");
+            assert!(!start::is_refusal(&error), "{case}: {error}");
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{case}: {error}");
+            assert!(
+                error.to_string().contains("changed while"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    /// #2171 fourth review: the plan is checked against the root-owned
+    /// anchor before any lock file is created at the plan's daemon target.
+    /// A journal whose plan names a target the anchor does not approve is a
+    /// typed refusal and leaves no lock file there.
+    #[test]
+    fn no_plan_lock_file_is_created_outside_the_anchored_install() {
+        let (dir, root, mut record) = rooted(journal::Phase::HostCommitted);
+        let (args, command) = matching(&record);
+        let elsewhere = dir.path().canonicalize().unwrap().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        retarget(&mut record, elsewhere.join("x0xd"));
+        rewrite(&root, &record);
+        let error = issue_as(&args, &command, effective_uid())
+            .err()
+            .expect("refused");
+        assert!(start::is_refusal(&error), "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with(contract::REFUSAL_OTHER_INSTALL),
+            "{error}"
+        );
+        assert!(!recovery::lock_path(&elsewhere.join("x0xd")).exists());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// #2171 fourth review: a plan daemon target that names the argv's
+    /// daemon through a symlinked directory has the same lock file. The
+    /// start does not wait on its own lock (30 s, then a failed read); it
+    /// goes on at once to the checks, here the non-canonical plan path,
+    /// which is a typed refusal.
+    #[test]
+    fn a_plan_target_through_a_symlinked_directory_reuses_the_held_lock() {
+        let (dir, root, mut record) = rooted(journal::Phase::HostCommitted);
+        let (args, command) = matching(&record);
+        let target = record.plan.daemon.target_path.clone();
+        let alias = dir.path().canonicalize().unwrap().join("alias");
+        std::os::unix::fs::symlink(target.parent().unwrap(), &alias).unwrap();
+        retarget(&mut record, alias.join(target.file_name().unwrap()));
+        rewrite(&root, &record);
+        bind(&root, &record);
+        let begun = std::time::Instant::now();
+        let result = issue_as(&args, &command, effective_uid());
+        assert!(
+            begun.elapsed() < std::time::Duration::from_secs(10),
+            "the start waited on its own lock"
+        );
+        assert!(refused(result));
+    }
+
+    /// #2186 review: the same-file check needs both halves; the same inode
+    /// on another device is another file.
+    #[test]
+    fn same_file_compares_device_and_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(file_id(&meta), (meta.dev(), meta.ino()));
+        assert!(same_file((1, 5), (1, 5)));
+        assert!(!same_file((1, 5), (2, 5)));
+        assert!(!same_file((1, 5), (1, 6)));
+    }
+
     /// #2171 review 3 (b): a plan lock that cannot be taken (its directory
     /// is gone) is a failed read, never a refusal.
     #[test]
     fn a_plan_lock_that_cannot_be_taken_is_a_failed_read() {
         let error = plan_daemon_lock(
             Path::new("/nonexistent-x0x-dir/x0xd"),
+            None,
             std::time::Duration::from_millis(10),
         )
         .expect_err("no directory");
@@ -1205,17 +1573,30 @@ mod tests {
         let (args, command) = matching(&record);
         let uid = effective_uid();
         let anchor = root.join(plan_binding::TEST_ANCHOR_NAME);
-        let edits: [fn(&mut serde_json::Value); 3] = [
-            |a| a["cli_target"] = "/usr/local/bin/other-x0x".into(),
-            |a| {
-                a["participants"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::json!({"instance_id": "bob", "data_root": "/var/lib/bob"}))
-            },
-            |a| a["participants"][0]["data_root"] = "/var/lib/elsewhere".into(),
+        type Edit = (fn(&mut serde_json::Value), &'static str);
+        let edits: [Edit; 4] = [
+            (
+                |a| a["cli_target"] = "/usr/local/bin/other-x0x".into(),
+                contract::REFUSAL_OTHER_INSTALL,
+            ),
+            (
+                |a| a["daemon_target"] = "/usr/local/bin/other-x0xd".into(),
+                contract::REFUSAL_OTHER_INSTALL,
+            ),
+            (
+                |a| {
+                    a["participants"].as_array_mut().unwrap().push(
+                        serde_json::json!({"instance_id": "bob", "data_root": "/var/lib/bob"}),
+                    )
+                },
+                "anchored",
+            ),
+            (
+                |a| a["participants"][0]["data_root"] = "/var/lib/elsewhere".into(),
+                "anchored",
+            ),
         ];
-        for edit in edits {
+        for (edit, expected) in edits {
             let mut value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&anchor).unwrap()).unwrap();
             edit(&mut value);
@@ -1239,7 +1620,7 @@ mod tests {
             .unwrap();
             let error = issue_as(&args, &command, uid).err().expect("refused");
             assert!(start::is_refusal(&error), "{error}");
-            assert!(error.to_string().contains("anchored"), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
             bind(&root, &record);
         }
     }
@@ -1248,11 +1629,7 @@ mod tests {
     fn no_journal_or_a_settled_one_is_an_ordinary_start() {
         let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
         let (args, command) = matching(&record);
-        for phase in [
-            journal::Phase::Staged,
-            journal::Phase::Prepared,
-            journal::Phase::Idle,
-        ] {
+        for phase in [journal::Phase::Idle, journal::Phase::Superseded] {
             let mut settled = record.clone();
             settled.phase = phase;
             journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &settled).unwrap();
@@ -1277,11 +1654,212 @@ mod tests {
             .is_none());
     }
 
+    fn journal_at(root: &Path) -> journal::JournalRecord {
+        let journal::RecordRead::Journal(record) = journal::read_boot_records(root).journal else {
+            panic!("no journal");
+        };
+        *record
+    }
+
+    fn set_phase(root: &Path, record: &journal::JournalRecord, phase: journal::Phase) {
+        let mut changed = record.clone();
+        changed.phase = phase;
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &changed).unwrap();
+    }
+
+    /// #2012 (the open crash row of PR 2): the producer swapped the daemon
+    /// and stopped before its SwappedDaemon record, so a Prepared journal
+    /// lies over candidate bytes. A start restores the previous daemon from
+    /// its backup (the backup stays), writes Superseded and asks for the
+    /// next start (75); that start is an ordinary one on the previous
+    /// release. Red: the pre-#2012 issuer passed through to the candidate.
     #[test]
-    fn a_half_swapped_pair_is_refused() {
-        let (_dir, _root, record) = rooted(journal::Phase::SwappedDaemon);
+    fn a_swap_without_its_record_is_restored_and_superseded() {
+        for phase in [
+            journal::Phase::Staged,
+            journal::Phase::Probed,
+            journal::Phase::Prepared,
+            journal::Phase::SwappedDaemon,
+        ] {
+            let (_dir, root, record) = rooted(phase);
+            let (args, command) = matching(&record);
+            let plan = &record.plan;
+            // The CLI is still the previous release; the daemon is not.
+            std::fs::copy(&plan.cli.backup_path, &plan.cli.target_path).unwrap();
+            let error = issue_as(&args, &command, effective_uid())
+                .err()
+                .expect("settled, not a start");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::Interrupted,
+                "{phase:?}: {error}"
+            );
+            assert!(!start::is_refusal(&error), "{error}");
+            for artifact in [&plan.daemon, &plan.cli] {
+                assert_eq!(
+                    filesystem::hash(&artifact.target_path).unwrap(),
+                    artifact.previous_sha256,
+                    "{phase:?}"
+                );
+                assert_eq!(
+                    filesystem::hash(&artifact.backup_path).unwrap(),
+                    artifact.previous_sha256,
+                    "the backup stays"
+                );
+            }
+            let settled = journal_at(&root);
+            assert_eq!(settled.phase, journal::Phase::Superseded);
+            assert_eq!(settled.sequence, record.sequence + 1);
+            assert!(settled.daemon_progress.restored && !settled.cli_progress.restored);
+            assert!(issue_as(&args, &command, effective_uid())
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    /// A daemon and a CLI both swapped without SwappedCli (a crash between
+    /// the CLI swap and its record) are both restored.
+    #[test]
+    fn a_cli_swap_without_its_record_is_restored_too() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedDaemon);
         let (args, command) = matching(&record);
-        assert!(issue_as(&args, &command, effective_uid()).is_err());
+        let error = issue_as(&args, &command, effective_uid()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        let settled = journal_at(&root);
+        assert_eq!(settled.phase, journal::Phase::Superseded);
+        assert!(settled.daemon_progress.restored && settled.cli_progress.restored);
+        for artifact in [&record.plan.daemon, &record.plan.cli] {
+            assert_eq!(
+                filesystem::hash(&artifact.target_path).unwrap(),
+                artifact.previous_sha256
+            );
+        }
+    }
+
+    /// An interrupted journal over the previous pair is settled without a
+    /// restore, so later applies are not refused for ever.
+    #[test]
+    fn an_interrupted_journal_over_the_previous_pair_is_superseded() {
+        let (_dir, root, record) = rooted(journal::Phase::Prepared);
+        let (args, command) = matching(&record);
+        for artifact in [&record.plan.daemon, &record.plan.cli] {
+            std::fs::copy(&artifact.backup_path, &artifact.target_path).unwrap();
+        }
+        let error = issue_as(&args, &command, effective_uid()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        let settled = journal_at(&root);
+        assert_eq!(settled.phase, journal::Phase::Superseded);
+        assert!(!settled.daemon_progress.restored && !settled.cli_progress.restored);
+    }
+
+    /// Each check before the settle alone refuses it, and nothing changes:
+    /// unrelated bytes at a target, a backup that is not the previous
+    /// release, no plan anchor, a binding that does not bind the journal,
+    /// an unfinished trial. A journal that changes while the host lock is
+    /// taken is a failed read (75).
+    #[test]
+    fn an_interrupted_swap_is_settled_only_when_every_check_passes() {
+        type Spoil = fn(&Path, &journal::JournalRecord, &mut TrialArgs);
+        let spoils: [(Spoil, &str); 5] = [
+            (
+                |_, record, _| {
+                    std::fs::write(&record.plan.daemon.target_path, b"unrelated").unwrap()
+                },
+                "neither the previous nor the candidate",
+            ),
+            (
+                |_, record, _| std::fs::write(&record.plan.daemon.backup_path, b"other").unwrap(),
+                "does not hold the previous release",
+            ),
+            (|_, _, args| args.plan_anchor = None, "--plan-anchor"),
+            (
+                |root, record, _| {
+                    std::fs::remove_file(
+                        root.join(plan_binding::binding_file_name(&record.transaction_id)),
+                    )
+                    .unwrap()
+                },
+                "plan binding",
+            ),
+            (
+                |root, record, _| {
+                    let host = recovery::Host::new(root.to_path_buf(), record.clone()).unwrap();
+                    let trial = Trial::new(
+                        host.binding().unwrap(),
+                        "alice".into(),
+                        &Clock {
+                            boot: "b".into(),
+                            ms: 1,
+                        },
+                    )
+                    .unwrap();
+                    trial
+                        .save(&root.join(coordinator::TRIAL_FILE_NAME))
+                        .unwrap();
+                },
+                "unfinished trial",
+            ),
+        ];
+        for (spoil, reason) in spoils {
+            let (_dir, root, record) = rooted(journal::Phase::Prepared);
+            let (mut args, command) = matching(&record);
+            spoil(&root, &record, &mut args);
+            let daemon = std::fs::read(&record.plan.daemon.target_path).unwrap();
+            let error = issue_as(&args, &command, effective_uid()).err().unwrap();
+            assert!(start::is_refusal(&error), "{reason}: {error}");
+            assert!(error.to_string().contains(reason), "{reason}: {error}");
+            assert_eq!(
+                journal_at(&root).phase,
+                journal::Phase::Prepared,
+                "{reason}"
+            );
+            assert_eq!(
+                std::fs::read(&record.plan.daemon.target_path).unwrap(),
+                daemon
+            );
+        }
+        let (_dir, root, record) = rooted(journal::Phase::Prepared);
+        let (args, command) = matching(&record);
+        let (again, changed) = (root.clone(), record.clone());
+        tests::BEFORE_SETTLE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                set_phase(&again, &changed, journal::Phase::Probed)
+            }))
+        });
+        let error = issue_as(&args, &command, effective_uid()).err().unwrap();
+        assert!(!start::is_refusal(&error), "{error}");
+        assert_eq!(journal_at(&root).phase, journal::Phase::Probed);
+        assert_eq!(
+            filesystem::hash(&record.plan.daemon.target_path).unwrap(),
+            record.plan.daemon.candidate_sha256,
+            "a failed read restores nothing"
+        );
+    }
+
+    /// The settle takes the host lock: while the CLI lock is held by
+    /// another holder (a producer), the start waits and nothing changes.
+    #[test]
+    fn an_interrupted_swap_waits_for_the_host_lock() {
+        let (_dir, root, record) = rooted(journal::Phase::Prepared);
+        let (args, command) = matching(&record);
+        let cli = recovery::lock(&record.plan.cli.target_path).unwrap();
+        cli.lock().unwrap();
+        let started = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let held = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            drop(cli);
+        });
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            tx.send(()).unwrap();
+        });
+        let error = issue_as(&args, &command, effective_uid()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(350));
+        assert_eq!(journal_at(&root).phase, journal::Phase::Superseded);
+        held.join().unwrap();
+        releaser.join().unwrap();
     }
 
     /// Every mismatch between the launcher argv and the participant is an
@@ -1378,7 +1956,7 @@ mod tests {
     /// not the host root; the link is never followed.
     #[test]
     fn a_daemon_data_directory_that_links_to_the_host_root_is_refused() {
-        let (dir, root, record) = rooted(journal::Phase::Prepared);
+        let (dir, root, record) = rooted(journal::Phase::Idle);
         let (args, command) = matching(&record);
         let link = dir.path().canonicalize().unwrap().join("data-link");
         std::os::unix::fs::symlink(&root, &link).unwrap();
@@ -1460,7 +2038,7 @@ mod tests {
     /// `exec`; a trial start releases it for `Host::locked`.
     #[test]
     fn a_passthrough_keeps_the_daemon_lock_and_a_trial_releases_it() {
-        let (_dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (_dir, _root, record) = rooted(journal::Phase::Idle);
         let (args, command) = matching(&record);
         let mut held = None;
         let uid = effective_uid();
@@ -1500,7 +2078,7 @@ mod tests {
     /// start waits while the producer holds it.
     #[test]
     fn a_start_waits_for_the_producers_daemon_lock() {
-        let (_dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (_dir, _root, record) = rooted(journal::Phase::Idle);
         let (args, command) = matching(&record);
         let producer = recovery::lock(Path::new(&command.executable)).unwrap();
         producer.lock().unwrap();
@@ -1532,7 +2110,7 @@ mod tests {
     /// the producer's lock, the one beside the canonical install target.
     #[test]
     fn a_symlinked_daemon_takes_the_canonical_install_lock() {
-        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (dir, _root, record) = rooted(journal::Phase::Idle);
         let (args, mut command) = matching(&record);
         let link = dir.path().canonicalize().unwrap().join("bin-link");
         std::os::unix::fs::symlink(&record.plan.daemon.target_path, &link).unwrap();
@@ -1571,7 +2149,7 @@ mod tests {
     /// target is refused.
     #[test]
     fn a_passthrough_of_another_daemon_than_the_journals_is_refused() {
-        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (dir, _root, record) = rooted(journal::Phase::Idle);
         let (args, mut command) = matching(&record);
         let other = dir.path().canonicalize().unwrap().join("other-x0xd");
         std::fs::write(&other, b"").unwrap();
@@ -1584,7 +2162,7 @@ mod tests {
     /// and `relock` takes it once the daemon is back.
     #[test]
     fn a_missing_daemon_passes_through_without_the_lock_until_it_is_back() {
-        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (dir, _root, record) = rooted(journal::Phase::Idle);
         let (args, mut command) = matching(&record);
         let target = record.plan.daemon.target_path.clone();
         let base = dir.path().canonicalize().unwrap();
@@ -1622,7 +2200,7 @@ mod tests {
     /// under the lock, and an `exec` that finds it missing releases it.
     #[test]
     fn a_passthrough_execs_only_under_the_install_lock() {
-        let (_dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (_dir, _root, record) = rooted(journal::Phase::Idle);
         let (trial, command) = matching(&record);
         let target = record.plan.daemon.target_path.clone();
         let args = LauncherArgs {
@@ -1662,7 +2240,7 @@ mod tests {
     /// held is a retryable error, not the lock of the wrong file.
     #[test]
     fn a_daemon_path_that_moves_while_locking_is_retried() {
-        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (dir, _root, record) = rooted(journal::Phase::Idle);
         let target = record.plan.daemon.target_path.clone();
         let other = dir.path().canonicalize().unwrap().join("other-x0xd");
         let calls = std::cell::Cell::new(0);
@@ -1749,7 +2327,12 @@ mod tests {
             panic!("no exec of another daemon")
         });
         assert!(start::is_refusal(&error), "{error}");
-        assert!(error.to_string().contains("daemon target"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with(contract::REFUSAL_OTHER_INSTALL),
+            "{error}"
+        );
         assert!(held.is_none());
 
         let (trial, command) = matching(&record);
@@ -1806,7 +2389,7 @@ mod tests {
     /// failed read (75).
     #[test]
     fn a_refusal_at_the_exec_is_final() {
-        let (_dir, root, record) = rooted(journal::Phase::Prepared);
+        let (_dir, root, record) = rooted(journal::Phase::Idle);
         let (trial, command) = matching(&record);
         let args = LauncherArgs {
             trial: Some(trial),
@@ -1829,7 +2412,7 @@ mod tests {
     /// stays so; it is a typed refusal, not a 75 loop.
     #[test]
     fn an_install_lock_that_is_not_a_regular_file_is_refused() {
-        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (dir, _root, record) = rooted(journal::Phase::Idle);
         let (args, command) = matching(&record);
         let lock = recovery::lock_path(&record.plan.daemon.target_path);
         let elsewhere = dir.path().canonicalize().unwrap().join("elsewhere.lock");
@@ -1858,7 +2441,7 @@ mod tests {
         if effective_uid() == 0 {
             return;
         }
-        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (dir, _root, record) = rooted(journal::Phase::Idle);
         let (args, mut command) = matching(&record);
         let bin = dir.path().canonicalize().unwrap().join("ro-bin");
         std::fs::create_dir(&bin).unwrap();
@@ -1876,7 +2459,7 @@ mod tests {
     /// failed read, not a refusal.
     #[test]
     fn the_wait_for_the_install_lock_is_bounded() {
-        let (_dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (_dir, _root, record) = rooted(journal::Phase::Idle);
         let target = &record.plan.daemon.target_path;
         let producer = recovery::lock(target).unwrap();
         producer.lock().unwrap();
@@ -2089,8 +2672,9 @@ mod tests {
     /// not exist) exits 75.
     #[test]
     fn issuer_refusals_exit_78_and_read_errors_75() {
-        let (_dir, root, record) = rooted(journal::Phase::SwappedDaemon);
-        let (args, command) = matching(&record);
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (mut args, command) = matching(&record);
+        args.plan_anchor = None;
         let exit = |args: &TrialArgs| {
             start::start_with(
                 &JournalIssuer {

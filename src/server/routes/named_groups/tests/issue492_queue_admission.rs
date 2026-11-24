@@ -59,6 +59,7 @@ impl Fixture {
         )
         .expect("signed future commit");
         NamedGroupMetadataEvent::MemberRemoved {
+            target_key_package_b64: None,
             group_id: self.info.stable_group_id().to_string(),
             revision: self.info.roster_revision + 4,
             actor: actor.clone(),

@@ -298,6 +298,12 @@ fn launcher_refusal_check(dir: &std::path::Path) -> Option<DoctorCheck> {
     } else {
         "no longer running"
     };
+    if record
+        .reason
+        .starts_with(launcher_contract::REFUSAL_OTHER_INSTALL)
+    {
+        return Some(other_install_check(dir, &record, holding));
+    }
     Some(DoctorCheck {
         status: DoctorCheckStatus::Fail,
         detail: format!(
@@ -310,6 +316,78 @@ fn launcher_refusal_check(dir: &std::path::Path) -> Option<DoctorCheck> {
             "launcher_holding": holding,
         })),
     })
+}
+
+/// The launcher refused because the host journal in this data directory is
+/// for another install pair (`launcher_contract::REFUSAL_OTHER_INSTALL`):
+/// the data directory moved to another install, or two installs share it.
+/// The remedy depends on the journal's phase, which this reads (read only).
+/// A settled journal (`host_committed`, `restored`, `idle`, `superseded`)
+/// of an install that no longer runs on this data directory is history:
+/// stop the job, move the journal and its plan bindings aside, start the
+/// job. If the other install still runs on it, the journal stays (its
+/// launcher may still need it for a trial) and each install needs its own
+/// data directory. Any other phase is an update of the
+/// other install still in progress: leave it, run that install again, or
+/// restore it, until its journal is settled (docs/upgrade-system.md,
+/// "Moving a data root to another install").
+fn other_install_check(
+    dir: &std::path::Path,
+    record: &crate::upgrade::launcher_contract::LauncherRefusal,
+    holding: bool,
+) -> DoctorCheck {
+    use crate::upgrade::journal::{self, Phase, RecordRead};
+    let journal_path = dir.join(journal::JOURNAL_FILE_NAME);
+    let read = std::fs::read(&journal_path)
+        .ok()
+        .map(|bytes| journal::classify_record(&bytes, "journal"));
+    let (settled, summary) = match read {
+        Some(RecordRead::Journal(journal)) => (
+            matches!(
+                journal.phase,
+                Phase::HostCommitted | Phase::Restored | Phase::Idle | Phase::Superseded
+            ),
+            serde_json::json!({
+                "phase": journal.phase,
+                "transaction_id": journal.transaction_id,
+                "daemon_target": journal.plan.daemon.target_path,
+                "cli_target": journal.plan.cli.target_path,
+            }),
+        ),
+        _ => (false, serde_json::json!({ "readable": false })),
+    };
+    let remedy = if settled {
+        format!(
+            "the host journal is settled. If this data directory moved to this install and \
+             the other install no longer runs on it, stop the job, move {} and every \
+             upgrade-plan-binding.*.json in {} aside, then start the job. If the other install \
+             still runs on this data directory, do not move the journal (its launcher may still \
+             need it for a trial); give each install its own data directory",
+            journal::JOURNAL_FILE_NAME,
+            dir.display()
+        )
+    } else {
+        "the host journal is not settled: an update of the other install is still in \
+         progress; do not remove it; run the other install, or restore it, until its journal \
+         is settled"
+            .to_string()
+    };
+    DoctorCheck {
+        status: DoctorCheckStatus::Fail,
+        detail: format!(
+            "x0x-launcher refused to start x0xd: the data directory {} holds the host journal \
+             of another install (launcher pid {}); {remedy}",
+            dir.display(),
+            record.pid
+        ),
+        evidence: Some(serde_json::json!({
+            "launcher_refusal": record,
+            "launcher_holding": holding,
+            "refusal_kind": crate::upgrade::launcher_contract::REFUSAL_OTHER_INSTALL,
+            "host_journal": summary,
+            "host_journal_settled": settled,
+        })),
+    }
 }
 
 fn check_connectivity(health: &Result<serde_json::Value>) -> DoctorCheck {
@@ -418,6 +496,70 @@ pub(crate) fn store_integrity_check(val: &serde_json::Value) -> DoctorCheck {
 mod store_integrity_tests {
     use super::*;
 
+    /// #2012 (#1378 done-when): `x0x doctor` names a failed
+    /// launcher-protected attempt from `/diagnostics/upgrade` `plan`; a
+    /// committed or settled journal, and a legacy handoff, are not one.
+    #[test]
+    fn the_doctor_names_a_failed_launcher_attempt() {
+        let plan = |phase: &str, cause: serde_json::Value| {
+            serde_json::json!({"plan": {
+                "record": "journal", "phase": phase, "cause": cause,
+                "candidate_version": "0.50.0",
+            }})
+        };
+        let failed = failed_attempt(&plan("restored", "failed".into())).expect("failed");
+        assert!(
+            failed.contains("0.50.0") && failed.contains("restored"),
+            "{failed}"
+        );
+        assert!(failed_attempt(&plan("recovery_failed", serde_json::Value::Null)).is_some());
+        assert!(failed_attempt(&plan("superseded", "interrupted".into())).is_some());
+        for settled in ["idle", "host_committed", "superseded", "swapped_cli"] {
+            assert!(
+                failed_attempt(&plan(settled, serde_json::Value::Null)).is_none(),
+                "{settled}"
+            );
+        }
+        assert!(
+            failed_attempt(&serde_json::json!({"plan": {"record": "legacy_handoff"}})).is_none()
+        );
+        assert!(failed_attempt(&serde_json::json!({"plan": null})).is_none());
+    }
+
+    /// #2012 review: the doctor names a companion failure, its path and
+    /// the remedy; none without the record.
+    #[test]
+    fn the_doctor_names_a_failed_companion() {
+        let diagnostics = serde_json::json!({"companion_failure": {
+            "version": "0.50.0", "failures": 2, "last_unix": 100,
+            "detail": "x0x companion failed at /opt/x0x/x0x (denied); nothing was replaced",
+        }});
+        let warning = companion_failure(&diagnostics).expect("warned");
+        assert!(warning.contains("/opt/x0x/x0x"), "{warning}");
+        assert!(
+            warning.contains("0.50.0") && warning.contains("reinstall"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("not changed") && !warning.contains("mixed"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("upgrade-companion-failure.json"),
+            "{warning}"
+        );
+        assert!(warning.contains("POST /upgrade/apply"), "{warning}");
+        let mut mixed = diagnostics.clone();
+        mixed["companion_failure"]["pair_mixed"] = true.into();
+        let warning = companion_failure(&mixed).expect("warned");
+        assert!(warning.contains("manual recovery") && !warning.contains("not changed"));
+        let unreadable = serde_json::json!({"companion_failure": {"record": "unreadable"}});
+        assert!(companion_failure(&unreadable)
+            .unwrap()
+            .contains("cannot be read"));
+        assert!(companion_failure(&serde_json::json!({"companion_failure": null})).is_none());
+    }
+
     /// #1970: a group store at the image limit makes the doctor warn and
     /// name it; `ok` and `full` stores do not.
     #[test]
@@ -499,15 +641,90 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
     } else {
         format!("up to date ({current})")
     };
-    DoctorCheck::ok_with(
-        detail,
-        serde_json::json!({
-            "source": path,
-            "update_available": update_available,
-            "current_version": current,
-            "latest_version": latest,
-        }),
-    )
+    let evidence = serde_json::json!({
+        "source": path,
+        "update_available": update_available,
+        "current_version": current,
+        "latest_version": latest,
+        "launcher_gate": val.get("launcher_gate").cloned().unwrap_or(serde_json::Value::Null),
+        "companion_failure": val.get("companion_failure").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    if let Some(failed) = companion_failure(&val) {
+        return DoctorCheck::warn(format!("{detail}; {failed}"), Some(evidence));
+    }
+    if let Some(failed) = failed_attempt(&val) {
+        return DoctorCheck::warn(format!("{detail}; {failed}"), Some(evidence));
+    }
+    DoctorCheck::ok_with(detail, evidence)
+}
+
+/// A release whose apply failed on the sibling `x0x` (`/diagnostics/upgrade`
+/// `companion_failure`, #2012 review): what happened, the path, and the
+/// remedy, including how to retry before the backoff ends.
+pub(crate) fn companion_failure(diagnostics: &serde_json::Value) -> Option<String> {
+    let failed = diagnostics
+        .get("companion_failure")
+        .filter(|v| v.is_object())?;
+    let record = crate::upgrade::companion_failure::RECORD;
+    if failed.get("record").and_then(|v| v.as_str()) == Some("unreadable") {
+        return Some(format!(
+            "the companion failure record ({record} in the data directory) cannot be read; it \
+             is ignored and holds no release; remove it"
+        ));
+    }
+    let text = |key: &str| {
+        failed
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+    };
+    let number = |key: &str| failed.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let mixed = failed.get("pair_mixed").and_then(|v| v.as_bool()) == Some(true);
+    let outcome = if mixed {
+        "the daemon could not be restored, so a new x0xd runs beside the old x0x and the \
+         install needs manual recovery"
+    } else {
+        "the installed binaries were not changed"
+    };
+    Some(format!(
+        "the update to {} failed {} time(s) on the sibling x0x CLI; {outcome}: {}. Fix that \
+         file (it must be readable, and x0x.backup and x0x.upgrade.lock beside it must be \
+         writable by the daemon's account), or reinstall x0x. This release, also by POST \
+         /upgrade/apply, is retried after unix time {}; to retry it now, remove {record} from \
+         the data directory",
+        text("version"),
+        number("failures"),
+        text("detail"),
+        number("last_unix").saturating_add(crate::upgrade::companion_failure::backoff_secs(
+            u32::try_from(number("failures")).unwrap_or(u32::MAX)
+        ))
+    ))
+}
+
+/// A failed launcher-protected attempt in the host journal that
+/// `/diagnostics/upgrade` reports in `plan` (#2012, #1378): a recorded
+/// cause, or a restored or recovery-failed host.
+pub(crate) fn failed_attempt(diagnostics: &serde_json::Value) -> Option<String> {
+    let plan = diagnostics
+        .get("plan")
+        .filter(|plan| plan.get("record").and_then(|r| r.as_str()) == Some("journal"))?;
+    let phase = plan
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let cause = plan.get("cause").and_then(|v| v.as_str());
+    if cause.is_none() && !matches!(phase, "restored" | "recovery_failed") {
+        return None;
+    }
+    let candidate = plan
+        .get("candidate_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    Some(format!(
+        "the last launcher-protected update to {candidate} did not commit (host journal {phase}, \
+         cause {})",
+        cause.unwrap_or("none")
+    ))
 }
 
 fn write_doctor_text(report: &DoctorReport, out: &mut dyn Write) -> Result<()> {
@@ -4358,6 +4575,74 @@ mod tests {
             down_upgrade_check(Some(dir.path())).detail,
             "skipped: daemon unreachable"
         );
+    }
+
+    /// #2012 (#2171 fourth review): a launcher refusal for the host journal
+    /// of another install is a typed state in doctor. It reads the journal:
+    /// a settled one gets the remedy to move it and its bindings aside; an
+    /// unsettled one is left alone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn doctor_names_the_remedy_for_another_installs_journal() {
+        use crate::upgrade::journal::Phase;
+        use crate::upgrade::launcher_contract::*;
+        use crate::upgrade::prepare::tests as producer;
+        let (_dir, root) = producer::root();
+        producer::prepared_in(&root, producer::input_in(&root));
+        let record = LauncherRefusal {
+            schema: REFUSAL_SCHEMA,
+            reason: format!("{REFUSAL_OTHER_INSTALL}: the host journal is for another install"),
+            pid: std::process::id(),
+            process_start: process_start(std::process::id()).expect("start"),
+            at_unix_ms: 1,
+        };
+        std::fs::write(
+            root.join(REFUSAL_FILE_NAME),
+            serde_json::to_vec(&record).expect("json"),
+        )
+        .expect("write");
+        let check = down_upgrade_check(Some(&root));
+        assert_eq!(check.status, DoctorCheckStatus::Fail);
+        assert!(check.detail.contains("not settled"), "{}", check.detail);
+        assert!(check.detail.contains("do not remove"), "{}", check.detail);
+        let evidence = check.evidence.expect("evidence");
+        assert_eq!(evidence["refusal_kind"], REFUSAL_OTHER_INSTALL);
+        assert_eq!(evidence["host_journal"]["phase"], "swapped_cli");
+        assert_eq!(evidence["host_journal_settled"], false);
+
+        producer::settle(&root, Phase::HostCommitted);
+        let check = down_upgrade_check(Some(&root));
+        assert!(check.detail.contains("is settled"), "{}", check.detail);
+        assert!(
+            check.detail.contains("its own data directory"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("upgrade-plan-binding.*.json"),
+            "{}",
+            check.detail
+        );
+        let evidence = check.evidence.expect("evidence");
+        assert_eq!(evidence["host_journal"]["phase"], "host_committed");
+        assert_eq!(evidence["host_journal_settled"], true);
+
+        // Any other refusal keeps the generic report.
+        let other = LauncherRefusal {
+            reason: "prior child still exists".into(),
+            ..record
+        };
+        std::fs::write(
+            root.join(REFUSAL_FILE_NAME),
+            serde_json::to_vec(&other).expect("json"),
+        )
+        .expect("write");
+        let check = down_upgrade_check(Some(&root));
+        assert!(check
+            .evidence
+            .expect("evidence")
+            .get("refusal_kind")
+            .is_none());
     }
 
     /// Bundle allow-list coverage for the #2019 launcher-refusal doctor check

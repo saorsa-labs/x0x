@@ -276,21 +276,31 @@ pub(super) fn uncommitted() -> io::Error {
 }
 
 /// Retire a provisional trial whose host is committed: under the host lock,
-/// a fresh read, saved `Committed`.
+/// a fresh read, saved `Committed`. When that makes every participant's
+/// trial Committed, the same locked step settles the host journal to `Idle`
+/// (#2012): the transaction is history, the installer may change the
+/// launcher and its anchor again, and the next start is an ordinary one.
+/// A host already settled to `Idle` by a peer's retire is retired too, for
+/// a trial that is already Committed.
 pub(super) fn retire(host: &recovery::Host, path: &Path, trial: &mut Trial) -> io::Result<Retire> {
     let (binding, instance) = (trial.binding.clone(), trial.instance.clone());
     let retired = host.locked(|record| {
-        if record.phase != journal::Phase::HostCommitted {
+        let settled = record.phase == journal::Phase::Idle;
+        if record.phase != journal::Phase::HostCommitted && !settled {
             return Ok(Err(Retire::NotCommitted));
         }
         let mut current = Trial::load(path, &binding, &instance)?;
         match current.phase {
-            Phase::Provisional => {
+            Phase::Provisional if !settled => {
                 current.phase = Phase::Committed;
                 current.save(path)?;
             }
             Phase::Committed => {}
+            _ if settled => return Ok(Err(Retire::NotCommitted)),
             _ => return Ok(Err(Retire::Uncommitted)),
+        }
+        if !settled {
+            settle_idle(host, record, &binding)?;
         }
         Ok(Ok(current))
     })?;
@@ -301,6 +311,29 @@ pub(super) fn retire(host: &recovery::Host, path: &Path, trial: &mut Trial) -> i
         }
         Err(found) => found,
     })
+}
+
+/// Under the host lock with the journal HostCommitted: write `Idle` when
+/// every participant's trial record of this transaction is Committed. A
+/// trial that is missing, of another transaction or not yet Committed
+/// leaves the journal HostCommitted; that participant's own retire settles
+/// it later. The write is the journal's atomic replace (file and directory
+/// synced); a crash before it leaves HostCommitted, which the next retire
+/// on any participant's start settles.
+fn settle_idle(
+    host: &recovery::Host,
+    record: &mut journal::JournalRecord,
+    binding: &Binding,
+) -> io::Result<()> {
+    for participant in &host.plan().participants {
+        let path = coordinator::trial_path(participant);
+        match Trial::load(&path, binding, &participant.instance_id) {
+            Ok(trial) if trial.phase == Phase::Committed => {}
+            _ => return Ok(()),
+        }
+    }
+    record.phase = journal::Phase::Idle;
+    host.save_settled(record)
 }
 
 /// ADR 0094 S4: never overlap a surviving process of an earlier start.

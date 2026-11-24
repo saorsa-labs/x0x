@@ -7323,6 +7323,7 @@ async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result
     );
     let b_hex = hex::encode(b_kp.agent_id().as_bytes());
     let fork_event = NamedGroupMetadataEvent::MemberRemoved {
+        target_key_package_b64: None,
         group_id: stage.group_id.clone(),
         revision: revision_before.saturating_add(1),
         actor: b_hex.clone(),

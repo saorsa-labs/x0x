@@ -106,6 +106,17 @@ impl Host {
         action(&mut record)
     }
 
+    /// Save a settled phase (Idle, Superseded) under the host lock.
+    pub(super) fn save_settled(&self, record: &mut journal::JournalRecord) -> io::Result<()> {
+        if !matches!(
+            record.phase,
+            journal::Phase::Idle | journal::Phase::Superseded
+        ) {
+            return Err(invalid("not a settled phase"));
+        }
+        self.save(record)
+    }
+
     fn save(&self, record: &mut journal::JournalRecord) -> io::Result<()> {
         record.sequence = record
             .sequence

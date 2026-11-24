@@ -13,7 +13,10 @@ pub use auth::{gui_idle_timeout, DEFAULT_GUI_IDLE_TIMEOUT_MINUTES, MAX_GUI_IDLE_
 pub mod config;
 mod crdt_subscriptions;
 mod daemon_runtime;
-pub use daemon_runtime::{run_daemon_runtime, DAEMON_MAIN_THREAD_NAME, DAEMON_THREAD_STACK_BYTES};
+pub use daemon_runtime::{
+    run_cli_runtime, run_daemon_runtime, CLI_MAIN_THREAD_NAME, DAEMON_MAIN_THREAD_NAME,
+    DAEMON_THREAD_STACK_BYTES,
+};
 mod data_read;
 mod delegations;
 mod delivery_gate;
@@ -679,6 +682,10 @@ async fn serve_with_options_inner(
         }
         (None, None) => None,
     };
+    #[cfg(unix)]
+    crate::upgrade::producer::record_identity_root(
+        identity_dir.clone().or_else(crate::storage::x0x_home_dir),
+    );
 
     // #645: a CONFIGURED identity_dir shared across two different data dirs
     // still let two daemons load the same machine/agent keys and both sign

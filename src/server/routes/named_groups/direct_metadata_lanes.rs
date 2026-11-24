@@ -177,10 +177,7 @@ pub(in crate::server) async fn run_direct_metadata_listener(
         }
         // ADR 0110 §4b(1): owner-recovery mandates and commits ride the
         // same direct carrier; they are verified off this loop.
-        if msg
-            .payload
-            .starts_with(x0x::groups::owner_recovery::OWNER_RECOVERY_PREFIX)
-        {
+        if x0x::groups::owner_recovery::is_owner_recovery_payload(&msg.payload) {
             super::revocation_eviction::owner_recovery::spawn_receipt(
                 &state,
                 msg.sender,

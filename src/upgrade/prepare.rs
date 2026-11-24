@@ -17,7 +17,8 @@
 //! by path and read what it writes with the launcher's own issuer. The live
 //! observation of the running daemon is in `prepare_live` (library only).
 //!
-//! Dormant: no apply path calls it yet.
+//! The apply worker calls it only through `producer`, whose gate stays
+//! closed while `launcher_contract::LAUNCHER_ENABLED` is false.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -254,6 +255,21 @@ fn remove_bindings_except(data_root: &Path, keep: &[Option<&str>]) {
     }
 }
 
+/// The stage lock of a data root: `<data_root>/upgrade-stage.lock`.
+pub(crate) const STAGE_LOCK_NAME: &str = "upgrade-stage.lock";
+
+/// Take the stage lock of `data_root` (#2171 fourth review): every `stage`
+/// holds it from its journal read to its last binding removal, so two
+/// stages in one data root never interleave, whatever install pair each
+/// is for. Without it, two pairs that stage for the first time in a data
+/// root with no journal hold different install locks, and each could
+/// remove the other's new binding. It is taken after the host lock and
+/// held while nothing else is waited for, so it cannot deadlock.
+#[cfg(unix)]
+fn stage_lock(data_root: &Path) -> io::Result<InstallLock> {
+    InstallLock::take(lock_file(&data_root.join(STAGE_LOCK_NAME))?)
+}
+
 /// The new transaction's binding write. A test can make it fail at one
 /// barrier step (`tests::fail_binding_write`).
 #[cfg(unix)]
@@ -274,6 +290,10 @@ fn write_binding(path: &Path, binding: &plan_binding::PlanBinding) -> io::Result
 /// (`tests::fail_journal_write`), as a crash or a full disk would.
 #[cfg(unix)]
 fn write_staged_journal(path: &Path, record: &JournalRecord) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = tests::BEFORE_JOURNAL_WRITE.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     #[cfg(test)]
     if let Some(step) = tests::JOURNAL_FAILURE.with(std::cell::Cell::take) {
         return journal::write_record_with_failure(path, record, step);
@@ -436,6 +456,13 @@ impl HostLock {
         Ok([cli, daemon])
     }
 
+    /// The two locked files, CLI first, still held until they are dropped:
+    /// the apply worker hands them to the restart owner (#2012).
+    pub(crate) fn into_files(self) -> (std::fs::File, std::fs::File) {
+        let [cli, daemon] = self._locks;
+        (cli.into_file(), daemon.into_file())
+    }
+
     fn held(plan: &FrozenPlan, cli: InstallLock, daemon: InstallLock) -> Self {
         Self {
             cli: plan.cli.target_path.clone(),
@@ -514,6 +541,22 @@ impl Prepared {
         plan: FrozenPlan,
         anchor: &Anchored,
     ) -> io::Result<Self> {
+        Self::stage_reading_anchor(lock, data_root, transaction_id, plan, || Ok(anchor.clone()))
+    }
+
+    /// `stage`, with the anchor read by `read_anchor` while the data
+    /// root's stage lock is held (#2012). The installer takes the same lock
+    /// around its anchor change and its journal check, so either the
+    /// installer sees this transaction's Staged journal and refuses, or
+    /// this stage reads the anchor the installer wrote.
+    #[cfg(unix)]
+    pub(crate) fn stage_reading_anchor(
+        lock: &HostLock,
+        data_root: &Path,
+        transaction_id: &str,
+        plan: FrozenPlan,
+        read_anchor: impl FnOnce() -> io::Result<Anchored>,
+    ) -> io::Result<Self> {
         lock.covers(&plan)?;
         check_root(data_root)?;
         if !plan.participants.iter().any(|p| p.data_root == data_root) {
@@ -525,6 +568,7 @@ impl Prepared {
         if transaction_id.trim().is_empty() {
             return Err(refused("empty transaction id"));
         }
+        let _stage = stage_lock(data_root)?;
         let path = data_root.join(journal::JOURNAL_FILE_NAME);
         let mut current = None;
         match std::fs::symlink_metadata(&path) {
@@ -571,6 +615,7 @@ impl Prepared {
                 }
             }
         }
+        let anchor = read_anchor()?;
         let record = record(transaction_id, plan, Phase::Staged);
         checked(&record)?;
         let binding = anchor
@@ -672,6 +717,62 @@ impl Prepared {
         self.record = next;
         Ok(())
     }
+
+    /// Settle a transaction this run is giving up before any trial
+    /// (#2012): write `Superseded`, after the caller restored every swapped
+    /// artifact (`restored`: daemon, CLI). Allowed from Staged up to and
+    /// including SwappedCli, only for the journal this run last wrote. The
+    /// launcher passes through a Superseded journal (the previous pair is
+    /// installed) and the next stage replaces it.
+    pub(crate) fn abandon(&mut self, lock: &HostLock, restored: [bool; 2]) -> io::Result<()> {
+        lock.covers(&self.record.plan)?;
+        if !FORWARD.contains(&self.record.phase) {
+            return Err(refused(format!(
+                "a {:?} transaction is not abandoned by its producer",
+                self.record.phase
+            )));
+        }
+        let on_disk = journal::read_auxiliary_record(&self.path)?;
+        let unchanged = match journal::classify_record(&on_disk, "journal") {
+            journal::RecordRead::Journal(current) => {
+                serde_json::to_vec(&current).map_err(io::Error::other)?
+                    == serde_json::to_vec(&self.record).map_err(io::Error::other)?
+            }
+            _ => false,
+        };
+        if !unchanged {
+            return Err(refused("the host journal changed since this run wrote it"));
+        }
+        for (index, artifact) in [&self.record.plan.daemon, &self.record.plan.cli]
+            .into_iter()
+            .enumerate()
+        {
+            if sha256_of(&artifact.target_path)? != artifact.previous_sha256 {
+                return Err(refused(format!(
+                    "the {} target does not hold the previous release; not abandoned",
+                    if index == 0 { "daemon" } else { "cli" }
+                )));
+            }
+        }
+        let mut next = self.record.clone();
+        for (progress, restored) in [&mut next.daemon_progress, &mut next.cli_progress]
+            .into_iter()
+            .zip(restored)
+        {
+            if restored {
+                progress.restored = true;
+            }
+        }
+        next.phase = Phase::Superseded;
+        next.sequence = next
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| refused("journal sequence overflow"))?;
+        checked(&next)?;
+        journal::write_record(&self.path, &next)?;
+        self.record = next;
+        Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -689,6 +790,13 @@ pub(crate) mod tests {
         /// The barrier step at which this thread's next binding write fails.
         pub(crate) static BINDING_FAILURE: std::cell::Cell<Option<journal::BarrierStep>> =
             const { std::cell::Cell::new(None) };
+    }
+
+    thread_local! {
+        /// Runs once, on this thread, just before the next Staged journal
+        /// write, after the new binding is durable.
+        pub(crate) static BEFORE_JOURNAL_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// Make this thread's next binding write fail at `step`.
@@ -949,40 +1057,110 @@ pub(crate) mod tests {
         }
     }
 
-    /// #2171 review: over a settled journal for another install pair, a
-    /// stage is refused and changes nothing.
-    #[test]
-    fn staging_refuses_another_install_pair_over_a_journal() {
-        let (_dir, root) = root();
-        let plan = freeze_plan(input_in(&root)).unwrap();
-        let lock = HostLock::acquire(&plan).unwrap();
-        let anchor = plan_binding::test_anchored(&plan);
-        Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).unwrap();
-        settle(&root, Phase::HostCommitted);
-        drop(lock);
-        let (_other_dir, other_root) = super::tests::root();
-        let mut other = freeze_plan(input_in(&other_root)).unwrap();
-        // The other pair, staged into this data root.
-        other.participants = plan.participants.clone();
+    /// The plan of another install pair staged into `root`: the daemon
+    /// target, the CLI target or both (`daemon`, `cli`) from a pair in
+    /// another directory, the participants `plan`'s.
+    fn other_pair(plan: &FrozenPlan, daemon: bool, cli: bool) -> (tempfile::TempDir, FrozenPlan) {
+        let (other_dir, other_root) = super::tests::root();
+        let fresh = freeze_plan(input_in(&other_root)).unwrap();
+        let mut other = plan.clone();
+        if daemon {
+            other.daemon = fresh.daemon;
+        }
+        if cli {
+            other.cli = fresh.cli;
+        }
         for participant in &mut other.participants {
             participant.executable = other.daemon.target_path.clone();
             participant.argv[0] = other.daemon.target_path.to_string_lossy().into_owned();
         }
-        let other_lock = HostLock::acquire(&other).unwrap();
-        let other_anchor = plan_binding::test_anchored(&other);
-        let before = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
-        let error =
-            Prepared::stage(&other_lock, &root, "tx-2", other, &other_anchor).expect_err("refused");
-        assert!(
-            error.to_string().contains("another install pair"),
-            "{error}"
-        );
-        assert_eq!(
-            std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap(),
-            before
-        );
-        assert!(root.join(plan_binding::binding_file_name("tx-1")).exists());
-        assert!(!root.join(plan_binding::binding_file_name("tx-2")).exists());
+        (other_dir, other)
+    }
+
+    /// #2171 review: over a settled journal for another install pair, a
+    /// stage is refused and changes nothing. Each target is compared on
+    /// its own: a pair that differs only in the daemon target, or only in
+    /// the CLI target, is another pair.
+    #[test]
+    fn staging_refuses_another_install_pair_over_a_journal() {
+        for (daemon, cli) in [(true, false), (false, true), (true, true)] {
+            let (_dir, root) = root();
+            let plan = freeze_plan(input_in(&root)).unwrap();
+            let lock = HostLock::acquire(&plan).unwrap();
+            let anchor = plan_binding::test_anchored(&plan);
+            Prepared::stage(&lock, &root, "tx-1", plan.clone(), &anchor).unwrap();
+            settle(&root, Phase::HostCommitted);
+            drop(lock);
+            let (_other_dir, other) = other_pair(&plan, daemon, cli);
+            let other_lock = HostLock::acquire(&other).unwrap();
+            let other_anchor = plan_binding::test_anchored(&other);
+            let before = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+            let error = Prepared::stage(&other_lock, &root, "tx-2", other, &other_anchor)
+                .expect_err("refused");
+            let case = format!("daemon differs {daemon}, cli differs {cli}");
+            assert!(
+                error.to_string().contains("another install pair"),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap(),
+                before,
+                "{case}"
+            );
+            assert!(root.join(plan_binding::binding_file_name("tx-1")).exists());
+            assert!(!root.join(plan_binding::binding_file_name("tx-2")).exists());
+        }
+    }
+
+    /// #2171 fourth review: two install pairs that stage for the first time
+    /// in one data root (no journal yet) hold different install locks. The
+    /// data root's stage lock still keeps them apart: the second waits for
+    /// the first, then sees its Staged journal in flight and is refused, so
+    /// the first journal keeps its binding. Without the stage lock the
+    /// second runs inside the first and removes its binding.
+    #[test]
+    fn first_stages_of_two_pairs_in_one_data_root_never_interleave() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let (_other_dir, other) = other_pair(&plan, true, true);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let racer_root = root.clone();
+        let racer = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let racer_slot = racer.clone();
+        BEFORE_JOURNAL_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let thread = std::thread::spawn(move || {
+                    let other_lock = HostLock::acquire(&other).unwrap();
+                    let result = stage(&other_lock, &racer_root, "tx-other", other).map(drop);
+                    let _ = sender.send(());
+                    result
+                });
+                // Give the racing stage time to run to its end if it can.
+                let finished = receiver
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .is_ok();
+                *racer_slot.lock().unwrap() = Some((thread, finished));
+            }))
+        });
+        stage(&lock, &root, "tx-first", plan).unwrap();
+        let (thread, finished_inside) = racer.lock().unwrap().take().expect("the hook ran");
+        let raced = thread.join().unwrap();
+        assert!(!finished_inside, "the second stage ran inside the first");
+        let error = raced.expect_err("the second stage is refused");
+        assert!(error.to_string().contains("in flight"), "{error}");
+        let bytes = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+        let journal::RecordRead::Journal(record) = journal::classify_record(&bytes, "journal")
+        else {
+            panic!("no journal");
+        };
+        assert_eq!(record.transaction_id, "tx-first");
+        assert!(root
+            .join(plan_binding::binding_file_name("tx-first"))
+            .exists());
+        assert!(!root
+            .join(plan_binding::binding_file_name("tx-other"))
+            .exists());
     }
 
     /// #2171 review: a transaction id equal to the current journal's is
@@ -1238,5 +1416,68 @@ pub(crate) mod tests {
         std::fs::write(&target, b"candidate-daemon").unwrap();
         prepared.advance(&lock, Phase::SwappedDaemon).unwrap();
         assert!(prepared.advance(&lock, Phase::Prepared).is_err());
+    }
+
+    /// #2012: the producer gives up a transaction only over the previous
+    /// pair, from Staged up to SwappedCli, and only the journal it last
+    /// wrote. The result is Superseded, which no longer blocks an apply and
+    /// opens the host-commit gate. Red: drop the previous-pair check.
+    #[test]
+    fn an_abandoned_transaction_is_superseded_only_over_the_previous_pair() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let mut prepared = stage(&lock, &root, "tx", plan).unwrap();
+        prepared.advance(&lock, Phase::Prepared).unwrap();
+        let daemon = prepared.record().plan.daemon.clone();
+        std::fs::copy(&daemon.target_path, root.join("candidate")).unwrap();
+        std::fs::copy(&daemon.backup_path, &daemon.target_path).unwrap();
+        // The daemon now holds the previous release; the CLI target too.
+        let cli = prepared.record().plan.cli.clone();
+        std::fs::copy(&cli.backup_path, &cli.target_path).unwrap();
+        std::fs::write(&daemon.target_path, b"neither").unwrap();
+        assert!(prepared.abandon(&lock, [true, false]).is_err());
+        assert_eq!(prepared.record().phase, Phase::Prepared);
+        std::fs::copy(&daemon.backup_path, &daemon.target_path).unwrap();
+        assert!(journal::read_boot_records(&root).blocks_apply());
+        assert!(!journal::host_commit_gate_open(&root));
+        prepared.abandon(&lock, [true, false]).unwrap();
+        assert_eq!(prepared.record().phase, Phase::Superseded);
+        assert!(prepared.record().daemon_progress.restored);
+        assert!(!journal::read_boot_records(&root).blocks_apply());
+        assert!(journal::host_commit_gate_open(&root));
+        assert!(
+            prepared.abandon(&lock, [true, true]).is_err(),
+            "settled already"
+        );
+    }
+
+    /// #2012: of the journal phases, only Idle and Superseded let a later
+    /// apply through (`blocks_apply`); HostCommitted, Idle and Superseded
+    /// open the host-commit gate.
+    #[test]
+    fn only_settled_journals_let_an_apply_through() {
+        let (_dir, root) = root();
+        prepared_in(&root, input_in(&root));
+        for (phase, blocks, gate) in [
+            (Phase::Staged, true, false),
+            (Phase::SwappedCli, true, false),
+            (Phase::HostCommitted, true, true),
+            (Phase::Restored, true, false),
+            (Phase::RecoveryFailed, true, false),
+            (Phase::Idle, false, true),
+            (Phase::Superseded, false, true),
+        ] {
+            settle(&root, phase);
+            assert_eq!(
+                journal::read_boot_records(&root).blocks_apply(),
+                blocks,
+                "{phase:?}"
+            );
+            assert_eq!(journal::host_commit_gate_open(&root), gate, "{phase:?}");
+        }
+        // A handoff record still blocks, whatever the journal.
+        std::fs::write(root.join(journal::HANDOFF_FILE_NAME), b"{").unwrap();
+        assert!(journal::read_boot_records(&root).blocks_apply());
     }
 }

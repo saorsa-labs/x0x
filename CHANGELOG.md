@@ -14,6 +14,98 @@ All notable changes to this project will be documented in this file.
   `windows-x64` keeps the system allocator, because jemalloc does not
   support MSVC. In the v0.49.1 local soak, glibc-malloc nodes grew +5 to
   +12 MB/h under load and a jemalloc node +0.37 MB/h.
+- **Self-update replaces x0xd before x0x and fails as a pair (#2012; A14
+  amendment of 23 Nov 2026).** An apply that also replaces the sibling `x0x`
+  now swaps `x0xd` first. A sibling `x0x` that cannot be locked fails the
+  apply before any file changes, and one whose swap fails makes the apply
+  restore `x0xd` and fail with no restart (before, the failure was only a
+  warning and `x0xd` was upgraded alone). On Windows a release archive
+  without a usable `x0x.exe` now fails the apply too. A companion failure is
+  recorded and shown by `/health`, `GET /diagnostics/upgrade`
+  (`companion_failure`) and `x0x doctor` with the path and the remedy while
+  that release is newer than the running daemon; a successful apply removes
+  the record. The same release is not applied again, by any apply including
+  `POST /upgrade/apply`, for 30 minutes, doubling up to 24 hours; removing
+  `upgrade-companion-failure.json` from the data directory allows a retry at
+  once. A corrupt record is reported and never holds a release. The restart owner keeps both install locks until the process
+  exits, also through the HTTP apply's 750 ms delayed restart; on Unix, inside
+  the daemon, a lock wait during that time (another apply, `--clear-hold`, a
+  skill update, a probe retry) fails at once with "restart in progress". A
+  power loss between the two renames now leaves the new `x0xd` beside the
+  old `x0x` until the next release. A successful apply installs the same
+  files and restarts as before.
+- **Launcher enable step 3: gated producer and journal end of life (#2012).**
+  The daemon's apply path can write the host journal through SwappedCli, but
+  only behind a gate that is closed in this release (`LAUNCHER_ENABLED` is
+  false): a launcher-bound systemd unit with its drop-in in place, a plan
+  anchor naming exactly this one instance, and a launcher that answers
+  `x0x-launcher --capabilities` with `trial-v1`. The gate's last decision is
+  in `GET /diagnostics/upgrade` (`launcher_gate`). Idle and Superseded
+  journals no longer refuse an apply; the dormant launcher's retire writes
+  Idle, and a start that finds a swap interrupted before SwappedCli restores
+  the previous files and writes Superseded. The installer now also takes the
+  data root's stage lock. `/health` (`inputs.upgrade.journal`) and
+  `x0x doctor` show a failed launcher-protected attempt.
+
+- **Owner recovery removes every revoked leaf and the held creator's leaf in
+  one TreeKEM commit (`OwnerRecoveryV2`), and a seat with no leaf can be
+  removed (#2139, #2197; A09, A15 and A08 amendments of 23 Nov 2026).** A
+  TreeKEM owner recovery that excludes the creator held on its own expired
+  certificate, or removes two or more leaves, now sends a V2 frame (prefix
+  `X0XORC2`, capability bit 23 `owner_recovery_v2`). Its one commit, made by
+  saorsa-mls `remove_members`, gives none of the removed leaves the new epoch;
+  the creator stays seated with no leaf. Receivers check that the commit
+  removes exactly those leaves and read the creator's expiry at the author's
+  signed anchor. Other recoveries are V1, unchanged. An admin's removal, ban
+  or eviction of a seat that provably has no leaf is now roster-only (no
+  TreeKEM commit), so the excluded creator can be removed and invited again.
+  saorsa-mls is now 0.3.10. **Upgrade notes:** as for V1 (ADR 0110 D76), a
+  survivor whose current advert lacks bit 23 holds a needed V2 recovery
+  (`waiting_for_receiver_upgrade` with `"capability": "owner_recovery_v2"`);
+  a survivor with no current advert is not written the frame, is listed under
+  `receiver_upgrade_members`, and catches up after it upgrades. V1 is never
+  sent instead. New statuses: `recovery_commit_failed` (a commit attempt
+  failed and is retried) and, on the excluded creator's node,
+  `local_seat.state: "excluded_by_owner_recovery"`; on that node
+  `DELETE /groups/:id` drops only the local copy, and after an admin removes
+  the seat a fresh invite starts an ordinary join (the admission is the
+  existing join path, and the owner must re-certify the creator first,
+  because an owner-certified add needs a valid certificate). A named invite
+  for that agent minted before the removal is refused
+  (`remove_leafless_seat_first`); an open invite is not checked, and a join
+  on it before the removal is refused as already a member. `MemberRemoved` gains the
+  optional `target_key_package_b64` for the roster-only removal (older
+  receivers ignore it). A 0.49.x node applies
+  nothing from a V2 frame and refuses a roster-only removal of a seated
+  member; an author downgraded to 0.49.x after committing V2 can resend the
+  V2 frame to bit-7 members, which apply nothing. Limits: a creator not yet
+  expired at the anchor keeps its leaf; giving a still-seated creator its
+  leaf back after re-certification is open (#2197); the exclusion reads only
+  the committed certificate, so an announced but uncommitted renewal does not
+  stop it.
+- **Launcher enable step 2: data-root stage lock, installer plan anchor and
+  a signed launcher asset (#2012; A14 amendment of 22 Nov 2026).** The
+  prepare producer holds a lock on the data root
+  (`upgrade-stage.lock`) for every stage, so two install pairs staging in
+  one data root never interleave. The dormant launcher checks a plan
+  against its anchor before it creates any lock file at the plan's daemon
+  target, does not wait on its own lock when the plan names the daemon
+  through a symlinked directory, and reports a host journal of another
+  install with the typed reason `other-install-journal`, which `x0x doctor`
+  shows with its remedy. `.deployment/install.sh --launcher` now writes one
+  root-owned plan anchor per install (`/etc/x0x/launcher/install-<key>.anchor.json`,
+  shared by every unit of that install that it binds) and adds
+  `--plan-anchor` to the drop-in. It changes the launcher, the drop-in and
+  the anchor only when no data root of the install holds a journal other
+  than an idle or superseded one, runs one install at a time per anchor
+  directory, and never leaves the anchor naming a unit without its drop-in.
+  With no path it fetches and GPG-verifies the
+  `x0x-launcher-<platform>.tar.gz` release asset (Linux x64 and ARM64),
+  which releases carry only once the separate release workflow change
+  (#2190) lands; until then it fails closed and `--launcher PATH` is used. The fleet's `x0xd-443` units cannot be bound
+  yet, so fleet hosts have no trial. The launcher is still dormant (`ENABLED` is
+  false) and no apply path calls the producer, so no install changes
+  behaviour.
 - **Launcher journal integrity binding (#2012, design B4; A14 amendment of
   22 Nov 2026).** The launcher argv's trial form takes an optional
   `--plan-anchor <path>`, which names a root-owned file that lists the
@@ -40,6 +132,22 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **jemalloc builds of `x0xd` apply their jemalloc options (#1172; A06
+  amendment of 23 Nov 2026).** The options were exported as `malloc_conf`,
+  which the `_rjem_`-prefixed jemalloc of `tikv-jemalloc-sys` never reads,
+  so a `--features jemalloc` build ran with jemalloc's defaults
+  (`dirty_decay_ms` 10000, no background thread). They are now exported as
+  `_rjem_malloc_conf`: `dirty_decay_ms:1000,muzzy_decay_ms:0`, plus
+  `background_thread:true` on Linux glibc only. On macOS jemalloc has no
+  background thread (asked for one, it prints a warning and runs partly
+  initialised); tikv-jemalloc-sys marks musl as not supported, so it is
+  left off there too (untested at run time). `abort_conf:true` is
+  dropped, so a bad `_RJEM_MALLOC_CONF` value gives a jemalloc warning,
+  not an abort at start. `GET /status` gains an additive `allocator`
+  object (`name` `"jemalloc"` when the installed global allocator is
+  jemalloc, else `"system"`, and the effective jemalloc options).
+  Release builds do not enable `--features jemalloc` yet, so released
+  binaries are not changed by this fix.
 - **A renewed or live-announced certificate keeps a rider's roster mode
   (#2158; A04 amendment of 22 Nov 2026).** `GET /owner/agents` (and
   placement minting) showed a rider as `acp`, without its label, once a
@@ -108,6 +216,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The `x0x` CLI could crash with a stack overflow on Windows (#1764; A11
+  amendment of 22 Nov 2026).** A debug `x0x autostart` on a hosted Windows
+  runner exited with `STATUS_STACK_OVERFLOW` (0xC00000FD). The CLI ran its
+  async main on the process main thread, which has 1 MiB of stack on Windows,
+  and building the clap command tree there needs more: on a macOS arm64 debug
+  build it overflowed a 1.5 MiB thread and fit in 2 MiB, and the old debug
+  `x0x --version` aborted with the main stack limited to 1 MiB. The CLI now
+  runs on a thread named `x0x-main` with an 8 MiB stack, as `x0xd` does
+  since #2083. Release builds were not measured here; the `ci-full.yml`
+  Windows job now runs `--version`, `--help` and `autostart --help` on both
+  the debug and the release `x0x.exe`. Exit codes are unchanged, except that
+  a failure to start the CLI runtime now prints an error and exits 1 instead
+  of panicking.
 - **Package size:** the v0.49.0 crate was 12.4 MiB compressed and crates.io
   rejected it (413, 10 MiB limit). The `exclude` list now drops `tests/` (except
   the two `[[test]]` targets), `docs/`, `issues/`, `scripts/`, `.github/`,

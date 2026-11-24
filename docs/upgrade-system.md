@@ -185,6 +185,57 @@ that daemon at a different version does not get the hint. Apply still
 replaces that sibling. `x0x --name <instance>` and `x0x --api <address>`
 select that daemon for `--check` and `--apply`.
 
+**Pair order and lock custody (#2012).** An apply that replaces the sibling
+`x0x` replaces `x0xd` first, then `x0x`: the order the host journal records
+(`SwappedDaemon`, then `SwappedCli`). A sibling `x0x` that cannot be locked
+fails the apply before any file changes. A sibling `x0x` whose swap fails
+(an error, or a replace that rolled itself back) makes the apply restore the
+`x0xd` it swapped and fail; no restart is requested. If that restore also
+fails, the apply fails with an error that says the pair is mixed and needs
+manual recovery. On Windows a release archive without a usable `x0x.exe`
+fails the apply too (nothing is replaced): an unattended host then keeps a
+matching pair instead of a new daemon beside an old CLI, and the failure is
+reported as below. In 0.49.1 and earlier a failed companion only logged a
+warning, and the daemon was upgraded alone.
+
+A companion failure is recorded in `<data_root>/upgrade-companion-failure.json`
+(mode 0600, synced; release, the error naming the `x0x` path, the count, the
+time, and whether the pair was left mixed). The recorded failures are the
+companion's lock and swap failures and, on Windows, an archive without a
+usable `x0x.exe`; on Unix an archive without `x0x` fails earlier, at the probe
+extraction, and is not recorded. `/health` (`inputs.upgrade.companion_failure`,
+loopback or owner only; the redacted reason names neither the release nor the
+count), `GET /diagnostics/upgrade` (`companion_failure`) and `x0x doctor` show
+it while its release is newer than the running daemon, with the remedy: make
+the file readable and `x0x.backup` and `x0x.upgrade.lock` beside it writable by
+the daemon's account, or reinstall `x0x`. The same release is not applied
+again, by any apply including an operator's `POST /upgrade/apply`, for 30
+minutes after the first such failure, doubling per further failure up to 24
+hours; a newer release is tried at once, removing the record allows a retry at
+once, and a wait more than 24 hours ahead (a clock stepped back) is ignored. A
+successful apply removes the record. A record that cannot be read is reported
+(`{"record": "unreadable"}`, a degraded `/health` reason, a doctor warning) and
+never holds a release.
+
+Crash window: the two renames are separate steps. A power loss or kill
+between them leaves the new `x0xd` beside the old `x0x`. Nothing repairs this
+until the next release is applied (with 0.49.1's order it was the old `x0xd`
+beside the new `x0x`, which the next update cycle replaced).
+
+The apply worker hands both install locks (`<x0x>.upgrade.lock`,
+`<x0xd>.upgrade.lock`) to the restart owner. The immediate owner keeps them
+until the process exits. The HTTP apply's deferred owner keeps them through
+its 750 ms delay and the restart. While they are held, no other process that
+takes these locks swaps the install between the swap and the exit. Not every
+reader takes them: `install.sh --binary` does not, and the dormant launcher
+takes no lock. On Unix, inside the daemon, every wait for these locks (a
+second apply, `x0x upgrade --clear-hold`, a skill update, the probe-retry loop)
+fails with "restart in progress" instead of waiting, at once or at its next
+20 ms poll, so it cannot hold up the restart's shutdown drain. On Windows only
+a wait that starts after the restart owner took the locks fails at once; one
+that already started still blocks. A restart that is refused (and restores the
+binaries) releases the locks when it returns.
+
 A daemon apply that finds no sibling `x0x` records that the file is missing
 at debug level. It does not warn. `POST /upgrade/apply` and `x0x doctor` do
 not carry a companion status field. A14 plans a `cli_status` value of
@@ -398,11 +449,69 @@ SKILL remains unchanged. A later installer must enforce the applicable gate:
 host commit on protected paths, or matching candidate bytes and stable local
 health on unprotected paths under D195. It must retain the prior guide.
 
-#### Prepare producer (#2012, dormant)
+#### Prepare producer (#2012, gated and dormant)
 
 `upgrade::prepare` writes the prepared host journal
 (`<data_root>/upgrade-journal.json`) that the launcher-side issuer, the
-launcher's `Host::new` and the arm handler read. No apply path calls it yet.
+launcher's `Host::new` and the arm handler read. The daemon's apply worker
+calls it only through `upgrade::producer`, behind a gate that is closed in
+this build.
+
+**The gate.** An `x0xd` apply evaluates it after the restart plan and the
+download, and records the decision (`GET /diagnostics/upgrade`
+`launcher_gate`: `open`, `reason`, `plan_anchor`). It is open only when all
+of these hold, in this order:
+
+1. `launcher_contract::LAUNCHER_ENABLED` is true. It is false, so the gate
+   is closed on every host and no launcher is run;
+2. the restart plan is `SupervisedExit`;
+3. the systemd readback of this instance found a loaded `ExecStart` that runs
+   `x0x-launcher` in the trial form with `--plan-anchor`, whose `--host-root`
+   is this daemon's data root;
+4. systemd reports `NeedDaemonReload=no` and exactly one loaded drop-in named
+   `30-x0x-launcher.conf`, a regular file whose last `ExecStart=` is the
+   loaded command. A drop-in removed or edited by hand closes the gate even
+   while the anchor still names the unit;
+5. the plan anchor passes the launcher's checks, names this install, and
+   names exactly one participant: this instance with this data root. A host
+   whose anchor names more than one participant (`x0xd` and `x0xd-443` from
+   one install) has no protected apply yet;
+6. `x0x-launcher --capabilities` (empty environment, no input, 5 s bound)
+   exits 0 and prints `trial-v1`. The launcher prints nothing for it while it
+   is dormant, and a launcher older than the flag exits 64.
+
+A closed gate is the unprotected apply described above, unchanged. macOS has
+no gate input yet (launchd), so its gate is always closed.
+
+**The transaction.** With the gate open, the worker holds both install
+locks and has passed admission and the probes. Then it:
+
+1. writes `<x0xd>.backup` and `<x0x>.backup` durably (a synced temporary file,
+   renamed, then the directory synced);
+2. freezes the plan (one participant: this daemon, observed live; the
+   captured environment leaves out the per-start variables in
+   `prepare_live::PER_START_ENV`: `X0X_M2_BOOT_FD`, `INVOCATION_ID`,
+   `JOURNAL_STREAM`, `NOTIFY_SOCKET`, `LISTEN_PID`, `LISTEN_FDS`,
+   `LISTEN_FDNAMES`, `MAINPID`, `MANAGERPID`, `SYSTEMD_EXEC_PID`,
+   `WATCHDOG_PID`, `WATCHDOG_USEC`, `TRIGGER_UNIT`, `TRIGGER_PATH`,
+   `TRIGGER_TIMER_REALTIME_USEC`, `TRIGGER_TIMER_MONOTONIC_USEC` and the five
+   `MONITOR_*` variables systemd sets for `OnFailure=`/`OnSuccess=` units);
+3. adopts the two locks as the `HostLock` and stages: the anchor is read
+   while the data root's stage lock is held, then the binding and the Staged
+   journal are written;
+4. writes Prepared;
+5. puts the daemon candidate in place (mode 0755, synced, renamed, directory
+   synced), then writes SwappedDaemon;
+6. does the same for the CLI, then writes SwappedCli;
+7. hands the host lock and the journal to the restart owner, which exits by
+   `SupervisedExit` as on the unprotected path.
+
+A failure in steps 4 to 6 restores every target it swapped from its backup
+(a copy; the backup stays), then writes `Superseded`. A restart that is
+refused before the daemon stops restores the binaries and writes
+`Superseded` too. What the launcher does after `SwappedCli` (arming the
+old daemon, the trial) is not exercised end to end yet: that is the
+lifecycle test of the enable step.
 
 - `freeze_plan` checks the plan before anything is written:
   - the daemon's and the CLI's target and backup paths exist and are
@@ -495,9 +604,9 @@ fields), so two more records bind it (`upgrade::plan_binding`):
    "participants": [{"instance_id": "x0xd", "data_root": "/var/lib/x0x"}]}
   ```
 
-  The launcher argv names it with `--plan-anchor <absolute path>`. No
-  installer writes one yet; the drop-in installer will (a later step of
-  the launcher enable plan on #2012).
+  The launcher argv names it with `--plan-anchor <absolute path>`. The
+  drop-in installer (`.deployment/install.sh --launcher`) writes it; see
+  "The installer's plan anchor" below.
 - **Plan binding.** One per transaction:
   `<data_root>/upgrade-plan-binding.<key>.json`, mode 0600, beside the
   journal, where `<key>` is the lowercase hex SHA-256 of the transaction id
@@ -506,7 +615,13 @@ fields), so two more records bind it (`upgrade::plan_binding`):
   is the SHA-256 of the frozen plan's JSON (the digest the trial binding
   uses); `anchor_sha256` is the SHA-256 of the anchor file's bytes.
 
-`Prepared::stage` takes the read anchor by type. It refuses a plan whose
+`Prepared::stage` takes the read anchor by type. It holds the data root's
+stage lock (`<data_root>/upgrade-stage.lock`, mode 0600) from its journal
+read to its last binding removal, after the host lock, so two stages in
+one data root never interleave, whatever install pair each is for. Without
+it, two pairs that stage for the first time in a data root with no journal
+would hold different install locks, and each could remove the other's new
+binding. It refuses a plan whose
 daemon target, CLI target, or set of (instance id, data root) is not
 exactly the anchor's, before it writes anything. It writes the new
 transaction's binding, then the Staged journal. The binding stays the same
@@ -551,11 +666,19 @@ typed refusal (78):
   account. The journal and the binding are both read under the install
   lock of the journal plan's daemon target, taken beside that target even
   when the binary is missing (a lock that cannot be taken is a failed
-  read, 75). Every stage in this data root holds that lock, so none can
-  change the binding between the two reads;
+  read, 75). When the start does not already hold that lock it takes it,
+  reads the journal again under it, and a journal that changed in between
+  is a failed read (75). A stage that writes in this data root while this
+  journal exists is for the same install pair (a stage for another pair is
+  refused), so it holds that same lock and cannot change the binding
+  between the two reads. A lock file that is the start's own daemon lock
+  through another path (a plan target under a symlinked directory) is the
+  lock already held; the start does not wait on it;
 - the binding names another transaction, generation, plan or anchor, or
   the plan names another install pair or other participants than the
-  anchor.
+  anchor. The install pair is checked against the anchor before the start
+  creates or takes any lock file at the plan's daemon target, so a lock
+  file is created only beside the anchored daemon.
 
 A missing anchor, or one the launcher's account cannot read, is a typed
 refusal (78) too, not a failed read: root writes it in a root directory,
@@ -565,6 +688,182 @@ only; an access control list is not read (only root can set one on a
 root-owned anchor or directory). A
 passthrough needs neither file, so a unit without `--plan-anchor` (one an
 older installer wrote) still starts, but can never own a trial.
+
+#### The installer's plan anchor (#2012, dormant)
+
+`.deployment/install.sh --launcher` writes the plan anchor through
+`.deployment/launcher-dropin.py` and adds `--plan-anchor <path>` to the
+drop-in's `ExecStart`:
+
+- **One anchor per install.** The file is
+  `/etc/x0x/launcher/install-<key>.anchor.json`, where `<key>` is the first
+  16 hex digits of the SHA-256 of the canonical daemon target. Every unit
+  that runs that install names the same file. Each unit's install adds or
+  replaces its own participant (instance id, data root). A binding carries
+  one anchor digest and a plan must name every participant of the
+  install, so units that share one install must name byte-identical
+  anchors; one shared file makes that so. A file there for another daemon
+  target is refused.
+- **Canonical form.** The file is written with sorted keys, participants
+  sorted by instance id, a two-space indent and a final newline, so a rerun
+  that changes nothing writes the same bytes. The CLI target is the `x0x`
+  beside the daemon (resolved if it is a link); the daemon target is the
+  installed binary's canonical path. `tests/fixtures/plan-anchor-installer.json`
+  is checked against both this writer and the launcher's reader.
+- **Owner and place.** Root writes it (`install.sh` runs as root), mode
+  0644, through a 0700 temporary file, fsync, rename and a directory fsync.
+  The directory is created 0755 whatever the umask. It and every directory
+  above it must be root's and not writable by group or others (a sticky
+  directory is allowed), as the launcher checks. The path in the drop-in is
+  canonical: on macOS `/etc` is `/private/etc`.
+- **Checks before changes.** The journal check runs before the first change
+  and again after systemd is asked (against the data root systemd's answer
+  gives). The first change, taking the unit out of the anchor, and the
+  removal of the drop-in come before systemd is asked; nothing else changes
+  before the second check. The launcher, its drop-in and the anchor change only when no data
+  root the anchor names, before or after, and no data root of this unit
+  holds a host journal other than an `idle` or `superseded` one. A
+  HostCommitted or Restored journal holds them too, since its launcher may
+  still run a trial and reads the anchor on every start. A journal that is
+  unreadable, a symlink or not a regular file counts as a journal; it is
+  opened without following a symlink or blocking on a FIFO. A refusal
+  exits with "the launcher step changed nothing": the launcher, the drop-in
+  and the anchor are as they were. Any other error before the first change
+  also changes nothing. A refusal found after systemd was asked restores
+  the drop-in, then the anchor, and reloads systemd, and `install.sh`
+  reloads systemd again. If that restore itself fails, the error says so
+  (`RestoreFailed`): the unit is then out of the anchor and its drop-in may
+  be missing, which keeps the rule below. The unit file, the config and any
+  `--binary` that `install.sh` wrote before the launcher step stay
+  installed; the message says so.
+- **Steady state.** A committed update's journal becomes Idle once every
+  instance's launcher has retired its trial, and an interrupted one becomes
+  Superseded at the next start (see "Journal end of life"); the installer
+  then runs again. A Restored or RecoveryFailed journal is not settled by any
+  code: every `install.sh` run for that install, with or without
+  `--launcher`, is refused until the journal is moved aside by hand (stop the
+  install's units, move `upgrade-journal.json` and its
+  `upgrade-plan-binding.*.json` files aside). The refusal message says this.
+- **The anchor names a unit only while its drop-in is in place.** The unit
+  leaves the anchor first, then the launcher and the drop-in are written,
+  and the unit enters the anchor last. A power loss at any step therefore
+  never leaves the anchor naming a unit without its drop-in (a test crashes
+  after each change). An install that fails after its first change takes
+  the unit out of the anchor first, whatever the journals say (a launcher
+  that then refuses a binding fails closed), and only then removes the
+  drop-in. If taking it out of the anchor fails, the drop-in stays and the
+  installer exits loudly (status 4). The drop-in's header says to remove
+  it with `install.sh` without `--launcher`; a drop-in deleted by hand
+  still leaves the anchor naming that unit.
+- **One run at a time.** A run holds an exclusive lock on
+  `<anchor dir>/.install.lock`, so two runs for units of one install never
+  rewrite the shared anchor at once. A run that waits longer than 120 s
+  (`X0X_INSTALL_LOCK_WAIT`) changes nothing.
+- **Launcher replacement.** The installed launcher must be a regular file
+  (a symlink there is refused, not followed). A different launcher is
+  installed under the journal rule above; the old one is kept as
+  `x0x-launcher.previous`.
+- **Removal.** `install.sh` without `--launcher` takes this unit out of the
+  anchor (the file goes with its last participant), then removes the
+  drop-in, under the same rule.
+- **Fleet hosts have no trial today.** A plan names every running
+  participant of an install, and the anchor names only launcher-bound
+  units. The fleet's `x0xd-443` unit has a generated config
+  (`deploy-443.sh`), and `install.sh` refuses such an instance, so no
+  shipped tool can bind it: the producer refuses those plans.
+- **Limits.** Anchor membership alone does not prove a unit is bound now:
+  before the launcher is enabled, the producer must check that every
+  anchored unit is launcher-bound and that its launcher reads the journal
+  format (the `--capabilities` gate). The installer does not take the data
+  root's stage lock, so an anchor change at the same moment as a stage
+  that read the old anchor can leave a binding the launcher refuses (78);
+  the producer must read the anchor under the stage lock. The fleet units
+  run as root, so there the root-owned anchor is the daemon's own account:
+  tamper-evidence only, as on macOS.
+
+`install.sh --launcher` with no path fetches the release asset
+`x0x-launcher-<platform>.tar.gz` for the installed x0xd's own version
+(`x0xd --version`; Linux x86_64 and aarch64), its `.sha256`, its GPG
+signature (`.asc`) and `SAORSA_PUBLIC_KEY.asc`. It needs curl and gpg. The
+`.sha256` must hold 64 hex digits that match, the key must have the pinned
+fingerprint and the signature must be a `VALIDSIG` of it, checked in a
+throwaway GnuPG home. A failure leaves the launcher, its drop-in and the
+anchor as they were. The asset is produced only once the separate release
+workflow PR (#2190, for David to merge) lands; until a release carries it,
+`--launcher` with no path fails closed and `--launcher PATH` is the way to
+install. That PR builds `x0x-launcher`
+(`--features m2-launcher`) for linux-x64-gnu, linux-arm64-gnu, macos-x64 and
+macos-arm64 and ships it as that archive, signed with ML-DSA-65 (`.sig`,
+context `x0x-launcher-v1`) and GPG (`.asc`). It is not in the signed release
+manifest or the release custody set: self-update never replaces the
+launcher. Not yet done (open before the launcher is enabled):
+`--launcher PATH` verifies nothing about the given file; a signature covers
+the archive's bytes only, so an older validly signed launcher is accepted
+(no version binding, no rollback protection); the launcher binary has no
+build-provenance record; and the release does not run the packaged
+launcher before shipping it.
+
+#### Journal end of life (#2012)
+
+A journal is settled when it is `Idle` or `Superseded`. A settled journal
+does not refuse a later apply, opens the host-commit gate, is a passthrough
+for the launcher, and lets the installer change the launcher and its anchor.
+
+- **Idle.** The launcher's retire (under the host lock, CLI lock then daemon
+  lock) saves its trial `Committed` and, in the same locked step, writes
+  `Idle` when every participant's trial record of the transaction is
+  `Committed`. A crash before the write leaves `HostCommitted`, which the
+  next start's retire settles. A retire on a host already `Idle` for a
+  `Committed` trial is still a retire.
+- **Superseded.** The producer writes it when it gives up before the
+  hand-off. A launcher start that finds `Staged`, `Probed`, `Prepared` or
+  `SwappedDaemon` writes it too: the producer is gone, since it keeps the
+  install locks until it exits. Under the host lock, with the journal read
+  again and its binding checked against the anchor, the start restores every
+  target that holds the candidate from its backup, writes `Superseded`, and
+  exits 75 so that the next start reads the settled journal. A target that
+  holds neither release, a backup that is not the previous release, a
+  missing anchor or binding, or an unfinished trial is a typed refusal (78)
+  and nothing changes. This closes the crash between the daemon swap and the
+  SwappedDaemon record, which before left a Prepared journal over swapped
+  bytes and a passthrough to the candidate, and the crash between the CLI
+  swap and its record, which before was a refusal (78) with the daemon down.
+- `Restored` and `RecoveryFailed` are not settled by any code: the cause
+  they keep decides the hold. The installer still refuses while they are
+  there.
+
+The installer takes the stage lock of every data root the anchor names,
+before and after its change, from its journal check to its last anchor
+write, so a stage either finished before the check (and the check refuses
+on its journal) or reads the new anchor. It opens the data root as a
+directory without following a symlink and opens or creates the lock file
+relative to that handle (0600, given to the data root's owner); anything but
+a regular file is refused.
+
+#### Moving a data root to another install (#2012)
+
+A host journal names its install pair. A launcher whose daemon is not that
+journal's install, over that data root, refuses to start (78) with the
+reason `other-install-journal: ...`, and the producer refuses to stage
+another pair there. This happens when a data root moves to another install
+(a new daemon path) or two installs share one data root. `x0x doctor`, with
+the daemon down, shows it as its own state (`refusal_kind:
+"other-install-journal"`) with the journal's phase, transaction and install
+targets, and gives the remedy:
+
+- **Settled journal** (`host_committed`, `restored`, `idle`,
+  `superseded`) of an install that no longer runs on this data root: stop
+  the unit, move `upgrade-journal.json` and every
+  `upgrade-plan-binding.*.json` in the data root aside, then start the
+  unit. If the other install still runs on this data root, do not move the
+  journal (its launcher may still need it for a trial): give each install
+  its own data root.
+- **Any other phase:** an update of the other install is still in
+  progress. Do not remove the journal. Run the other install until its
+  update settles (or its launcher restores it), then move the settled
+  journal as above.
+
+There is no command for this yet; it is a manual step.
 
 **Limit.** The binding fixes which install a plan can name: the install
 pair, the participants and their data roots. The daemon's account cannot
@@ -826,8 +1125,9 @@ has no hash or signature of its own. A trial also needs the plan anchor
 and the plan binding (see [Plan binding](#plan-binding-2012-b4-dormant)):
 without `--plan-anchor`, or with an anchor or binding that does not check,
 an in-flight journal is a typed refusal (78), never a trial. The writer of
-that journal is the M2 prepare producer (#2012), which no apply path calls
-yet, so with the engine held every start is still the passthrough. An owned start installs its SIGTERM and
+that journal is the M2 prepare producer (#2012), which the apply path calls
+only behind a gate that is closed while `LAUNCHER_ENABLED` is false, so with
+the engine held every start is still the passthrough. An owned start installs its SIGTERM and
 SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
 exits or a step can be retried (an issuer error never falls back to the
 passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
@@ -978,16 +1278,19 @@ The readback checks only what decides the restart. The launcher's own
 `--host-root` and `--instance` select its journal, so the readback does not
 bind them; the installer takes them from x0xd itself.
 
-`.deployment/install.sh --launcher /path/to/x0x-launcher` (off by default)
-installs the launcher next to the instance's `x0xd` and writes
+`.deployment/install.sh --launcher /path/to/x0x-launcher` (off by default;
+with no path it fetches the signed release asset) installs the launcher
+next to the instance's `x0xd`, writes the install's plan anchor ("The
+installer's plan anchor" above) and writes
 `<unit>.service.d/30-x0x-launcher.conf` (by a temporary file and a rename):
 
 ```ini
-# Installed by .deployment/install.sh --launcher (#1378). Remove this file
-# and run `systemctl daemon-reload` to return to the direct job.
+# Installed by .deployment/install.sh --launcher (#1378). To return to the
+# direct job, run .deployment/install.sh without --launcher: it also takes
+# this unit out of the plan anchor. Do not just delete this file.
 [Service]
 ExecStart=
-ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> -- /opt/x0x/x0xd <unit args>
+ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> --plan-anchor /etc/x0x/launcher/install-<key>.anchor.json -- /opt/x0x/x0xd <unit args>
 Restart=always
 RestartPreventExitStatus=64 78
 KillMode=mixed
@@ -1356,14 +1659,22 @@ version 2. A version-1 wrapper refuses supervised self-update; run
 `x0x autostart` to regenerate it. Before #1588, Windows refused every
 supervised apply, so no working setup loses self-update.
 
-CI (`Test Suite (Windows)`, `windows-latest`) runs the pipe, clock,
-record-barrier and foreground exit-status tests
+CI (`Test Suite (Windows)`, `windows-latest`, in `ci-full.yml`) runs the
+pipe, clock, record-barrier and foreground exit-status tests
 (`cargo test --lib windows_exec_regressions`,
-`cargo test --test upgrade_journal`). It does not run a Windows service
-or a second local user.
+`cargo test --test upgrade_journal`). It then runs the flush-owner
+acceptance (#1764, `scripts/ci/windows-flush-acceptance.ps1`): the real
+`x0xd` under a wrapper made by `x0x autostart`, with no peers and with
+self-update on but its release sources off. The flush owner starts only
+when self-update is on (`[update] enabled = true`).
+It checks the owner start and pipe name, the token checks, a refusal for a
+second non-admin local user, the wrapper restart rule with a stub child,
+and the directory barrier on NTFS (see [`cicd.md`](cicd.md)).
 
-Owed: final acceptance is a supervised self-update run on a Windows VM.
-That run is not done yet.
+Owed: a supervised self-update run on Windows (#1764 items 2 and 3): a
+real apply that exits 100 and restarts on the new version, and an injected
+flush failure that restores the old binary and exits 75. The hosted run
+does not do this: it has no signed test release to download.
 
 ### Migrating an existing launchd job
 

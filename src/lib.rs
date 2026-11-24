@@ -246,6 +246,9 @@ pub mod gui;
 /// HTTP/WebSocket server: axum router, handlers, and the daemon serving entrypoint.
 pub mod server;
 
+/// The allocator `x0xd` runs with and its jemalloc options (#1172).
+pub mod allocator;
+
 /// Forward compatibility for wire-format enums (#1604).
 pub(crate) mod wire_compat;
 
