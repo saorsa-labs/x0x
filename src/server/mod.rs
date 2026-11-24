@@ -682,6 +682,10 @@ async fn serve_with_options_inner(
         }
         (None, None) => None,
     };
+    #[cfg(unix)]
+    crate::upgrade::producer::record_identity_root(
+        identity_dir.clone().or_else(crate::storage::x0x_home_dir),
+    );
 
     // #645: a CONFIGURED identity_dir shared across two different data dirs
     // still let two daemons load the same machine/agent keys and both sign

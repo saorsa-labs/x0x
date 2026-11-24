@@ -418,7 +418,7 @@ fn stop_trial<C: Custody>(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::testkit::fixture;
+    use super::testkit::{fixture, fixture_with};
     use super::*;
     use std::cell::Cell;
 
@@ -469,11 +469,20 @@ mod tests {
 
     /// A Provisional trial at `path` whose child is `identity`.
     fn provisional(host: &recovery::Host, path: &Path, identity: Identity) -> Trial {
+        provisional_for(host, path, identity, "alice")
+    }
+
+    fn provisional_for(
+        host: &recovery::Host,
+        path: &Path,
+        identity: Identity,
+        instance: &str,
+    ) -> Trial {
         let clock = Clock {
             boot: identity.boot.clone(),
             ms: 1_000,
         };
-        let mut trial = Trial::new(host.binding().unwrap(), "alice".into(), &clock).unwrap();
+        let mut trial = Trial::new(host.binding().unwrap(), instance.into(), &clock).unwrap();
         trial.save(path).unwrap();
         trial.phase = Phase::Authorized;
         trial.save(path).unwrap();
@@ -1305,6 +1314,53 @@ mod tests {
         let mut stopped = Trial::load(&path, &trial.binding, "alice").unwrap();
         stopped.phase = Phase::Committed;
         assert!(stopped.save(&path).is_err());
+    }
+
+    /// #2012: the retire that leaves every participant's trial Committed
+    /// settles the host journal to Idle in the same locked step; before
+    /// that the journal stays HostCommitted. A retire on a host already
+    /// settled, for a Committed trial, is still a retire. Red: drop the
+    /// `settle_idle` call (the journal stays HostCommitted for ever).
+    #[test]
+    fn the_last_retire_settles_the_host_to_idle() {
+        let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, |record| {
+            let mut bob = record.plan.participants[0].clone();
+            bob.instance_id = "bob".into();
+            bob.data_root = bob.data_root.join("bob");
+            std::fs::create_dir(&bob.data_root).unwrap();
+            record.plan.participants.push(bob);
+        });
+        let paths: Vec<_> = host
+            .plan()
+            .participants
+            .iter()
+            .map(coordinator::trial_path)
+            .collect();
+        let mut alice = provisional(&host, &paths[0], gone_child());
+        let mut bob = provisional_for(&host, &paths[1], gone_child(), "bob");
+        set_journal_phase(&root, journal::Phase::HostCommitted);
+        assert_eq!(
+            run::retire(&host, &paths[0], &mut alice).unwrap(),
+            run::Retire::Retired
+        );
+        assert_eq!(journal_phase(&root), journal::Phase::HostCommitted);
+        assert_eq!(
+            run::retire(&host, &paths[1], &mut bob).unwrap(),
+            run::Retire::Retired
+        );
+        assert_eq!(journal_phase(&root), journal::Phase::Idle);
+        assert_eq!(bob.phase, Phase::Committed);
+        assert_eq!(
+            run::retire(&host, &paths[0], &mut alice).unwrap(),
+            run::Retire::Retired
+        );
+        assert_eq!(journal_phase(&root), journal::Phase::Idle);
+        // A settled host retires no trial that is not Committed.
+        let mut late = provisional(&host, &root.join("late.json"), gone_child());
+        assert_eq!(
+            run::retire(&host, &root.join("late.json"), &mut late).unwrap(),
+            run::Retire::NotCommitted
+        );
     }
 
     /// #1968 approval, slice 3: the stop path's first host lock is retried

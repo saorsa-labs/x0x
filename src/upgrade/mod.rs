@@ -7,6 +7,7 @@
 //! Upgrade parsers must not derive Debug for values that can hold argv, environment or credentials.
 
 pub mod apply;
+pub(crate) mod companion_failure;
 #[cfg(unix)]
 pub(crate) mod fleet_policy;
 pub(crate) mod install_lock;
@@ -36,6 +37,8 @@ pub(crate) mod prepare;
 pub(crate) mod prepare_live;
 pub(crate) mod probe;
 pub(crate) mod probe_retry;
+#[cfg(unix)]
+pub mod producer;
 pub mod restart;
 pub mod rollout;
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -318,9 +321,65 @@ pub(super) fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeEr
     acquire_install_lock(target).map(install_lock::InstallLock::into_file)
 }
 
+/// The error text of an in-process lock wait refused because this
+/// process's restart owner holds the install locks (#2012): the process is
+/// about to exit for its restart, so waiting would only hold up its
+/// shutdown drain.
+pub(crate) const RESTART_IN_PROGRESS: &str =
+    "restart in progress: this daemon's restart owner holds the install locks";
+
+/// Whether `error` is the refusal [`RESTART_IN_PROGRESS`].
+pub(crate) fn is_restart_in_progress(error: &UpgradeError) -> bool {
+    error.to_string().starts_with(RESTART_IN_PROGRESS)
+}
+
+static RESTART_OWNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Held while a restart owner in this process holds the install locks an
+/// apply worker handed it (`apply::HeldInstallLocks`). Every in-process
+/// wait for one of those lock files fails fast while it exists.
+pub(crate) struct RestartOwnerMark(Vec<PathBuf>);
+
+impl RestartOwnerMark {
+    /// Mark the install locks of `targets`.
+    pub(crate) fn new(targets: &[&Path]) -> Self {
+        let paths: Vec<PathBuf> = targets.iter().map(|t| host_upgrade_lock_path(t)).collect();
+        if let Ok(mut owned) = RESTART_OWNED.lock() {
+            owned.extend(paths.iter().cloned());
+        }
+        Self(paths)
+    }
+}
+
+impl Drop for RestartOwnerMark {
+    fn drop(&mut self) {
+        if let Ok(mut owned) = RESTART_OWNED.lock() {
+            for path in &self.0 {
+                if let Some(index) = owned.iter().position(|p| p == path) {
+                    owned.swap_remove(index);
+                }
+            }
+        }
+    }
+}
+
+fn restart_owner_holds(lock_path: &Path) -> bool {
+    RESTART_OWNED
+        .lock()
+        .map(|owned| owned.iter().any(|p| p == lock_path))
+        .unwrap_or(false)
+}
+
 /// The same lock as `acquire_host_upgrade_lock`, as the guard type that
 /// proves it is held, so `prepare::HostLock::adopt` can take it over
 /// (#2074 review).
+///
+/// On Unix the wait polls (every 20 ms) instead of blocking in the kernel,
+/// so it can stop: while this process's restart owner holds the install
+/// locks it returns [`RESTART_IN_PROGRESS`] at once, and a wait that began
+/// earlier returns it at its next poll (#2012 review). Clear-hold, a skill
+/// update, the probe-retry loop and a second apply in this process
+/// therefore never hold up the restart's shutdown drain.
 pub(super) fn acquire_install_lock(
     target: &Path,
 ) -> Result<install_lock::InstallLock, UpgradeError> {
@@ -332,18 +391,31 @@ pub(super) fn acquire_install_lock(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(&lock_path).map_err(|source| {
+    let failed = |source: std::io::Error| {
         UpgradeError::Other(format!(
             "failed to take host upgrade lock at {}: {source}",
             lock_path.display()
         ))
-    })?;
-    install_lock::InstallLock::take(file).map_err(|source| {
-        UpgradeError::Other(format!(
-            "failed to take host upgrade lock at {}: {source}",
-            lock_path.display()
-        ))
-    })
+    };
+    #[cfg(unix)]
+    loop {
+        if restart_owner_holds(&lock_path) {
+            return Err(UpgradeError::Other(RESTART_IN_PROGRESS.to_string()));
+        }
+        let file = options.open(&lock_path).map_err(failed)?;
+        if let Some(lock) = install_lock::InstallLock::try_take(file).map_err(failed)? {
+            return Ok(lock);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    #[cfg(not(unix))]
+    {
+        if restart_owner_holds(&lock_path) {
+            return Err(UpgradeError::Other(RESTART_IN_PROGRESS.to_string()));
+        }
+        let file = options.open(&lock_path).map_err(failed)?;
+        install_lock::InstallLock::take(file).map_err(failed)
+    }
 }
 
 /// Unix postcondition shared with [`Upgrader::atomic_replace`]: Success means

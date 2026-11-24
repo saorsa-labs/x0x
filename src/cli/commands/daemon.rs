@@ -496,6 +496,70 @@ pub(crate) fn store_integrity_check(val: &serde_json::Value) -> DoctorCheck {
 mod store_integrity_tests {
     use super::*;
 
+    /// #2012 (#1378 done-when): `x0x doctor` names a failed
+    /// launcher-protected attempt from `/diagnostics/upgrade` `plan`; a
+    /// committed or settled journal, and a legacy handoff, are not one.
+    #[test]
+    fn the_doctor_names_a_failed_launcher_attempt() {
+        let plan = |phase: &str, cause: serde_json::Value| {
+            serde_json::json!({"plan": {
+                "record": "journal", "phase": phase, "cause": cause,
+                "candidate_version": "0.50.0",
+            }})
+        };
+        let failed = failed_attempt(&plan("restored", "failed".into())).expect("failed");
+        assert!(
+            failed.contains("0.50.0") && failed.contains("restored"),
+            "{failed}"
+        );
+        assert!(failed_attempt(&plan("recovery_failed", serde_json::Value::Null)).is_some());
+        assert!(failed_attempt(&plan("superseded", "interrupted".into())).is_some());
+        for settled in ["idle", "host_committed", "superseded", "swapped_cli"] {
+            assert!(
+                failed_attempt(&plan(settled, serde_json::Value::Null)).is_none(),
+                "{settled}"
+            );
+        }
+        assert!(
+            failed_attempt(&serde_json::json!({"plan": {"record": "legacy_handoff"}})).is_none()
+        );
+        assert!(failed_attempt(&serde_json::json!({"plan": null})).is_none());
+    }
+
+    /// #2012 review: the doctor names a companion failure, its path and
+    /// the remedy; none without the record.
+    #[test]
+    fn the_doctor_names_a_failed_companion() {
+        let diagnostics = serde_json::json!({"companion_failure": {
+            "version": "0.50.0", "failures": 2, "last_unix": 100,
+            "detail": "x0x companion failed at /opt/x0x/x0x (denied); nothing was replaced",
+        }});
+        let warning = companion_failure(&diagnostics).expect("warned");
+        assert!(warning.contains("/opt/x0x/x0x"), "{warning}");
+        assert!(
+            warning.contains("0.50.0") && warning.contains("reinstall"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("not changed") && !warning.contains("mixed"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("upgrade-companion-failure.json"),
+            "{warning}"
+        );
+        assert!(warning.contains("POST /upgrade/apply"), "{warning}");
+        let mut mixed = diagnostics.clone();
+        mixed["companion_failure"]["pair_mixed"] = true.into();
+        let warning = companion_failure(&mixed).expect("warned");
+        assert!(warning.contains("manual recovery") && !warning.contains("not changed"));
+        let unreadable = serde_json::json!({"companion_failure": {"record": "unreadable"}});
+        assert!(companion_failure(&unreadable)
+            .unwrap()
+            .contains("cannot be read"));
+        assert!(companion_failure(&serde_json::json!({"companion_failure": null})).is_none());
+    }
+
     /// #1970: a group store at the image limit makes the doctor warn and
     /// name it; `ok` and `full` stores do not.
     #[test]
@@ -577,15 +641,90 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
     } else {
         format!("up to date ({current})")
     };
-    DoctorCheck::ok_with(
-        detail,
-        serde_json::json!({
-            "source": path,
-            "update_available": update_available,
-            "current_version": current,
-            "latest_version": latest,
-        }),
-    )
+    let evidence = serde_json::json!({
+        "source": path,
+        "update_available": update_available,
+        "current_version": current,
+        "latest_version": latest,
+        "launcher_gate": val.get("launcher_gate").cloned().unwrap_or(serde_json::Value::Null),
+        "companion_failure": val.get("companion_failure").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    if let Some(failed) = companion_failure(&val) {
+        return DoctorCheck::warn(format!("{detail}; {failed}"), Some(evidence));
+    }
+    if let Some(failed) = failed_attempt(&val) {
+        return DoctorCheck::warn(format!("{detail}; {failed}"), Some(evidence));
+    }
+    DoctorCheck::ok_with(detail, evidence)
+}
+
+/// A release whose apply failed on the sibling `x0x` (`/diagnostics/upgrade`
+/// `companion_failure`, #2012 review): what happened, the path, and the
+/// remedy, including how to retry before the backoff ends.
+pub(crate) fn companion_failure(diagnostics: &serde_json::Value) -> Option<String> {
+    let failed = diagnostics
+        .get("companion_failure")
+        .filter(|v| v.is_object())?;
+    let record = crate::upgrade::companion_failure::RECORD;
+    if failed.get("record").and_then(|v| v.as_str()) == Some("unreadable") {
+        return Some(format!(
+            "the companion failure record ({record} in the data directory) cannot be read; it \
+             is ignored and holds no release; remove it"
+        ));
+    }
+    let text = |key: &str| {
+        failed
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+    };
+    let number = |key: &str| failed.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let mixed = failed.get("pair_mixed").and_then(|v| v.as_bool()) == Some(true);
+    let outcome = if mixed {
+        "the daemon could not be restored, so a new x0xd runs beside the old x0x and the \
+         install needs manual recovery"
+    } else {
+        "the installed binaries were not changed"
+    };
+    Some(format!(
+        "the update to {} failed {} time(s) on the sibling x0x CLI; {outcome}: {}. Fix that \
+         file (it must be readable, and x0x.backup and x0x.upgrade.lock beside it must be \
+         writable by the daemon's account), or reinstall x0x. This release, also by POST \
+         /upgrade/apply, is retried after unix time {}; to retry it now, remove {record} from \
+         the data directory",
+        text("version"),
+        number("failures"),
+        text("detail"),
+        number("last_unix").saturating_add(crate::upgrade::companion_failure::backoff_secs(
+            u32::try_from(number("failures")).unwrap_or(u32::MAX)
+        ))
+    ))
+}
+
+/// A failed launcher-protected attempt in the host journal that
+/// `/diagnostics/upgrade` reports in `plan` (#2012, #1378): a recorded
+/// cause, or a restored or recovery-failed host.
+pub(crate) fn failed_attempt(diagnostics: &serde_json::Value) -> Option<String> {
+    let plan = diagnostics
+        .get("plan")
+        .filter(|plan| plan.get("record").and_then(|r| r.as_str()) == Some("journal"))?;
+    let phase = plan
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let cause = plan.get("cause").and_then(|v| v.as_str());
+    if cause.is_none() && !matches!(phase, "restored" | "recovery_failed") {
+        return None;
+    }
+    let candidate = plan
+        .get("candidate_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    Some(format!(
+        "the last launcher-protected update to {candidate} did not commit (host journal {phase}, \
+         cause {})",
+        cause.unwrap_or("none")
+    ))
 }
 
 fn write_doctor_text(report: &DoctorReport, out: &mut dyn Write) -> Result<()> {
