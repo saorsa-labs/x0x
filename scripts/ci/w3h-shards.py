@@ -272,6 +272,19 @@ def matrix(names):
     return {'group': entries}
 
 
+def missing_traces(names, incoming):
+    """`(entry, cases)` for each matrix entry with no file under
+    `incoming`/w3h-traces-<entry>: its runner was lost or its job failed
+    before the upload, which is an infra failure, not a verdict."""
+    assigned = assign(names)
+    missing = []
+    for entry in matrix(names)['group']:
+        directory = Path(incoming) / f'w3h-traces-{entry}'
+        if not (directory.is_dir() and any(p.is_file() for p in directory.rglob('*'))):
+            missing.append((entry, assigned[split_part(entry)[0]]))
+    return missing
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--matrix', action='store_true',
@@ -284,6 +297,9 @@ def main(argv=None):
                         help='print the --stress-count for GROUP (a matrix entry)')
     parser.add_argument('--tag-traces', nargs=2, metavar=('GROUP', 'DIR'),
                         help='rename the trace files in DIR for part GROUP')
+    parser.add_argument('--missing-traces', nargs=2, metavar=('INCOMING', 'OUT'),
+                        help='name the shards with no traces under INCOMING and '
+                             'write their case names to OUT')
     parser.add_argument('--root', type=Path, default=ROOT,
                         help='repository root (default: this repo)')
     args = parser.parse_args(argv)
@@ -298,6 +314,14 @@ def main(argv=None):
         entry, directory = args.tag_traces
         print(f'W3-H shard {entry}: renamed {tag_traces(entry, directory)} trace files')
         return 0
+    if args.missing_traces:
+        incoming, out = args.missing_traces
+        missing = missing_traces(names, incoming)
+        for entry, _cases in missing:
+            print(f'W3H-INFRA shard {entry} uploaded no traces (runner lost or job failed)')
+        cases = sorted({case for _entry, cases in missing for case in cases})
+        Path(out).write_text(''.join(f'{case}\n' for case in cases))
+        return 0
     if args.filter:
         # Validate the group exists in this tree when it is a named shard
         # that currently has cases, but still print a filter for an empty
@@ -311,7 +335,7 @@ def main(argv=None):
             raise SystemExit(f'W3-H shard {args.list!r} has no cases')
         print('\n'.join(cases))
         return 0
-    parser.error('pass --matrix, --filter, --list, --stress or --tag-traces')
+    parser.error('pass --matrix, --filter, --list, --stress, --tag-traces or --missing-traces')
     return 2
 
 
