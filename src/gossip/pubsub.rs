@@ -6522,6 +6522,63 @@ mod tests {
         );
     }
 
+    /// WHY (#2187): the Full ceiling of 3 is below sg's promotion floor of
+    /// 6, which sg upstream does not test. When an eager peer leaves the
+    /// connected plane, a membership refresh must promote a lazy peer so the
+    /// Full eager set returns to exactly 3; it must not stay at 2 or grow
+    /// toward sg's floor.
+    #[tokio::test]
+    async fn full_eager_set_refills_to_ceiling_three_after_an_eager_peer_leaves() {
+        let manager = slice1_manager(2, true).await;
+        let plane: Vec<[u8; 32]> = (1..=5).map(|id| [id; 32]).collect();
+        set_plane(&manager, plane.clone());
+        let name = "x0x/dm/v1/inbox/2187-refill";
+        let topic = TopicId::new([87; 32]);
+        let _sub = manager.subscribe_topic_id(name.into(), topic).await;
+        let eager_of = |peers: &[[u8; 32]]| -> Vec<[u8; 32]> {
+            plane_roles(&manager, topic, peers)
+                .into_iter()
+                .filter(|(_, role)| role == "eager")
+                .map(|(peer, _)| peer)
+                .collect()
+        };
+        let before = eager_of(&plane);
+        assert_eq!(
+            before.len(),
+            3,
+            "five connected peers fill the Full ceiling of 3"
+        );
+
+        let gone = before[0];
+        let remaining: Vec<[u8; 32]> = plane.iter().copied().filter(|p| *p != gone).collect();
+        set_plane(&manager, remaining.clone());
+        manager.refresh_topic_peers().await;
+
+        assert_ne!(
+            role_for(&manager, topic, gone),
+            "eager",
+            "a peer that left the plane is no longer eager"
+        );
+        let after = eager_of(&remaining);
+        assert_eq!(
+            after.len(),
+            3,
+            "the Full eager set returns to the ceiling of 3: {:?}",
+            plane_roles(&manager, topic, &remaining)
+        );
+        assert!(
+            after.iter().any(|peer| !before.contains(peer)),
+            "a previously lazy peer was promoted to replace the departed one"
+        );
+        assert!(
+            before
+                .iter()
+                .filter(|peer| **peer != gone)
+                .all(|peer| after.contains(peer)),
+            "the remaining eager peers are not displaced"
+        );
+    }
+
     /// WHY (#807 Full parity): #807 is a Leaf-only defect. The #808 port
     /// made every Full writer, including the per-publish initialize, force
     /// one preferred Full/bootstrap peer eager, displacing a working eager

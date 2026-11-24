@@ -518,13 +518,16 @@ where
 /// after a successful publish when no ACK is required, so it is off here;
 /// local-error retries run in the caller. Since #2187 the default config
 /// carries a raw-QUIC receive-pipeline ACK, so raw stays fire-and-forget here
-/// explicitly.
+/// explicitly. The push is the direct fast path, so its preferred raw
+/// attempt dials a peer with no live connection (`dial_for_raw_quic`), as it
+/// did before #2187, instead of sending the revocation through the mesh.
 fn revocation_push_send_config() -> crate::dm::DmSendConfig {
     crate::dm::DmSendConfig {
         max_retries: 0,
         require_gossip_ack: false,
         require_durable_app_ack: false,
         prefer_raw_quic_if_connected: true,
+        dial_for_raw_quic: true,
         raw_quic_receive_ack_timeout: None,
         ..crate::dm::DmSendConfig::default()
     }

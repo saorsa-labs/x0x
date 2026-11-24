@@ -63,6 +63,20 @@ async fn send_frame(state: &AppState, peer: &AgentId, frame: &CallFrame) -> Resu
         .map_err(|e| e.to_string())
 }
 
+/// Send one frame from a background loop without awaiting it there. Since
+/// #2187 a default send can wait on a raw receive-pipeline ACK (16.25 s at
+/// worst per raw stage), so an inline await would let one silent contact
+/// stall the call listener or sweeper for every other call. The result is
+/// only logged, as before.
+fn spawn_frame_send(state: &Arc<AppState>, peer: AgentId, frame: CallFrame, failure: &'static str) {
+    let task_state = Arc::clone(state);
+    let _spawned = state.spawn_detached(async move {
+        if let Err(e) = send_frame(&task_state, &peer, &frame).await {
+            tracing::debug!(target: "x0x::calls", error = %e, "{failure}");
+        }
+    });
+}
+
 fn refusal_response(refusal: CallRefusal) -> axum::response::Response {
     (
         StatusCode::FORBIDDEN,
@@ -296,9 +310,7 @@ pub(in crate::server) async fn run_call_listener(state: Arc<AppState>) {
         };
         broadcast_call_events(&state, events);
         if let Some(reply) = reply {
-            if let Err(e) = send_frame(&state, &msg.sender, &reply).await {
-                tracing::debug!(target: "x0x::calls", error = %e, "call reply not delivered");
-            }
+            spawn_frame_send(&state, msg.sender, reply, "call reply not delivered");
         }
     }
 }
@@ -312,9 +324,7 @@ pub(in crate::server) async fn run_call_sweeper(state: Arc<AppState>) {
         let (events, frames) = state.calls.lock().await.expire(now_ms());
         broadcast_call_events(&state, events);
         for (peer, frame) in frames {
-            if let Err(e) = send_frame(&state, &peer, &frame).await {
-                tracing::debug!(target: "x0x::calls", error = %e, "missed-call hangup not delivered");
-            }
+            spawn_frame_send(&state, peer, frame, "missed-call hangup not delivered");
         }
     }
 }
