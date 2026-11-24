@@ -250,7 +250,13 @@ pub(crate) struct BootRecord {
 pub(crate) fn host_commit_gate_open(data_dir: &Path) -> bool {
     match read_boot_records(data_dir).journal {
         RecordRead::Missing => true,
-        RecordRead::Journal(record) => record.phase == Phase::HostCommitted,
+        // Idle (a committed transaction settled after every trial retired)
+        // and Superseded (a transaction given up before any trial, the
+        // previous pair installed) are history: no trial runs (#2012).
+        RecordRead::Journal(record) => matches!(
+            record.phase,
+            Phase::HostCommitted | Phase::Idle | Phase::Superseded
+        ),
         RecordRead::Refused(_)
         | RecordRead::Handoff(_)
         | RecordRead::Boot(_)
@@ -377,10 +383,19 @@ impl BootRecords {
 
     /// Existing legacy intent is diagnostic and keeps the pre-M2 planner
     /// contract. Any M2, unknown or corrupt record prevents a new apply.
+    ///
+    /// A settled journal alone (Idle or Superseded, #2012) does not: it is
+    /// history that the next transaction replaces. Every other phase, and a
+    /// corrupt or unknown journal, still does.
     pub(crate) fn blocks_apply(&self) -> bool {
-        [&self.journal, &self.handoff, &self.boot]
-            .iter()
-            .any(|record| !matches!(record, RecordRead::Missing | RecordRead::LegacyHandoff(_)))
+        let settled_journal = matches!(
+            &self.journal,
+            RecordRead::Journal(record) if matches!(record.phase, Phase::Idle | Phase::Superseded)
+        );
+        (!settled_journal && !matches!(self.journal, RecordRead::Missing))
+            || [&self.handoff, &self.boot]
+                .iter()
+                .any(|record| !matches!(record, RecordRead::Missing | RecordRead::LegacyHandoff(_)))
     }
 
     pub(crate) fn diagnostic(&self) -> Option<String> {

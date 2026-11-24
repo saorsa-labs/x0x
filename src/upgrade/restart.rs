@@ -904,6 +904,32 @@ pub struct SystemdVerifiedUnit {
     pub restart: String,
     /// present and parseable.
     pub template_version: Option<u32>,
+    /// The loaded `ExecStart` when it runs `x0x-launcher` in the trial
+    /// form (#2012): what the prepare producer's gate checks. Never
+    /// serialized, so the intent record does not change.
+    #[serde(skip)]
+    pub launcher: Option<LoadedLauncher>,
+}
+
+/// A unit's loaded launcher command (#2012), read back from systemd's
+/// structured `ExecStart` for this exact instance: the launcher executable
+/// systemd runs, the whole command after `$` expansion, and the trial
+/// arguments the launcher's own parser read from it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoadedLauncher {
+    /// The executable systemd runs (the structured `ExecStart` path).
+    pub executable: PathBuf,
+    /// The spawned argv, `argv[0]` first.
+    pub command: Vec<String>,
+    /// The trial arguments (`--host-root`, `--instance`, `--plan-anchor`).
+    pub trial: super::launcher_contract::TrialArgs,
+}
+
+// The command carries the daemon's arguments, which can hold credentials.
+impl std::fmt::Debug for LoadedLauncher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoadedLauncher(<redacted>)")
+    }
 }
 
 /// Outcome of the systemd loaded-policy readback — the systemd-side twin of
@@ -1562,11 +1588,20 @@ fn readback_systemd_observation_in(
             .and_then(|v| v.trim().parse::<u32>().ok())
     });
 
+    let launcher = launcher_daemon.as_ref().and_then(|_| {
+        let parsed = super::launcher_contract::parse_launcher_argv(tokens.get(1..)?).ok()?;
+        Some(LoadedLauncher {
+            executable: PathBuf::from(&loaded_path),
+            command: tokens.clone(),
+            trial: parsed.trial?,
+        })
+    });
     let verified_identity = SystemdVerifiedUnit {
         unit,
         user_manager,
         restart: restart.to_string(),
         template_version,
+        launcher,
     };
 
     // Start-rate limiting (man systemd.service, StartLimitIntervalSec=/
@@ -5172,6 +5207,7 @@ mod tests {
                 user_manager: false,
                 restart: "always".to_string(),
                 template_version: Some(1),
+                launcher: None,
             })),
         )
         .expect("verified systemd policy does not require a launchd readback");
@@ -5183,6 +5219,7 @@ mod tests {
                 user_manager: false,
                 restart: "always".to_string(),
                 template_version: Some(1),
+                launcher: None,
             })
         );
     }
@@ -7351,6 +7388,7 @@ mod tests {
                 user_manager: false,
                 restart: "always".into(),
                 template_version: Some(1),
+                launcher: None,
             },
         )))
         .expect("verified readback admits SupervisedExit");
@@ -7435,6 +7473,7 @@ mod tests {
                 user_manager: true,
                 restart: "on-success".into(),
                 template_version: None,
+                launcher: None,
             })),
         )
         .expect("plan resolves");
