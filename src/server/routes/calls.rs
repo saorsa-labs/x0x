@@ -63,18 +63,49 @@ async fn send_frame(state: &AppState, peer: &AgentId, frame: &CallFrame) -> Resu
         .map_err(|e| e.to_string())
 }
 
+/// Upper bound on detached call-frame sends in flight. The listener and
+/// sweeper emit at most one frame per call event, and a legitimate load is
+/// bounded by `MAX_LIVE_CALLS` live plus `MAX_ENDED_RETAINED` ended calls,
+/// i.e. tens of sends. Each send can hold its task for up to ~16.25 s (the
+/// worst-case raw receive-pipeline ACK wait; see `DmSendConfig`
+/// `raw_quic_receive_ack_timeout`) on a silent peer, so 256 still absorbs a
+/// burst of ~16 frames/s from silent peers while capping what a remote
+/// invite flood can pin.
+const MAX_INFLIGHT_CALL_FRAME_SENDS: usize = 256;
+
+static CALL_FRAME_SEND_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_INFLIGHT_CALL_FRAME_SENDS);
+
 /// Send one frame from a background loop without awaiting it there. Since
 /// #2187 a default send can wait on a raw receive-pipeline ACK (16.25 s at
 /// worst per raw stage), so an inline await would let one silent contact
 /// stall the call listener or sweeper for every other call. The result is
 /// only logged, as before.
 fn spawn_frame_send(state: &Arc<AppState>, peer: AgentId, frame: CallFrame, failure: &'static str) {
+    let Ok(slot) = CALL_FRAME_SEND_SLOTS.try_acquire() else {
+        tracing::debug!(
+            target: "x0x::calls",
+            peer = %hex::encode(peer.as_bytes()),
+            cap = MAX_INFLIGHT_CALL_FRAME_SENDS,
+            "{failure}: frame shed, in-flight send cap reached"
+        );
+        return;
+    };
     let task_state = Arc::clone(state);
-    let _spawned = state.spawn_detached(async move {
+    let spawned = state.spawn_detached(async move {
+        // Released when the task ends, or when a shutdown-refused future is dropped unstarted.
+        let _slot = slot;
         if let Err(e) = send_frame(&task_state, &peer, &frame).await {
             tracing::debug!(target: "x0x::calls", error = %e, "{failure}");
         }
     });
+    if !spawned {
+        tracing::debug!(
+            target: "x0x::calls",
+            peer = %hex::encode(peer.as_bytes()),
+            "{failure}: daemon shutting down, send not started"
+        );
+    }
 }
 
 fn refusal_response(refusal: CallRefusal) -> axum::response::Response {
