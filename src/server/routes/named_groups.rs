@@ -25,7 +25,9 @@ mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
-pub(in crate::server) use direct_metadata_lanes::run_direct_metadata_listener;
+pub(in crate::server) use direct_metadata_lanes::{
+    run_direct_metadata_listener, run_join_result_listener,
+};
 pub(in crate::server) use fair_admission::FairAdmission;
 #[cfg(test)]
 pub(in crate::server) use group_recovery::open_staging_journal_for_test;
@@ -53228,8 +53230,9 @@ pub(in crate::server) const BASE_ROSTER_SERVE_HANDLER_CAP: usize = 8;
 /// provisionally validated (the sender is the member asked for, the group is
 /// known), admitted by [`FairAdmission`] (one in-flight handler per
 /// `(group, member)`, a per-group share, a global cap), and handled off the
-/// listener under a timeout. Every other message is handled in order on the
-/// listener, as a shielded apply (#1275). Returns `false` when the listener
+/// listener under a timeout. A `Result`, `Refused` or `Pending` is applied
+/// here inline, as a shielded apply (#1275); the join-result listener sends
+/// those to per-group lanes instead (#2207). Returns `false` when the caller
 /// must stop: shutdown refused such an apply, or it panicked.
 pub(in crate::server) async fn dispatch_join_result_message(
     state: &Arc<AppState>,
@@ -53415,39 +53418,13 @@ pub(in crate::server) async fn dispatch_join_result_message(
         ..
     } = &msg
     else {
-        // #1275: a result seats the joiner (roster and TreeKEM persistence)
-        // and a refusal finalizes its attempt under the persistence lock,
-        // so they run shielded: an abort of this listener cannot cut them
-        // off. The listener awaits each, so they still apply in order.
-        // `false` (shutdown refused it, or it panicked) stops the listener.
-        // #1699: the result of a staged re-seat join seats its staged
-        // record. A fetch request (below) is served from the live record.
-        let group_id = match &msg {
-            JoinResultMessage::Result { event, .. } => {
-                named_group_metadata_event_group_id(event).to_string()
-            }
-            JoinResultMessage::Refused { receipt } => receipt.group_id.clone(),
-            JoinResultMessage::Pending { notice } => notice.group_id.clone(),
-            JoinResultMessage::FetchRequest { group_id, .. }
-            // #646: both arms returned above; named for exhaustiveness.
-            | JoinResultMessage::BaseRosterFetch { group_id, .. }
-            | JoinResultMessage::BaseRoster { group_id, .. }
-            | JoinResultMessage::BaseRosterUnavailable { group_id, .. } => group_id.clone(),
+        // Result, Refused and Pending. The join-result listener sends these
+        // to per-group lanes (#2207) and does not call this function with
+        // them; a direct caller applies them here, inline.
+        let Some(group_id) = join_result_apply_group(&msg) else {
+            return true;
         };
-        let apply_state = Arc::clone(state);
-        let sender = *sender;
-        return state
-            .run_shielded(Box::pin(async move {
-                let stagings = &apply_state.reseat_stagings;
-                stagings
-                    .run_in_staging_of(
-                        &group_id,
-                        handle_join_result_message(&apply_state, &sender, verified, msg),
-                    )
-                    .await;
-            }))
-            .await
-            .is_some();
+        return apply_join_result_shielded(state, *sender, verified, msg, group_id).await;
     };
     let sender_hex = hex::encode(sender.as_bytes());
     if sender_hex != *member_agent_id {
@@ -53502,6 +53479,131 @@ pub(in crate::server) async fn dispatch_join_result_message(
         }
     });
     true
+}
+
+/// The group of a `Result`, `Refused` or `Pending`: the messages that the
+/// join-result listener applies in order per group (#2207). `None` for the
+/// messages that [`dispatch_join_result_message`] hands off the listener.
+pub(in crate::server) fn join_result_apply_group(msg: &JoinResultMessage) -> Option<String> {
+    match msg {
+        JoinResultMessage::Result { event, .. } => {
+            Some(named_group_metadata_event_group_id(event).to_string())
+        }
+        JoinResultMessage::Refused { receipt } => Some(receipt.group_id.clone()),
+        JoinResultMessage::Pending { notice } => Some(notice.group_id.clone()),
+        JoinResultMessage::FetchRequest { .. }
+        | JoinResultMessage::BaseRosterFetch { .. }
+        | JoinResultMessage::BaseRoster { .. }
+        | JoinResultMessage::BaseRosterUnavailable { .. } => None,
+    }
+}
+
+/// #1275: a result seats the joiner (roster and TreeKEM persistence) and a
+/// refusal finalizes its attempt under the persistence lock, so they run
+/// shielded: an abort of the caller cannot cut them off. #1699: the result
+/// of a staged re-seat join seats its staged record. `false`: shutdown
+/// refused the apply, or it panicked.
+pub(in crate::server) async fn apply_join_result_shielded(
+    state: &Arc<AppState>,
+    sender: AgentId,
+    verified: bool,
+    msg: JoinResultMessage,
+    group_id: String,
+) -> bool {
+    let apply_state = Arc::clone(state);
+    #[cfg(test)]
+    let label = join_result_apply_test_gate::label(&msg);
+    state
+        .run_shielded(Box::pin(async move {
+            #[cfg(test)]
+            join_result_apply_test_gate::wait(&group_id).await;
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    handle_join_result_message(&apply_state, &sender, verified, msg),
+                )
+                .await;
+            #[cfg(test)]
+            join_result_apply_test_gate::note_applied(&group_id, label);
+        }))
+        .await
+        .is_some()
+}
+
+/// #2207 tests: hold the join-result applies of one group, as a Welcome
+/// fetch inside the apply does. Each released permit lets exactly one held
+/// apply go on. Records the applies that entered the hold and, in order,
+/// the frames whose apply finished.
+#[cfg(test)]
+pub(in crate::server) mod join_result_apply_test_gate {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use super::JoinResultMessage;
+
+    static GATES: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static ENTERED: LazyLock<Mutex<HashMap<String, u32>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static APPLIED: LazyLock<Mutex<HashMap<String, Vec<String>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Hold every later apply of `group_id`; returns the release.
+    pub(in crate::server) fn hold(group_id: &str) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert(group_id.to_string(), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    /// Applies of `group_id` that have started.
+    pub(in crate::server) fn entered(group_id: &str) -> u32 {
+        ENTERED
+            .lock()
+            .ok()
+            .and_then(|entered| entered.get(group_id).copied())
+            .unwrap_or_default()
+    }
+
+    /// The labels of the finished applies of `group_id`, in finish order.
+    pub(in crate::server) fn applied(group_id: &str) -> Vec<String> {
+        APPLIED
+            .lock()
+            .ok()
+            .and_then(|applied| applied.get(group_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// A frame's label: the nonce of a `Pending`, else empty.
+    pub(super) fn label(msg: &JoinResultMessage) -> String {
+        match msg {
+            JoinResultMessage::Pending { notice } => notice.nonce.clone(),
+            _ => String::new(),
+        }
+    }
+
+    pub(super) fn note_applied(group_id: &str, label: String) {
+        if let Ok(mut applied) = APPLIED.lock() {
+            applied.entry(group_id.to_string()).or_default().push(label);
+        }
+    }
+
+    pub(super) async fn wait(group_id: &str) {
+        if let Ok(mut entered) = ENTERED.lock() {
+            *entered.entry(group_id.to_string()).or_default() += 1;
+        }
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(group_id).cloned());
+        if let Some(gate) = gate {
+            if let Ok(permit) = gate.acquire().await {
+                permit.forget();
+            }
+        }
+    }
 }
 
 /// #1269 r2: the message of a caught panic payload, for the fetch-handler
@@ -56666,6 +56768,7 @@ pub(in crate::server) mod tests {
     mod issue2004_expired_catchup;
     mod issue2135_removal_commit_binding;
     mod issue2202_welcome_listener;
+    mod issue2207_join_result_lanes;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue646_base_roster_fetch;
