@@ -608,3 +608,15 @@ fn prefix_and_capability_bit_are_pinned() {
         &payload
     ));
 }
+
+/// #2187: ADR 0080 §3 waits for no ACK of any kind. The default send config
+/// now carries a raw-QUIC receive-pipeline ACK, so the push config must keep
+/// both ACKs off explicitly.
+#[test]
+fn push_send_config_waits_for_no_ack() {
+    let config = revocation_push_send_config();
+    assert_eq!(config.raw_quic_receive_ack_timeout, None);
+    assert!(!config.require_gossip_ack);
+    assert!(!config.require_durable_app_ack);
+    assert_eq!(config.max_retries, 0);
+}

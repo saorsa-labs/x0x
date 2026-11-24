@@ -252,7 +252,9 @@ async fn test_send_direct_loopback_delivery_between_agents(
     let mut bob_rx = bob.subscribe_direct();
 
     let receipt = alice.send_direct(&bob.agent_id(), payload.clone()).await?;
-    assert_eq!(receipt.path, x0x::dm::DmPath::RawQuic);
+    // #2187: `send_direct` uses the default config, which carries the
+    // raw-QUIC receive-pipeline ACK, so the receipt is the acked raw path.
+    assert_eq!(receipt.path, x0x::dm::DmPath::RawQuicAcked);
 
     let received = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
         .await
@@ -286,7 +288,8 @@ async fn test_send_direct_loopback_delivery_between_agents(
 /// recorder is `dm_inbox::DmInboxService`, which is spawned exclusively by
 /// `Agent::start_dm_inbox` — called only by the daemon (`src/server/mod.rs`),
 /// never by `Agent::builder()`. Bob therefore has no gossip inbox at all, and
-/// the `DmPath::RawQuic` receipt asserted below confirms Alice used the raw
+/// the `DmPath::RawQuicAcked` receipt asserted below (the default config
+/// carries the receive-pipeline ACK since #2187) confirms Alice used the raw
 /// stream rather than a gossip envelope. Alice's outbound recorder writes to
 /// *her* store, and she has history disabled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -368,7 +371,7 @@ async fn raw_dm_receive_loop_records_inbound_history() {
         .expect("send_direct must succeed");
     assert_eq!(
         receipt.path,
-        x0x::dm::DmPath::RawQuic,
+        x0x::dm::DmPath::RawQuicAcked,
         "this test only guards the raw-QUIC recorder; a gossip-path receipt \
          would mean the message never reached the listener under test"
     );

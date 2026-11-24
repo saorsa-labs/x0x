@@ -11,7 +11,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 /// The absolute budget of one ordinary send under the test config
-/// (`timeout_per_attempt` = 2 s, default retries/backoff/raw knobs), from
+/// (`timeout_per_attempt` = 2 s, no raw receive-pipeline ACK, default
+/// retries/backoff/grace), from
 /// `dm_evidence::ordinary_send_budget`:
 ///
 /// evidence 2, refresh 3, evidence dial 3, preferred raw 2×2 plus 0.25,
@@ -56,6 +57,7 @@ async fn held_revocation_wait_ends_the_entire_send_at_one_absolute_deadline(
     seed_discovered_recipient(&agent, recipient).await;
     let config = dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(2),
+        raw_quic_receive_ack_timeout: None,
         ..Default::default()
     };
     tokio::time::pause();
@@ -97,6 +99,7 @@ async fn uncontended_send_keeps_its_existing_typed_failure(
     seed_discovered_recipient(&agent, recipient).await;
     let config = dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(2),
+        raw_quic_receive_ack_timeout: None,
         ..Default::default()
     };
     // Control: without contention the wrap must not preempt the send's own
@@ -143,6 +146,7 @@ async fn relay_fallback_deadline_records_each_failure_once(
     ));
     let config = dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(2),
+        raw_quic_receive_ack_timeout: None,
         ..Default::default()
     };
     let candidates = std::sync::Arc::clone(&agent.relay_candidates);

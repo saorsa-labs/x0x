@@ -351,6 +351,9 @@ impl Default for BindingConfig {
             request_timeout: Duration::from_secs(30),
             send_config: DmSendConfig {
                 prefer_raw_quic_if_connected: true,
+                // #2187: keep the pre-#2187 dial for the preferred raw
+                // attempt, bounded by the 4 s receive-ACK timeout.
+                dial_for_raw_quic: true,
                 raw_quic_receive_ack_timeout: Some(Duration::from_secs(4)),
                 ..DmSendConfig::default()
             },
@@ -847,6 +850,19 @@ mod tests {
             Some(json!({"message": {"parts": [{"kind": "text", "text": "ping"}]}})),
             Value::String("corr-1".to_string()),
         )
+    }
+
+    #[test]
+    fn default_send_config_dials_for_bounded_raw_quic() {
+        // Why (#2187): A2A keeps its pre-#2187 dial for the preferred raw
+        // attempt, bounded by its 4 s receive-pipeline ACK.
+        let config = BindingConfig::default().send_config;
+        assert!(config.prefer_raw_quic_if_connected);
+        assert!(config.dial_for_raw_quic);
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(4))
+        );
     }
 
     #[test]

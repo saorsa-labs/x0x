@@ -191,6 +191,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # `features: jemalloc` makes jemalloc the global allocator of x0xd
+      # (#1172: glibc malloc kept freed pages under load). build.yml builds
+      # each leg with the same features, so PR CI builds what ships.
       matrix:
         include:
           - platform: linux-x64-gnu
@@ -199,6 +202,7 @@ jobs:
             cross: false
             archive: tar.gz
             binary: x0xd
+            features: jemalloc
             launcher: true
 
           - platform: linux-x64-musl
@@ -207,6 +211,7 @@ jobs:
             cross: true
             archive: tar.gz
             binary: x0xd
+            features: jemalloc
             launcher: false
 
           - platform: linux-arm64-gnu
@@ -215,6 +220,7 @@ jobs:
             cross: true
             archive: tar.gz
             binary: x0xd
+            features: jemalloc
             launcher: true
 
           - platform: macos-x64
@@ -223,6 +229,7 @@ jobs:
             cross: false
             archive: tar.gz
             binary: x0xd
+            features: jemalloc
             launcher: true
 
           - platform: macos-arm64
@@ -231,6 +238,7 @@ jobs:
             cross: false
             archive: tar.gz
             binary: x0xd
+            features: jemalloc
             launcher: true
 
           - platform: windows-x64
@@ -239,6 +247,8 @@ jobs:
             cross: false
             archive: zip
             binary: x0xd.exe
+            # jemalloc does not support MSVC: system allocator.
+            features: ''
             launcher: false
 
     steps:
@@ -295,18 +305,29 @@ jobs:
       - name: Build (native)
         if: ${{ !matrix.cross }}
         shell: bash
+        env:
+          BUILD_FEATURES: ${{ matrix.features }}
         run: |
           set -o pipefail
           cargo build --locked --release --target ${{ matrix.target }} \
+            ${BUILD_FEATURES:+--features "$BUILD_FEATURES"} \
             --bin x0xd --bin x0x --message-format=json-render-diagnostics \
             | tee "${RUNNER_TEMP}/release-${{ matrix.platform }}-build.jsonl"
 
       - name: Build (cross)
         if: matrix.cross
         shell: bash
+        env:
+          BUILD_FEATURES: ${{ matrix.features }}
+          # jemalloc fixes its page size at build time, and configure cannot
+          # probe it when cross-compiling (it falls back to 4 KiB). 64 KiB
+          # pages also run on 4 and 16 KiB kernels. The target prefix keeps
+          # it off other targets; Cross.toml passes it into the container.
+          AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE: '16'
         run: |
           set -o pipefail
           cross build --locked --release --target ${{ matrix.target }} \
+            ${BUILD_FEATURES:+--features "$BUILD_FEATURES"} \
             --bin x0xd --bin x0x --message-format=json-render-diagnostics \
             | tee "${RUNNER_TEMP}/release-${{ matrix.platform }}-build.jsonl"
 

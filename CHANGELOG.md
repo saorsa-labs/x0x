@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Release builds of `x0xd` use jemalloc on Linux and macOS (#1172).**
+  `release.yml` and the matching `build.yml` legs build `linux-x64-gnu`,
+  `linux-x64-musl`, `linux-arm64-gnu`, `macos-x64` and `macos-arm64` with
+  `--features jemalloc`, so jemalloc is the global allocator of the shipped
+  `x0xd` (the `x0x` CLI links the crate but keeps the system allocator).
+  `windows-x64` keeps the system allocator, because jemalloc does not
+  support MSVC. `x0x-launcher` keeps the system allocator. `linux-arm64-gnu`
+  builds jemalloc with 64 KiB pages, so it starts on 4, 16 and 64 KiB-page
+  kernels. In the v0.49.1 local soak, glibc-malloc nodes grew +5 to
+  +12 MB/h under load and a jemalloc node +0.37 MB/h. David decided on
+  24 Nov 2026 to ship on a 12 h allocator A/B
+  (work-node RSS 118 vs 147 MB at h12, no restarts; A06 amendment of
+  24 Nov 2026).
 - **Self-update replaces x0xd before x0x and fails as a pair (#2012; A14
   amendment of 23 Nov 2026).** An apply that also replaces the sibling `x0x`
   now swaps `x0xd` first. A sibling `x0x` that cannot be locked fails the
@@ -123,6 +136,21 @@ All notable changes to this project will be documented in this file.
   adoption and legacy imports still copy the OR-Set for their rollback.
 
 ### Fixed
+
+- **TreeKEM Welcome transfer: a slow chunk ack no longer holds the
+  joiner's Welcome listener (#2202, refs #2189).** The joiner sent each
+  `ChunkAck` inside the single Welcome listener loop and waited for its
+  receipt (up to 24 s), so chunks queued behind it waited in series (in the
+  #1172 soak, ack failures 24 s apart, each followed at once by the next
+  queued chunk). The ack now runs in a bounded background task (32 at a
+  time). With all 32 busy the ack is dropped and logged; a later chunk's ack
+  covers it, but a dropped ack for the last chunk leaves the owner waiting
+  out its final-ack timeout without sending `Complete`. The joiner now
+  completes the Welcome as soon as it holds every chunk and the content hash
+  matches, without waiting for the owner's `Complete`. A `Complete` that
+  arrives before every chunk no longer fails the fetch; later chunks can
+  still finish it. No wire change; the serving checks are unchanged. The
+  direct-path timeouts themselves are tracked in #2189.
 
 - **jemalloc builds of `x0xd` apply their jemalloc options (#1172; A06
   amendment of 23 Nov 2026).** The options were exported as `malloc_conf`,

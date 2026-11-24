@@ -1,0 +1,5 @@
+# cross runs the build in a container and passes in only the variables
+# listed here. tikv-jemalloc-sys reads the target-prefixed page size variable
+# (set by the release.yml and build.yml cross legs, #1172).
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = ["AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE"]

@@ -11158,9 +11158,14 @@ impl Agent {
     ///
     /// See [`dm::DmError`].
     ///
-    /// Uses the default capability-aware policy. Call
-    /// [`Self::send_direct_with_config`] to opt into the raw-QUIC fast path
-    /// explicitly.
+    /// Uses [`dm::DmSendConfig::default`], which since #2187 first tries the
+    /// raw-QUIC fast path, with the receive-pipeline ACK, only when a live
+    /// direct connection to the recipient already exists (matching the
+    /// `POST /direct/send` default). It never dials for that attempt; a peer
+    /// without a live connection goes straight to the capability-aware policy
+    /// above. Call
+    /// [`Self::send_direct_with_config`] with `prefer_raw_quic_if_connected:
+    /// false` to keep the gossip-inbox path and its application-level ACK.
     pub async fn send_direct(
         &self,
         to: &identity::AgentId,
@@ -12358,9 +12363,17 @@ impl Agent {
         // back to gossip at once, as before.
         // The raw-QUIC path returns a transport receipt, never an application
         // ACK, so it can never satisfy a strict send.
-        let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
-            && !config.require_gossip
-            && !config.require_durable_app_ack
+        //
+        // #2187: "if connected" means a live connection now. Without this
+        // gate a NAT-only peer cost a repair, per-address dials and a dial
+        // timeout before the gossip path. A caller that opts into dialling
+        // (`dial_for_raw_quic`) or makes raw terminal
+        // (`stop_fallback_on_raw_error`) still dials, and a recipient with no
+        // gossip inbox still reaches the raw fallback below, which dials.
+        let preferred_raw_receipt = if Self::preferred_raw_attempt_allowed(&config, || {
+            self.has_live_direct_connection(to)
+        })
+        .await
         {
             match self
                 .send_direct_raw_quic(
@@ -14196,6 +14209,65 @@ impl Agent {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// #2187: whether the preferred raw-QUIC attempt runs. A strict or
+    /// gossip-only send never takes it; otherwise it runs when the caller
+    /// opts into dialling (`dial_for_raw_quic`), makes raw terminal
+    /// (`stop_fallback_on_raw_error`), or the recipient has a live
+    /// connection. `live` is only awaited when the answer depends on it.
+    async fn preferred_raw_attempt_allowed<F, Fut>(config: &dm::DmSendConfig, live: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        if !config.prefer_raw_quic_if_connected
+            || config.require_gossip
+            || config.require_durable_app_ack
+        {
+            return false;
+        }
+        config.dial_for_raw_quic || config.stop_fallback_on_raw_error || live().await
+    }
+
+    /// #2187: whether `to` has a live direct QUIC connection right now,
+    /// through the machine named by the discovery cache or by the
+    /// direct-messaging registry. It never dials, repairs or waits. It only
+    /// gates the preferred raw-QUIC attempt; the raw send still resolves and
+    /// authorizes its own target.
+    async fn has_live_direct_connection(&self, to: &identity::AgentId) -> bool {
+        let cached = self
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(to)
+            .map(|d| d.machine_id)
+            .filter(|m| m.0 != [0u8; 32]);
+        let registry = self.direct_messaging.get_machine_id(to).await;
+        let candidates = [cached, registry];
+        let Some(network) = &self.network else {
+            // Test builds: the strict in-process stand-in answers from its
+            // connection script. A machine it lists is live; with no known
+            // machine, only an unscripted (all-connected) stand-in is live.
+            #[cfg(test)]
+            if pinned_standin_is_strict(&self.identity.agent_id()) {
+                let script = pinned_standin_transport(&self.identity.agent_id());
+                if candidates.iter().all(Option::is_none) {
+                    return !script.only_listed_connected;
+                }
+                return candidates
+                    .into_iter()
+                    .flatten()
+                    .any(|machine| script.is_connected(&ant_quic::PeerId(machine.0)));
+            }
+            return false;
+        };
+        for machine in candidates.into_iter().flatten() {
+            if network.is_connected(&ant_quic::PeerId(machine.0)).await {
+                return true;
+            }
+        }
+        false
     }
 
     async fn send_direct_raw_quic(
@@ -35071,6 +35143,8 @@ mod tests {
                 b"stale-block-clear".to_vec(),
                 dm::DmSendConfig {
                     prefer_raw_quic_if_connected: true,
+                    // Fire-and-forget raw: this test pins `DmPath::RawQuic`.
+                    raw_quic_receive_ack_timeout: None,
                     ..dm::DmSendConfig::default()
                 },
             )
@@ -35228,6 +35302,8 @@ mod tests {
                 b"post-reconnect-probe".to_vec(),
                 dm::DmSendConfig {
                     prefer_raw_quic_if_connected: true,
+                    // Fire-and-forget raw: this test pins `DmPath::RawQuic`.
+                    raw_quic_receive_ack_timeout: None,
                     ..dm::DmSendConfig::default()
                 },
             )
@@ -35406,6 +35482,8 @@ mod tests {
                 b"post-reconnect-global-bootstrap".to_vec(),
                 dm::DmSendConfig {
                     prefer_raw_quic_if_connected: true,
+                    // Fire-and-forget raw: this test pins `DmPath::RawQuic`.
+                    raw_quic_receive_ack_timeout: None,
                     ..dm::DmSendConfig::default()
                 },
             )
@@ -37669,6 +37747,136 @@ mod tests {
         assert_eq!(candidates.len(), 2, "both TOML candidates seeded");
         assert!(candidates.iter().any(|c| c.0 == candidate_a));
         assert!(candidates.iter().any(|c| c.0 == candidate_b));
+    }
+
+    /// #2187: the preferred raw-QUIC attempt runs only for a live connection,
+    /// unless the caller opts into dialling or makes raw terminal. Pure: the
+    /// live check is a counted closure, so a "no attempt" answer proves the
+    /// preferred path neither dials nor even asks for the connection state.
+    #[tokio::test]
+    async fn preferred_raw_attempt_gate_needs_a_live_connection_or_an_opt_in() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        async fn allowed(config: &dm::DmSendConfig, live: bool) -> (bool, usize) {
+            let asked = AtomicUsize::new(0);
+            let result = Agent::preferred_raw_attempt_allowed(config, || {
+                asked.fetch_add(1, Ordering::Relaxed);
+                async move { live }
+            })
+            .await;
+            (result, asked.load(Ordering::Relaxed))
+        }
+        let default = dm::DmSendConfig::default();
+        assert_eq!(allowed(&default, false).await, (false, 1));
+        assert_eq!(allowed(&default, true).await, (true, 1));
+        let dial = dm::DmSendConfig {
+            dial_for_raw_quic: true,
+            ..dm::DmSendConfig::default()
+        };
+        assert_eq!(allowed(&dial, false).await, (true, 0));
+        let terminal = dm::DmSendConfig {
+            stop_fallback_on_raw_error: true,
+            ..dm::DmSendConfig::default()
+        };
+        assert_eq!(allowed(&terminal, false).await, (true, 0));
+        for refused in [
+            dm::DmSendConfig {
+                prefer_raw_quic_if_connected: false,
+                dial_for_raw_quic: true,
+                ..dm::DmSendConfig::default()
+            },
+            dm::DmSendConfig {
+                require_gossip: true,
+                dial_for_raw_quic: true,
+                ..dm::DmSendConfig::default()
+            },
+            dm::DmSendConfig {
+                require_durable_app_ack: true,
+                dial_for_raw_quic: true,
+                ..dm::DmSendConfig::default()
+            },
+        ] {
+            assert_eq!(allowed(&refused, true).await, (false, 0));
+        }
+    }
+
+    /// #2187 end to end, inert (no network node; the strict in-process
+    /// stand-in scripts the transport). The recipient has a gossip inbox and
+    /// a known machine that is NOT connected. A default send must not take
+    /// the preferred raw path, so the stand-in records no raw delivery and
+    /// its scripted repair (the dial) never runs; the send goes to the
+    /// gossip path (no gossip runtime here, so it fails there). With
+    /// `dial_for_raw_quic` the same send dials (scripted repair connects)
+    /// and delivers over raw QUIC.
+    #[tokio::test]
+    async fn default_send_skips_raw_dial_without_a_live_connection_but_opt_in_dials() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        assert!(agent.network.is_none());
+        agent.set_pinned_standin_strict_resolution_for_testing(true);
+        agent.script_pinned_standin_transport_for_testing(PinnedTransportScript::connected_only(
+            &[],
+            true,
+        ));
+        let recipient = identity::AgentId([0x5c; 32]);
+        let machine = identity::MachineId([0x5d; 32]);
+        agent.capability_store.insert(
+            recipient,
+            machine,
+            dm::DmCapabilities::v2_durable_gossip_ready(vec![1; 1184]),
+            dm::now_unix_ms(),
+        );
+        agent
+            .record_authenticated_binding_for_testing(recipient, machine, 1)
+            .await;
+        agent
+            .direct_messaging()
+            .mark_connected(recipient, machine)
+            .await;
+        assert!(
+            !agent.has_live_direct_connection(&recipient).await,
+            "the scripted stand-in lists no connected machine"
+        );
+
+        let default_result = agent
+            .send_direct_with_config(&recipient, b"gated".to_vec(), dm::DmSendConfig::default())
+            .await;
+        assert!(
+            agent
+                .general_raw_standin_deliveries_for_testing()
+                .is_empty(),
+            "a default send to a peer with no live connection must not use raw QUIC: \
+             {default_result:?}"
+        );
+        assert!(
+            !agent.has_live_direct_connection(&recipient).await,
+            "no dial ran: the scripted repair would have connected the machine"
+        );
+
+        let dialled = agent
+            .send_direct_with_config(
+                &recipient,
+                b"dialled".to_vec(),
+                dm::DmSendConfig {
+                    dial_for_raw_quic: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await;
+        let deliveries = agent.general_raw_standin_deliveries_for_testing();
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "dial_for_raw_quic must dial and deliver over raw QUIC: {dialled:?}"
+        );
+        assert_eq!(deliveries[0].0, recipient);
+        assert_eq!(deliveries[0].2, b"dialled".to_vec());
     }
 
     #[tokio::test]

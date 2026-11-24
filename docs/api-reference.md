@@ -574,7 +574,8 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 when `x0x::allocator::GlobalJemalloc` is installed (as in an `x0xd` built
 with `--features jemalloc`), otherwise `"system"`. An embedder built with
 the feature but without that global allocator reports `"system"`.
-Release builds do not enable jemalloc yet. For jemalloc, `jemalloc` holds
+Release builds use jemalloc on Linux and macOS and the system allocator on
+Windows. For jemalloc, `jemalloc` holds
 the options read back from jemalloc at run time (`background_thread`,
 `dirty_decay_ms`, `muzzy_decay_ms`); it is `null` for the system allocator.
 The values are read once and cached, because jemalloc fixes them at start.
@@ -3129,8 +3130,11 @@ Success `200`:
 
 Effectiveness is exactly "the carrier message is durably committed in this
 group's history" — never "the notification was received". `notification`
-reports the best-effort DM handoff to the delegate (`"durable_ack"` or
-`"unreachable:<error>"`) and is informational only. The notification DM
+reports the best-effort DM handoff to the delegate and is informational
+only: `"durable_ack"` (gossip-inbox path; the delegate's application ACK
+arrived), `"raw_quic_acked"` (raw-QUIC path; the delegate's reader drained
+the bytes, no application ACK), `"raw_quic"`, `"relayed"`, `"loopback"`, or
+`"unreachable:<error>"`. The notification DM
 payload is the ASCII prefix `x0x-delegation:v1:` followed by the signed
 delegation JSON (arrays-of-bytes fields; no outer wrapper).
 
