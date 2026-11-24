@@ -375,6 +375,10 @@ as ruled, and E-D4 to E-D16 as recommended.
 | E-D16 | UDP receive buffers: E0 records the configured maximum and the effective socket buffer now, with no change. The sysctl is raised on production hosts after promotion (a mid-gate change is an environment break). ant-quic reports the effective size in v0.47, and the setting is documented for embedders. | Ruled |
 | E-D17 | A delivered/published matrix **and** the hedge bytes-versus-latency evidence are a hard gate on every lever that sheds, prunes, gates or re-routes bytes. Own-origin, inbox, targeted and revocation classes deliver 100%, and no pair falls below baseline. It is measured on a sealed all-RC mesh **and** on a mixed 0.45↔RC mesh, in both directions, under budget pressure. A byte saving that loses a message is a failure. Named-group fanout joins the protected classes (D36). | Ruled |
 
+**E-D5 note (24 Nov 2026).** David decided to ship jemalloc in release
+builds on the 12 h allocator A/B instead of the 24 h run named in E-D5. The
+decision and evidence are in A06 (amendment of 24 Nov 2026, #1172).
+
 **The efficiency rules in brief (E-D15).** A byte saving that loses a message
 is a failure. Every topic declares its audience and rate, and request/response
 and ACK traffic goes to the requester only. Costs are stated as wire bytes in

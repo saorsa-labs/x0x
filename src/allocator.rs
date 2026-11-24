@@ -2,8 +2,9 @@
 //! (#1172).
 //!
 //! `x0xd` uses jemalloc as its global allocator only when it is built with
-//! `--features jemalloc` (and without `profile-heap`). Release builds do not
-//! enable that feature yet, so released binaries use the system allocator.
+//! `--features jemalloc` (and without `profile-heap`). Release builds enable
+//! it on Linux and macOS; Windows (MSVC) release builds use the system
+//! allocator.
 //! jemalloc is prefixed, so only Rust allocations move to it; C code in the
 //! process keeps the system `malloc`.
 //!
