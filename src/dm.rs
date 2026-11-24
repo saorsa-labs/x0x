@@ -1339,8 +1339,9 @@ pub struct DmSendConfig {
     /// QUIC direct-stream path when a live direct connection already exists.
     /// The check never dials (#2187); with no live connection the send goes
     /// straight to the normal capability-aware send logic, unless
-    /// `stop_fallback_on_raw_error` is set, in which case the raw attempt
-    /// still dials. If the fast path fails, fall back to the normal
+    /// `dial_for_raw_quic` or `stop_fallback_on_raw_error` is set, in which
+    /// case the raw attempt still dials. If the fast path fails, fall back to
+    /// the normal
     /// capability-aware send logic. A strict send
     /// (`require_durable_app_ack`) never takes this path.
     ///
@@ -1353,6 +1354,18 @@ pub struct DmSendConfig {
     /// [`DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT`], so a raw-QUIC success still
     /// means the recipient's reader drained the bytes.
     pub prefer_raw_quic_if_connected: bool,
+    /// If true, the preferred raw-QUIC attempt (`prefer_raw_quic_if_connected`)
+    /// runs even when the recipient has no live direct connection, so it
+    /// dials (repair, discovery redial) before any gossip fallback. This is
+    /// the pre-#2187 behaviour of the preferred attempt.
+    ///
+    /// Defaults to `false` (#2187): a plain DM to a peer with no live
+    /// connection goes straight to the gossip-inbox path with no dial wait.
+    /// Set it for high-volume or product paths that must reach a reachable
+    /// peer over raw QUIC rather than relay through the gossip mesh (file
+    /// transfer, `POST /direct/send`, A2A); keep a bounded
+    /// `raw_quic_receive_ack_timeout` with it.
+    pub dial_for_raw_quic: bool,
     /// When set, raw-QUIC sends use ant-quic's receive-pipeline ACK surface
     /// and only return success after the remote reader task has drained the
     /// bytes. `None` keeps the old fire-and-forget raw path.
@@ -1417,6 +1430,7 @@ impl Default for DmSendConfig {
             // #2187: match the HTTP API default (src/api/mod.rs
             // `body_bool_default_true("prefer_raw_quic_if_connected")`).
             prefer_raw_quic_if_connected: true,
+            dial_for_raw_quic: false,
             raw_quic_receive_ack_timeout: Some(DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT),
             stop_fallback_on_raw_error: false,
             require_gossip_ack: true,
@@ -3365,6 +3379,8 @@ mod tests {
         // without the ACK would silently weaken delivery to fire-and-forget.
         let cfg = DmSendConfig::default();
         assert!(cfg.prefer_raw_quic_if_connected);
+        // #2187: the plain default never dials for the preferred raw attempt.
+        assert!(!cfg.dial_for_raw_quic);
         assert_eq!(
             cfg.raw_quic_receive_ack_timeout,
             Some(DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT)

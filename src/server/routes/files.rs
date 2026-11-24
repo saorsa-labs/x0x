@@ -31,6 +31,9 @@ fn file_transfer_now() -> (u64, u64) {
 pub(in crate::server) fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
     let mut config = x0x::dm::DmSendConfig {
         prefer_raw_quic_if_connected: true,
+        // #2187: file chunks must reach a reachable peer over raw QUIC, not
+        // relay through the gossip mesh, so the preferred attempt dials.
+        dial_for_raw_quic: true,
         stop_fallback_on_raw_error: false,
         ..x0x::dm::DmSendConfig::default()
     };
@@ -1892,6 +1895,8 @@ mod tests {
     fn file_transfer_control_messages_are_acked_but_chunks_are_windowed() {
         let control = file_transfer_control_send_config();
         assert!(control.prefer_raw_quic_if_connected);
+        // #2187: file transfer dials for its preferred raw attempt.
+        assert!(control.dial_for_raw_quic);
         assert!(!control.stop_fallback_on_raw_error);
         assert_eq!(
             control.raw_quic_receive_ack_timeout,
@@ -1900,6 +1905,8 @@ mod tests {
 
         let chunk = file_transfer_send_config();
         assert!(chunk.prefer_raw_quic_if_connected);
+        // #2187: file transfer dials for its preferred raw attempt.
+        assert!(chunk.dial_for_raw_quic);
         assert!(!chunk.stop_fallback_on_raw_error);
         assert_eq!(
             chunk.raw_quic_receive_ack_timeout,

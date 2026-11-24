@@ -37,6 +37,9 @@ pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
     x0x::dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(8),
         prefer_raw_quic_if_connected: true,
+        // #2187: the product path keeps its pre-#2187 dial for the preferred
+        // raw attempt, bounded by the receive-ACK timeout below.
+        dial_for_raw_quic: true,
         raw_quic_receive_ack_timeout: Some(x0x::dm::DEFAULT_RAW_QUIC_RECEIVE_ACK_TIMEOUT),
         ..x0x::dm::DmSendConfig::default()
     }
@@ -1078,6 +1081,8 @@ mod tests {
         let config = direct_message_send_config();
         assert!(config.require_gossip_ack);
         assert!(config.prefer_raw_quic_if_connected);
+        // #2187: the product path dials for its preferred raw attempt.
+        assert!(config.dial_for_raw_quic);
         // Raw-QUIC preference must be loss-detecting (receive-pipeline ACK), or
         // a send into a superseded connection reports Ok, the retry never
         // fires, and the recipient's app never sees the message.
