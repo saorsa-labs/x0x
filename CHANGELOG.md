@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Docs: the operator path for an Active seat with no TreeKEM leaf (#2197,
+  option D; A09 amendment of 25 Nov 2026).** No leaf is restored to a seat
+  that stays Active. A creator that an `OwnerRecoveryV2` left without a leaf
+  comes back as a new member: an admin removes the seat (roster-only), the
+  owner re-certifies the agent, and an admin sends a fresh invite. The ADR
+  0109 re-seat refuses an Active subject (`subject_active`), and there is no
+  self re-join. No code change.
 - **The promotion announce makes no GitHub API request (#1169; A14 amendment
   of 24 Nov 2026).** `POST /upgrade/announce` takes an optional JSON body
   `{manifest_b64, signature_b64}` (CLI `x0x upgrade --announce

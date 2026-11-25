@@ -838,6 +838,37 @@ seated leafless member, and the optional `target_key_package_b64` on
 drops only the local copy in the `excluded_by_owner_recovery` state. Status: `capability` on the promoted member's wait
 and on stranded members, `recovery_commit_failed`, `local_seat`.
 
+25 Nov 2026 — decided by David (option D on
+[#2197](https://github.com/saorsa-labs/x0x/issues/2197)). **Keep what is
+built.** No leaf is restored to a seat that stays Active, and #2197 closes.
+This replaces known limit (2) of the 23 Nov 2026 amendment ("not built
+(#2197 stays open)"): it is now the decided behaviour. A creator whose seat
+an `OwnerRecoveryV2` left Active with no leaf comes back only by this
+operator path:
+1. An admin removes the seat (`DELETE /groups/:id/members/:agent_id`); for a
+   provably leafless seat the removal is roster-only, as above.
+2. The owner re-certifies the creator's agent, and the creator's node drops
+   its local copy (`DELETE /groups/:id`, local only in the
+   `excluded_by_owner_recovery` state).
+3. An admin sends a fresh invite, and the creator joins as a new member on
+   the ordinary join path, with a new leaf.
+
+The old seat is lost; the new leaf holds only the epochs from the
+re-admission on. Two paths do not exist. The ADR 0109 §3 re-seat
+(`POST /groups/:id/members/:agent_id/reseat`) refuses an Active subject with
+409 `subject_active`, so the orchestrator's ruling of 22 Nov 2026 (in
+#2197) that the creator re-joins by itself through that path described a
+path that does not exist. A node with no leaf cannot add itself,
+because saorsa-mls 0.3.10 has no external commit. The options not chosen were
+an admin's manual re-add of a leafless Active seat (a re-seat variant with a
+TreeKEM add, a Welcome, a new event and capability bit), an automatic re-add
+on the certificate rebind, and a self re-join (which needs a saorsa-mls
+change). Correction: the excluded seat's status names the remedy
+`admin_removes_then_local_leave_and_new_invite`, not
+`admin_removes_and_reinvites` as the bullet "The excluded seat's own node"
+says. No code, wire or route change. The operator procedure is in
+`docs/api-reference.md` (owner recovery status).
+
 ## Security claims
 
 State the exact properties of each released path. Post-quantum signatures and key encapsulation do not alone prove forward secrecy or recovery after key compromise.
