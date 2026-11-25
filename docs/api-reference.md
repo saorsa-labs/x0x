@@ -2460,6 +2460,43 @@ every wait. A wait always names its cause; it does not stop silently.
     before the removal meets the inviter's existing already-a-member
     refusal, and it can join again after the removal.
 
+**Operator procedure: an Active seat with no TreeKEM leaf (#2197).** An
+`OwnerRecoveryV2` that excludes the creator leaves its seat Active with no
+TreeKEM leaf. Nothing gives that seat a leaf again. The only way back is
+these steps, in this order (decided by David, 25 Nov 2026, option D on
+#2197):
+
+1. **An admin removes the seat.** `DELETE /groups/:id/members/:agent_id`
+   (CLI `x0x group remove-member`). Do not ban it: a ban is also
+   roster-only here, but this procedure brings the agent back. For a seat that provably has no leaf the
+   daemon makes this roster-only: no TreeKEM commit and no epoch change;
+   the reply carries `"roster_only": true`. A member whose current advert
+   lacks bit 23 holds it (409 `waiting_for_receiver_upgrade`, see the
+   table below).
+2. **The owner re-certifies the creator's agent.** The new certificate
+   must be valid before the join, because an owner-certified add needs a
+   valid certificate. On the creator's own node, `DELETE /groups/:id`
+   (`x0x group leave`) drops its local copy of the group; in the
+   `excluded_by_owner_recovery` state it seals and publishes nothing.
+3. **An admin sends a fresh invite and the creator joins as a new
+   member.** `POST /groups/:id/invite` (`x0x group invite`; the REST body
+   can name the agent with `intended_joiner`), then `POST /groups/join`
+   (`x0x group join`) on the creator's node. This is the ordinary join
+   path. A named invite minted before step 1 answers 409
+   `remove_leafless_seat_first`.
+
+What is lost: the old seat. The creator comes back as a new member with a
+new leaf, so it holds only the epochs from its re-admission on, and none
+of the epochs it missed while it had no leaf.
+
+What does not exist:
+- **A re-seat of the Active seat.** `POST /groups/:id/members/:agent_id/reseat`
+  (ADR 0109 §3, `x0x group reseat`) refuses a subject that is Active with
+  409 `subject_active`. An earlier note that the creator "re-joins by itself
+  through the ADR 0109 re-seat path" was wrong.
+- **A self re-join.** saorsa-mls 0.3.10 has no external commit, so a node
+  with no leaf cannot add itself to the tree.
+
 **New status codes.**
 
 | Route | Status | Body |
