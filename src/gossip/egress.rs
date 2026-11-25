@@ -903,6 +903,7 @@ mod tests {
                 hop: 0,
                 ttl: 10,
                 payload_hash: Some(*blake3::hash(&payload).as_bytes()),
+                created_at_secs: None,
             };
             header.seal_payload_hash(Some(&payload));
             let signature = if sign {
@@ -966,6 +967,7 @@ mod tests {
                     hop: 0,
                     ttl: 10,
                     payload_hash: None,
+                    created_at_secs: None,
                 },
                 payload: Some(Bytes::from_static(b"repair payload")),
                 signature: Vec::new(),

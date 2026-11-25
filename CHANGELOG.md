@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Dependencies: saorsa-gossip `=0.6.1` (Wave 2), new
+  `[gossip] content_bound_msg_id_policy` knob (A06 amendment of 25 Nov
+  2026).** All eleven `saorsa-gossip-*` crates move from `=0.5.97` to
+  `=0.6.1`; ant-quic stays `=0.29.0`, which saorsa-gossip 0.6.1 also pins.
+  saorsa-gossip 0.6.0 is a minor-breaking release, so the next x0x release
+  is a **minor** version bump. Wave 2 adds the PlumTree wire PRUNE and
+  GRAFT frames, GossipSub v1.2 IDONTWANT and batched unsigned control. A
+  node advertises them in a capability exchange and uses them only towards
+  peers that advertise them too, so 0.5.x peers keep the Wave 1 wire. x0x
+  handles the new `MessageKind` values `Prune`, `Graft` and `IDontWant` as
+  gossip control kinds: saorsa-gossip processes them, and x0x only counts
+  them, under the new `prune`, `graft` and `idontwant` keys of the per-kind
+  and inbound-by-topic diagnostics counters (a key shows only when its
+  count is not zero). The new `content_bound_msg_id_policy` key takes
+  `accept-only` (the default), `publish-v3` or `require-v3` and maps to
+  saorsa-gossip's `ContentBoundMsgIdPolicy`. The default keeps today's
+  behaviour: the node validates inbound content-bound (v3) headers and
+  publishes v2 headers. The flip to `publish-v3` is an operator change,
+  made node by node, and only after every reachable hop runs
+  saorsa-gossip 0.6 or later (`CAP_CONTENT_BOUND_MSG_ID`), because relays
+  cannot downgrade a v3 header. x0xd logs the installed policy at start.
+  The #501 controlled-load producer allowlist moves to the crates.io 0.6.1
+  pubsub package by checksum; 0.5.97 is refused as superseded.
+
 - **Docs: the operator path for an Active seat with no TreeKEM leaf (#2197,
   option D; A09 amendment of 25 Nov 2026).** No leaf is restored to a seat
   that stays Active. A creator that an `OwnerRecoveryV2` left without a leaf

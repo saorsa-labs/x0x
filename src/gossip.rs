@@ -14,7 +14,7 @@ pub mod runtime;
 pub(crate) mod stale_targets;
 pub(crate) mod wire;
 
-pub use config::{GossipConfig, LeafBytePolicy};
+pub use config::{ContentBoundMsgIdPolicy, GossipConfig, LeafBytePolicy};
 pub use egress::{EgressBudgetWarning, EgressTopicUsage, SUSTAINED_EGRESS_EXCEED_SECS};
 pub use participation::{
     classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, resolve_participation,

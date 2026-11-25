@@ -16,13 +16,16 @@ use super::participation::{
     classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, ParticipationMode,
     ParticipationSnapshot, RELAY_BYTES_SEMANTICS,
 };
-use super::GossipConfig;
+use super::{ContentBoundMsgIdPolicy, GossipConfig};
 use crate::contacts::{ContactStore, TrustLevel};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
 use crate::network::NetworkNode;
 use bytes::Bytes;
-use saorsa_gossip_pubsub::{BytePolicy, LeafEgressConfig, PlumtreePubSub, PubSub, SignaturePolicy};
+use saorsa_gossip_pubsub::{
+    BytePolicy, ContentBoundMsgIdPolicy as SgContentBoundMsgIdPolicy, LeafEgressConfig,
+    PlumtreePubSub, PubSub, SignaturePolicy,
+};
 use saorsa_gossip_transport::GossipTransport;
 #[cfg(test)]
 use saorsa_gossip_types::MessageHeader;
@@ -38,6 +41,16 @@ pub(crate) const ZERO_FANOUT_WARN_WINDOW: Duration = Duration::from_secs(30);
 
 /// ant-quic accepts a 4 MiB application stream; x0x prepends one type byte.
 pub(crate) const MAX_LEAF_GOSSIP_FRAME_BYTES: usize = 4 * 1024 * 1024 - 1;
+
+const fn sg_content_bound_msg_id_policy(
+    policy: ContentBoundMsgIdPolicy,
+) -> SgContentBoundMsgIdPolicy {
+    match policy {
+        ContentBoundMsgIdPolicy::AcceptOnly => SgContentBoundMsgIdPolicy::AcceptOnly,
+        ContentBoundMsgIdPolicy::PublishV3 => SgContentBoundMsgIdPolicy::PublishV3,
+        ContentBoundMsgIdPolicy::RequireV3 => SgContentBoundMsgIdPolicy::RequireV3,
+    }
+}
 
 fn leaf_egress_config(config: &GossipConfig) -> Option<LeafEgressConfig> {
     (config.resolved_participation() == ParticipationMode::Leaf
@@ -277,7 +290,7 @@ struct InboundSlot {
 
 const INBOUND_CLASS_NAMES: [&str; 5] = ["announce_blob", "caps", "dm_bus", "presence", "other"];
 
-const INBOUND_KIND_NAMES: [&str; 9] = [
+const INBOUND_KIND_NAMES: [&str; 12] = [
     "eager",
     "ihave",
     "iwant",
@@ -287,6 +300,9 @@ const INBOUND_KIND_NAMES: [&str; 9] = [
     "presence",
     "anti_entropy",
     "shuffle",
+    "prune",
+    "graft",
+    "idontwant",
 ];
 
 static KNOWN_INBOUND_CLASSES: LazyLock<HashMap<TopicId, usize>> = LazyLock::new(|| {
@@ -326,6 +342,9 @@ fn inbound_kind_index(kind: MessageKind) -> usize {
         MessageKind::Presence => 6,
         MessageKind::AntiEntropy => 7,
         MessageKind::Shuffle => 8,
+        MessageKind::Prune => 9,
+        MessageKind::Graft => 10,
+        MessageKind::IDontWant => 11,
     }
 }
 
@@ -2175,6 +2194,18 @@ impl PubSubManager {
         }
         self.relay_fanout
             .set_budget(config.relay_fanout_budget_msgs_per_sec);
+        let wanted = sg_content_bound_msg_id_policy(config.content_bound_msg_id_policy);
+        self.plumtree.set_content_bound_msg_id_policy(wanted);
+        if self.plumtree.content_bound_msg_id_policy() != wanted {
+            return Err(NetworkError::NodeCreation(format!(
+                "content_bound_msg_id_policy \"{}\" could not be installed",
+                config.content_bound_msg_id_policy.as_str()
+            )));
+        }
+        tracing::info!(
+            "[gossip] content_bound_msg_id_policy = \"{}\"",
+            self.content_bound_msg_id_policy()
+        );
         let accepted = leaf_egress_config(&self.egress_config);
         if !self.plumtree.configure_leaf_egress(accepted) {
             return Err(NetworkError::NodeCreation(
@@ -2384,6 +2415,18 @@ impl PubSubManager {
             SignaturePolicy::RejectV1 => "reject_v1",
             SignaturePolicy::AcceptV1 => "accept_v1",
         }
+    }
+
+    /// Installed saorsa-gossip content-bound `msg_id` policy, in the
+    /// `[gossip] content_bound_msg_id_policy` TOML spelling.
+    #[must_use]
+    pub fn content_bound_msg_id_policy(&self) -> &'static str {
+        match self.plumtree.content_bound_msg_id_policy() {
+            SgContentBoundMsgIdPolicy::AcceptOnly => ContentBoundMsgIdPolicy::AcceptOnly,
+            SgContentBoundMsgIdPolicy::PublishV3 => ContentBoundMsgIdPolicy::PublishV3,
+            SgContentBoundMsgIdPolicy::RequireV3 => ContentBoundMsgIdPolicy::RequireV3,
+        }
+        .as_str()
     }
 
     /// Cumulative outer v1 (header-only-signed) receipts since startup.
@@ -4525,6 +4568,7 @@ pub(crate) mod test_support {
             kind: MessageKind::Eager,
             hop: 0,
             ttl: 10,
+            created_at_secs: None,
         };
         header.seal_payload_hash(Some(inner.as_ref()));
         let header_bytes = postcard::to_stdvec(&header).expect("header serialize");
@@ -5159,6 +5203,32 @@ mod tests {
             sends: Vec::new(),
         });
         manager
+    }
+
+    /// WHY: a mixed fleet keeps working only while the default publishes v2
+    /// headers; a wrong arm would leak v3 headers before the fleet flip.
+    #[test]
+    fn content_bound_msg_id_policy_maps_one_to_one_onto_sg() {
+        assert_eq!(
+            sg_content_bound_msg_id_policy(GossipConfig::default().content_bound_msg_id_policy),
+            SgContentBoundMsgIdPolicy::AcceptOnly
+        );
+        for (ours, theirs) in [
+            (
+                ContentBoundMsgIdPolicy::AcceptOnly,
+                SgContentBoundMsgIdPolicy::AcceptOnly,
+            ),
+            (
+                ContentBoundMsgIdPolicy::PublishV3,
+                SgContentBoundMsgIdPolicy::PublishV3,
+            ),
+            (
+                ContentBoundMsgIdPolicy::RequireV3,
+                SgContentBoundMsgIdPolicy::RequireV3,
+            ),
+        ] {
+            assert_eq!(sg_content_bound_msg_id_policy(ours), theirs);
+        }
     }
 
     /// WHY: the default `[gossip]` section is what every deployed daemon
@@ -8804,6 +8874,7 @@ mod tests {
             hop: 0,
             ttl: 10,
             payload_hash: None,
+            created_at_secs: None,
         };
         let signature = key
             .sign(&postcard::to_stdvec(&header).expect("header serializes"))
@@ -9622,6 +9693,7 @@ mod tests {
             kind: MessageKind::Eager,
             hop: 0,
             ttl: 10,
+            created_at_secs: None,
         };
         if version_v2 {
             header.seal_payload_hash(Some(payload.as_ref()));
@@ -9763,6 +9835,7 @@ mod tests {
             kind: MessageKind::Eager,
             hop: 0,
             ttl: 10,
+            created_at_secs: None,
         };
         bad_header.seal_payload_hash(Some(inner.as_ref()));
         let header_bytes = postcard::to_stdvec(&bad_header).expect("header");
@@ -10892,6 +10965,7 @@ mod sg76_marker_gate_tests {
             hop: 0,
             ttl: 10,
             payload_hash: None,
+            created_at_secs: None,
         };
         let signature = key.sign(&postcard::to_stdvec(&header).unwrap()).unwrap();
         (header, signature, key.public_key().to_vec())
@@ -11010,6 +11084,7 @@ mod sg76_marker_gate_tests {
                 hop: 0,
                 ttl: 10,
                 payload_hash: None,
+                created_at_secs: None,
             },
             payload: None,
             signature: Vec::new(),
@@ -11363,6 +11438,7 @@ mod issue869 {
             kind: MessageKind::Eager,
             hop: 0,
             ttl: 10,
+            created_at_secs: None,
         };
         header.seal_payload_hash(Some(inner.as_ref()));
         let header_bytes = postcard::to_stdvec(&header).expect("header");
@@ -11410,6 +11486,7 @@ mod issue869 {
             kind: MessageKind::Ping,
             hop: 0,
             ttl: 10,
+            created_at_secs: None,
         };
         header.seal_payload_hash(Some(&body));
         let signature = from_key
