@@ -1070,6 +1070,7 @@ fn w3h_969_frame_oracle_decodes_a_sealed_transport_frame() -> Result<()> {
         kind: saorsa_gossip_types::MessageKind::Eager,
         hop: 0,
         ttl: 10,
+        created_at_secs: None,
     };
     header.seal_payload_hash(Some(&inner));
     let wire = WireV3 {

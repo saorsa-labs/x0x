@@ -34,6 +34,39 @@ impl LeafBytePolicy {
     }
 }
 
+/// Content-bound `msg_id` (saorsa-gossip `MessageHeader` v3) policy.
+///
+/// TOML: `[gossip] content_bound_msg_id_policy`. Maps one-to-one onto
+/// saorsa-gossip's `ContentBoundMsgIdPolicy`. v3 headers are signed by the
+/// origin publisher and relays cannot downgrade them, so saorsa-gossip
+/// requires that `publish-v3` and `require-v3` are set only after every
+/// reachable hop advertises `CAP_CONTENT_BOUND_MSG_ID` (saorsa-gossip 0.6.0
+/// or later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContentBoundMsgIdPolicy {
+    /// Validate inbound v3 headers but publish v2. The default, and the only
+    /// safe setting in a fleet that still has saorsa-gossip 0.5.x peers.
+    #[default]
+    AcceptOnly,
+    /// Publish v3 headers; still accept inbound v2.
+    PublishV3,
+    /// Publish v3 headers and drop inbound v1/v2 EAGER headers.
+    RequireV3,
+}
+
+impl ContentBoundMsgIdPolicy {
+    /// The TOML / log spelling of this policy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptOnly => "accept-only",
+            Self::PublishV3 => "publish-v3",
+            Self::RequireV3 => "require-v3",
+        }
+    }
+}
+
 /// Configuration for the gossip overlay network.
 ///
 /// These parameters control x0x's Leaf egress budget, participation mode and
@@ -101,6 +134,10 @@ pub struct GossipConfig {
     /// Opt-in, and only on a Leaf — see [`LeafBytePolicy`].
     #[serde(default)]
     pub byte_policy: LeafBytePolicy,
+
+    /// Content-bound `msg_id` policy — see [`ContentBoundMsgIdPolicy`].
+    #[serde(default)]
+    pub content_bound_msg_id_policy: ContentBoundMsgIdPolicy,
 
     /// Per-topic budget for *eager* re-forwarding of relayed
     /// messages on topics this node subscribes to. Within budget, verdicts
@@ -177,6 +214,7 @@ impl Default for GossipConfig {
             leaf_egress_hard_bytes_per_sec: default_leaf_egress_hard(),
             leaf_egress_burst_bytes: default_leaf_egress_burst(),
             byte_policy: LeafBytePolicy::ObserveOnly,
+            content_bound_msg_id_policy: ContentBoundMsgIdPolicy::AcceptOnly,
             relay_fanout_budget_msgs_per_sec: default_relay_fanout_budget_msgs_per_sec(),
             relay: false,
             participation: ParticipationMode::Leaf,
@@ -303,6 +341,37 @@ mod tests {
         assert_eq!(
             opted_in.leaf_egress_hard_bytes_per_sec,
             default_leaf_egress_hard()
+        );
+    }
+
+    #[test]
+    fn omitted_content_bound_msg_id_policy_means_accept_only() {
+        let parsed: GossipConfig = toml::from_str("dispatch_workers = 2").unwrap();
+        assert_eq!(
+            parsed.content_bound_msg_id_policy,
+            ContentBoundMsgIdPolicy::AcceptOnly
+        );
+        assert_eq!(
+            GossipConfig::default().content_bound_msg_id_policy,
+            ContentBoundMsgIdPolicy::AcceptOnly
+        );
+        assert_eq!(parsed.content_bound_msg_id_policy.as_str(), "accept-only");
+    }
+
+    #[test]
+    fn explicit_content_bound_msg_id_policy_parses_every_value() {
+        for (text, expected) in [
+            ("accept-only", ContentBoundMsgIdPolicy::AcceptOnly),
+            ("publish-v3", ContentBoundMsgIdPolicy::PublishV3),
+            ("require-v3", ContentBoundMsgIdPolicy::RequireV3),
+        ] {
+            let parsed: GossipConfig =
+                toml::from_str(&format!("content_bound_msg_id_policy = \"{text}\"")).unwrap();
+            assert_eq!(parsed.content_bound_msg_id_policy, expected);
+            assert_eq!(expected.as_str(), text);
+        }
+        assert!(
+            toml::from_str::<GossipConfig>("content_bound_msg_id_policy = \"publish_v3\"").is_err()
         );
     }
 

@@ -1098,6 +1098,18 @@ async fn pre_cutoff(
     // agent; once A and C hold the record, B's rebind of a later renewal
     // is refused with `rebind_signer_ineligible`, and no node binds it.
     let (later, later_digest, _) = issue_for(sim, "A", "B", not_after0 + 2 * RENEWAL_EXTRA).await?;
+    // B's revocation obliges A, the Home's only admin, to exclude B, and A
+    // seals once C answers its §2 head catch-up ask. With an immediate
+    // gossip flush that exchange can finish, and B drop the group, before
+    // B's rebind below. Run (7) asks B's route while B still holds the
+    // group, so every catch-up ask A sends for it parks before it leaves
+    // until B's rebind has been answered.
+    let a_asks = crate::server::routes::named_groups::detached_send_test_seam::arm_every(
+        &crate::server::routes::named_groups::detached_send_test_seam::catchup_page_from_key(
+            &sim.agent_hex("A")?,
+            group,
+        ),
+    );
     let (status_rv, body_rv) = sim
         .api(
             "B",
@@ -1129,6 +1141,12 @@ async fn pre_cutoff(
             Some(json!({"certificate": later})),
         )
         .await?;
+    receipt.note(format!(
+        "run (7): A's catch-up asks parked until B's rebind was answered; an ask reached the \
+         gate: {}",
+        a_asks.reached()
+    ));
+    drop(a_asks);
     pause(sim, "after the revoked agent's rebind", QUIET).await?;
     let after7 = seats(sim, THREE, group, b).await?;
     let refused7 = signer_ineligible(status7, &body7);
