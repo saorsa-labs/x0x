@@ -177,6 +177,7 @@ pub(in crate::server) async fn subscribe(
             }
             let (release_tx, released) = tokio::sync::watch::channel(false);
             let mut recv_sub = sub;
+            let shutdown = state.shutdown_started.clone();
             let forwarder = tokio::spawn(async move {
                 // First local. Its drop sends the completion signal. DELETE
                 // also waits until the task is finished, which is after this
@@ -187,7 +188,13 @@ pub(in crate::server) async fn subscribe(
                 // polled. The DELETE tests use that to hold `HistoryHandle`.
                 #[cfg(test)]
                 tests::rest_forwarder_test_pause::wait(&topic);
-                while let Some(msg) = recv_sub.recv().await {
+                loop {
+                    let msg = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break,
+                        msg = recv_sub.recv() => msg,
+                    };
+                    let Some(msg) = msg else { break };
                     if let Some(history) = history.as_ref() {
                         record_topic_message(history, &topic, &msg);
                     }

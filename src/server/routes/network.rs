@@ -1240,6 +1240,7 @@ mod participation_diagnostics_tests {
             kind: saorsa_gossip_types::MessageKind::Eager,
             hop: 0,
             ttl: 10,
+            created_at_secs: None,
         };
         let header_bytes = postcard::to_stdvec(&header).unwrap();
         let signature = signing_key.sign(&header_bytes).unwrap();

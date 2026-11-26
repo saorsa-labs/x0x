@@ -3391,9 +3391,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-coordinator"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c09671dea0dc4680ae295b4fa87276583b2157efac8fd3ed5c21ce7e75aa42a"
+checksum = "05c4c47afa22a5432152be7d747a05c9ac8c94e200f31a2c39de64dce23aaab1"
 dependencies = [
  "ant-quic 0.29.0",
  "anyhow",
@@ -3414,9 +3414,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-crdt-sync"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c37d816aef1ab0d220b23673c46e7631a4e0873be26afda5118b4eafe8eeda0"
+checksum = "6636d341804e32c7af7ced3248b3acf47887003d829c36a59ba3de6a70845a65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3429,9 +3429,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-groups"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc63aa9aef14544f68cb62d7ce820ddc54a5a2159e5ae4c5dac6144013639c9a"
+checksum = "01a29448bdaddaa20976d2c02e4587aaf2c030f886fc778600a47dece8c22441"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3442,9 +3442,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-identity"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b825921e59c4ed2afac50c9a6298d2ec2fa6ee43ec188a50d1df07e4d5e0c184"
+checksum = "044ff7b7d99c993e4cee41a1af31e1e0b11d4edad1bb5608374a8f3028539245"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3457,9 +3457,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-membership"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93e41fc3e402a1cc4cfd7e658614e8492583af88ca0e24d082c6a04cf6d5cbe3"
+checksum = "b297d6f02eced130b2099038dc3f1108f4716cee4797f58fe51796acfb300dbb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3475,9 +3475,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-presence"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb1901311875cc2e0307e61a530872602157fec17417ce57fd59c19bfebd154"
+checksum = "e1e9fe793c5eef762290279664d7009e8c60cf6e6a5d91abab94ec2f52d6cacc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3497,9 +3497,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-pubsub"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6d5c8ba47be8bf091220e2eec882915b941e1a4d75f74b734d79c1f72876954"
+checksum = "e7af6a3a3c7466b2c5f32db7845aeb8c6b4a4515fa81d5673c812c3f760a0394"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3520,9 +3520,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-rendezvous"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fd4816730b577395348f6f8f634f08c1b853948494e218c619a8ce242aeb059"
+checksum = "18afb85e7790cf9f20279706f345f3ac3fda960e580f4d39200dca0abfdfb715"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3536,9 +3536,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-runtime"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3298b3352bf1a3095b38a630a0c966b15e3455e525960632b29a1c7a9f1e5f5f"
+checksum = "4d636452dd01e10a96a987013c5d72bdf6c634257043b2f5c2d5426047d4227f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3562,9 +3562,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-transport"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f37c1fac02f07f88ff4993fc12f90220a1175125b09b0f180706bfd6eb19281f"
+checksum = "834886e0ec105de3997c1d338ec0f230782c2f236b5ab7b5b07a43f558bbf896"
 dependencies = [
  "ant-quic 0.29.0",
  "anyhow",
@@ -3584,9 +3584,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-types"
-version = "0.5.97"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41b39c814ccde7a1106651f0d099723b83958553af6ca00b9ff87ebac010437a"
+checksum = "df965f1916d451b2cc04f9d3ab72b310eb76c45330e4d045ca41bd56fdf570e9"
 dependencies = [
  "anyhow",
  "async-trait",

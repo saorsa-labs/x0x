@@ -37,6 +37,7 @@ fn build_eager_wire(
         hop: 0,
         ttl: 10,
         payload_hash: None,
+        created_at_secs: None,
     };
     header.seal_payload_hash(Some(payload.as_ref()));
     let header_bytes = postcard::to_stdvec(&header).expect("bench header serializes");

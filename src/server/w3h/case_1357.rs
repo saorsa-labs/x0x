@@ -1435,6 +1435,23 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let late_hold = (arm.hold == Hold::AllPathsUntilHalfW)
         .then(|| LateHold::install(sim, "A", release))
         .transpose()?;
+    // The restart arm crashes A after durable intake and before any
+    // exclusion. A seals once C answers its §2 head catch-up ask, and with
+    // an immediate gossip flush that exchange can finish before the case
+    // sees the durable `.evs` row. So every catch-up ask A sends for the
+    // group parks before it leaves until A has crashed: C gets no ask, and
+    // the restarted A's head sync starts from nothing on both sides.
+    let mut a_asks = if arm.restart_a {
+        Some(
+            crate::server::routes::named_groups::detached_send_test_seam::arm_every(
+                &crate::server::routes::named_groups::detached_send_test_seam::catchup_page_from_key(
+                    &a_hex, &group,
+                ),
+            ),
+        )
+    } else {
+        None
+    };
 
     // t = 0.
     let trigger = sim
@@ -1561,6 +1578,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             at(sim),
         );
         sim.stop("A", RestartMode::Crash).await?;
+        if let Some(gate) = a_asks.take() {
+            receipt.note(format!(
+                "A's catch-up asks parked until its crash; an ask reached the gate: {}",
+                gate.reached()
+            ));
+        }
         sim.start_again("A").await?;
         sim.until("A and C reconnect", SETUP, async |s: &Sim| {
             connected_to(s, "A", "C").await

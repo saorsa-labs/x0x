@@ -27,6 +27,14 @@ KEY_CACHE_CONTROL_TOPIC = "saorsa-gossip/key-cache-control/v1"
 CONTROL = "87f4025bf2b9a4ad"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
+# crates.io 0.6.1 (Wave 2): record_outbound, OutboundTopicMeters and
+# wire_bytes_for_peer are unchanged against 0.5.97 (registry sources
+# compared); the per-topic snapshot still exposes exactly four KINDS. New
+# PRUNE/GRAFT/IDONTWANT sends book to their own OutboundWireKind slots, not
+# to anti_entropy, and key_cache CONTROL_DOMAIN is unchanged. IDONTWANT and
+# the capability gate change eager attempt counts only. Content-bound v3
+# headers change frame sizes only under publish-v3/require-v3; x0x defaults
+# to accept-only (v2 headers).
 # crates.io 0.5.97 (#2187 Wave 1): pubsub src/ changes. The published crate
 # is byte-identical to the sg release 4e6d852, the squash of sg PR #138 head
 # 45803673 (dual Fable + Opus exact-head review, 22-23 Nov 2026); the meter
@@ -62,9 +70,9 @@ HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 # wire_bytes_for_peer and key_cache CONTROL_DOMAIN retain the reviewed
 # accounting semantics. Refused replays and claim changes can move attempt
 # counts without changing the meter.
-REGISTRY_PUBSUB_VERSION = "0.5.97"
+REGISTRY_PUBSUB_VERSION = "0.6.1"
 REGISTRY_PUBSUB_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-REGISTRY_PUBSUB_SHA = "e6d5c8ba47be8bf091220e2eec882915b941e1a4d75f74b734d79c1f72876954"
+REGISTRY_PUBSUB_SHA = "e7af6a3a3c7466b2c5f32db7845aeb8c6b4a4515fa81d5673c812c3f760a0394"
 GIT_PUBSUB_VERSION = "0.5.85"
 GIT_PUBSUB_URL = "https://github.com/saorsa-labs/saorsa-gossip.git"
 # SG 997abc75: per-peer wire-byte accounting via wire_bytes_for_peer;
@@ -120,7 +128,7 @@ def validate_source_premise(cargo_bytes, rust_bytes):
     manifest = tomllib.loads(cargo_bytes.decode())
     pin = manifest.get("dependencies", {}).get("saorsa-gossip-pubsub")
     patch = manifest.get("patch", {}).get("crates-io", {}).get("saorsa-gossip-pubsub")
-    # Registry 0.5.97 is the current package; the historical git producers
+    # Registry 0.6.1 is the current package; the historical git producers
     # remain at 0.5.85 and require an exact reviewed patch revision.
     if patch is None:
         require(pin == f"={REGISTRY_PUBSUB_VERSION}", "WORKSPACE_PUBSUB_PIN_MISMATCH")

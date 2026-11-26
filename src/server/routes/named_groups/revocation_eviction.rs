@@ -1289,6 +1289,9 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
     }
     let notify = state.agent.s4_revocation_intake().notified();
     loop {
+        if state.shutdown_started.is_cancelled() {
+            break;
+        }
         // §5: re-scan on host commit; the load then does what the trial
         // load deferred.
         if state.revocation_evictions.inner.lock().await.trial_load && host_commit_gate_open(&state)
@@ -1310,6 +1313,8 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
         rebind::drive(&state).await;
         owner_recovery::drive(&state).await;
         tokio::select! {
+            biased;
+            () = state.shutdown_started.cancelled() => break,
             () = notify.notified() => {}
             () = tokio::time::sleep(S4_WORKER_TICK) => {}
         }

@@ -30,7 +30,7 @@ pub const PER_KIND_ROLLING_WINDOW: Duration = Duration::from_secs(60);
 pub const PER_KIND_BUS_SHARE_THRESHOLD: f64 = 0.40;
 
 /// Stable kind keys — same lowercase set as `inbound_by_topic` / `outbound_by_kind`.
-pub const PER_KIND_NAMES: [&str; 9] = [
+pub const PER_KIND_NAMES: [&str; 12] = [
     "eager",
     "ihave",
     "iwant",
@@ -40,6 +40,9 @@ pub const PER_KIND_NAMES: [&str; 9] = [
     "presence",
     "anti_entropy",
     "shuffle",
+    "prune",
+    "graft",
+    "idontwant",
 ];
 
 fn kind_index(kind: MessageKind) -> usize {
@@ -53,6 +56,9 @@ fn kind_index(kind: MessageKind) -> usize {
         MessageKind::Presence => 6,
         MessageKind::AntiEntropy => 7,
         MessageKind::Shuffle => 8,
+        MessageKind::Prune => 9,
+        MessageKind::Graft => 10,
+        MessageKind::IDontWant => 11,
     }
 }
 

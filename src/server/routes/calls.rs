@@ -298,7 +298,13 @@ pub(in crate::server) async fn call_hangup(
 /// mid-call can still hang up).
 pub(in crate::server) async fn run_call_listener(state: Arc<AppState>) {
     let mut rx = state.agent.subscribe_direct();
-    while let Some(msg) = rx.recv().await {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            () = state.shutdown_started.cancelled() => break,
+            msg = rx.recv() => msg,
+        };
+        let Some(msg) = msg else { break };
         let Some(frame) = CallFrame::decode(&msg.payload) else {
             continue;
         };
@@ -351,7 +357,11 @@ pub(in crate::server) async fn run_call_listener(state: Arc<AppState>) {
 pub(in crate::server) async fn run_call_sweeper(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(SWEEP_INTERVAL);
     loop {
-        interval.tick().await;
+        tokio::select! {
+            biased;
+            () = state.shutdown_started.cancelled() => break,
+            _ = interval.tick() => {}
+        }
         let (events, frames) = state.calls.lock().await.expire(now_ms());
         broadcast_call_events(&state, events);
         for (peer, frame) in frames {
