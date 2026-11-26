@@ -540,18 +540,16 @@ fi
 if [ -n "$GUI_PROOF_SKIP_REASON" ]; then
     skip "GUI proof" "$GUI_PROOF_SKIP_REASON"
 elif [ -n "$NYC_TK" ] && [ -n "$SGP_AID" ] && [ -n "${PAIR_CONNECTED[nyc_singapore]:-}" ]; then
-    # Clawpatch 7fc6183 (critical security): /gui no longer injects the API
-    # token into the served HTML. The GUI contract is now: unauthenticated
-    # /gui answers 401; /gui?token=<SESSION> serves the chat UI with no token
-    # anywhere in the HTML; the browser proof bootstraps via the same
-    # ?token= query (session tokens only — the durable token is never
-    # accepted in a URL).
-    GUI_STATUS=$(vps_ssh "$NYC_IP" "curl -s -o /dev/null -w '%{http_code}' -m 15 'http://127.0.0.1:${X0X_API_PORT}/gui'" 2>/dev/null || echo "000")
+    # A11 amendment (26 Nov 2026): bare /gui serves the static HTML shell
+    # (zero secrets) so reload/bookmarks work via sessionStorage; supplying
+    # ?token=<DURABLE> MUST still answer 401, and /gui?token=<SESSION> serves
+    # the chat UI with no token anywhere in the HTML.
+    GUI_STATUS=$(vps_ssh "$NYC_IP" "curl -s -o /dev/null -w '%{http_code}' -m 15 'http://127.0.0.1:${X0X_API_PORT}/gui?token=$NYC_TK'" 2>/dev/null || echo "000")
     TOTAL=$((TOTAL+1))
     if [ "$GUI_STATUS" = "401" ]; then
-        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GET /gui refuses unauthenticated access (401)"
+        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GET /gui?token=<durable> refuses durable token in URL (401)"
     else
-        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} GET /gui unauthenticated status $GUI_STATUS (expected 401)"
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} GET /gui?token=<durable> status $GUI_STATUS (expected 401)"
     fi
 
     GUI_SESSION=$(vps_ssh "$NYC_IP" "curl -sf -m 15 -X POST 'http://127.0.0.1:${X0X_API_PORT}/auth/session' -H 'Authorization: Bearer $NYC_TK'" 2>/dev/null | jq -r '.session_token // empty')

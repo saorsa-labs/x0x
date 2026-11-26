@@ -75,6 +75,21 @@ pub(super) fn authorize(
             }
         }
     }
+    // (4b) Embedded GUI static shell (A11 amendment of 26 Nov 2026):
+    // `GET /gui` and `GET /gui/` serve a static compile-time HTML shell with
+    // no secrets or daemon state. Allow bare `GET` with no supplied
+    // credential so browser reload (after `?token=` is stripped), bookmarks,
+    // and direct navigation load the shell (which reuses `sessionStorage` or
+    // renders a sign-in overlay). Any supplied `?token=` or `Authorization`
+    // header must still validate above, so `?token=<durable>` and replaced
+    // or invalid tokens keep returning 401.
+    if method == Method::GET
+        && is_gui_shell_path(path)
+        && header_token.is_none()
+        && query_token.is_none()
+    {
+        return Ok(Grant::Open);
+    }
     // (5) A lapsed session token reaches refresh and revoke and nothing else.
     // Revoke also takes a token a refresh just replaced, so a sign-out that
     // lost the race to a refresh still ends the session.
@@ -520,6 +535,10 @@ pub(in crate::server) fn has_valid_owner_bearer(
 
 fn is_auth_exempt_path(path: &str) -> bool {
     path == "/health" || path.starts_with("/constitution")
+}
+
+fn is_gui_shell_path(path: &str) -> bool {
+    matches!(path, "/gui" | "/gui/")
 }
 
 fn accepts_query_token(path: &str) -> bool {
@@ -1637,13 +1656,84 @@ mod tests {
     // -- Auth-exempt / query-token path predicates.
 
     #[test]
-    fn gui_requires_auth_but_accepts_query_token_bootstrap() {
+    fn gui_shell_allows_bare_get_but_validates_supplied_credentials() {
+        // A11 amendment of 26 Nov 2026: bare GET /gui serves the static HTML
+        // shell so reload/bookmarks work via sessionStorage or sign-in UI,
+        // while any supplied credential (including ?token=<durable>) is still
+        // validated and rejected if invalid.
         assert!(!is_auth_exempt_path("/gui"));
         assert!(!is_auth_exempt_path("/gui/"));
+        assert!(is_gui_shell_path("/gui"));
+        assert!(is_gui_shell_path("/gui/"));
         assert!(accepts_query_token("/gui"));
         assert!(accepts_query_token("/gui/"));
         assert!(accepts_query_token("/peers/events"));
         assert!(accepts_query_token("/presence/events"));
+
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let session = sessions.issue();
+        for path in ["/gui", "/gui/"] {
+            assert_eq!(
+                authorize(path, &Method::GET, None, None, TEST_API_TOKEN, &sessions),
+                Ok(Grant::Open),
+                "bare GET {path} must serve static GUI shell"
+            );
+            assert!(
+                matches!(
+                    authorize(
+                        path,
+                        &Method::GET,
+                        None,
+                        Some(&session),
+                        TEST_API_TOKEN,
+                        &sessions
+                    ),
+                    Ok(Grant::Session(_))
+                ),
+                "GET {path}?token=<session> must authenticate session"
+            );
+            assert_eq!(
+                authorize(
+                    path,
+                    &Method::GET,
+                    None,
+                    Some(TEST_API_TOKEN),
+                    TEST_API_TOKEN,
+                    &sessions
+                ),
+                Err(StatusCode::UNAUTHORIZED),
+                "GET {path}?token=<durable> must stay 401"
+            );
+            assert_eq!(
+                authorize(
+                    path,
+                    &Method::GET,
+                    None,
+                    Some("bogus-token"),
+                    TEST_API_TOKEN,
+                    &sessions
+                ),
+                Err(StatusCode::UNAUTHORIZED),
+                "GET {path}?token=<bogus> must stay 401"
+            );
+            assert_eq!(
+                authorize(
+                    path,
+                    &Method::GET,
+                    Some("bogus-bearer"),
+                    None,
+                    TEST_API_TOKEN,
+                    &sessions
+                ),
+                Err(StatusCode::UNAUTHORIZED),
+                "GET {path} with invalid bearer must stay 401"
+            );
+            assert_eq!(
+                authorize(path, &Method::POST, None, None, TEST_API_TOKEN, &sessions),
+                Err(StatusCode::UNAUTHORIZED),
+                "POST {path} without credential must stay 401"
+            );
+        }
     }
 
     // ========================================================================

@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.50.1] - 2026-11-26
+
+### Changed
+
+- **Embedded GUI static shell reloads cleanly and provides a sign-in overlay
+  (A11 amendment of 26 Nov 2026).** Bare `GET /gui` and `GET /gui/` (with no
+  `Authorization` header and no `?token=` query parameter) now serve the
+  compile-time static HTML shell (`200 OK`) with `X-Frame-Options: DENY` and
+  `Content-Security-Policy: frame-ancestors 'none'` instead of `401`. Any
+  supplied `?token=` or `Authorization` header is still strictly validated,
+  preserving the `#127` rule that durable API tokens and replaced or invalid
+  session tokens are refused with `401` in query strings. Reloading an open GUI
+  tab (`Cmd+R`/`F5`) now reuses the live `sessionStorage` token seamlessly,
+  while opening `/gui` directly without a session (or after sign-out, idle
+  expiry, or a daemon restart) displays a **Connect to x0x** overlay directing
+  the user to run `x0x gui` or paste a session token minted via
+  `x0x auth session`.
+- **Documentation (`README.md`).** Added dedicated guides for installing x0x,
+  upgrading a running daemon (`x0x upgrade --check` / `--apply` / `--apply --now`,
+  GUI banner, REST, and installer), human collaboration, agent teams, sharing
+  agents via `ShareGrant`, GUI session-token troubleshooting, and every GUI
+  menu, Space app (including Scratch), and detail drawer.
+
+### Fixed
+
+- **GUI session expiry and owner-token prompts (`src/gui/x0x-gui.html`).**
+  `apiWith` now ends the session and shows the reconnect overlay immediately on
+  a `401` for the active session token (for example after a daemon restart or
+  upgrade) instead of letting background polls fail silently. `ownerApi` now
+  clears a rejected token on durable-required `403` as well as `401` (so
+  accidentally pasting a session token never wedges the tab) and shows the
+  macOS/Linux `api-token` paths in the prompt.
+
 ## [0.50.0] - 2026-11-26
 
 ### Fixed

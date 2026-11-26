@@ -571,11 +571,31 @@ tr:hover td{background:rgba(255,255,255,.01)}
 }
 :focus-visible{outline:2px solid var(--cy);outline-offset:2px}
 [role="button"]{cursor:pointer}
+#session-overlay{position:fixed;inset:0;z-index:2000;display:none;align-items:center;justify-content:center;background:rgba(10,12,20,.78);backdrop-filter:blur(6px);padding:20px}
+#session-overlay.open{display:flex}
+.session-card{width:100%;max-width:460px;background:var(--bg2);border:1px solid var(--bd);border-radius:12px;padding:24px;box-shadow:0 16px 48px rgba(0,0,0,.35)}
+.session-card h2{margin:0 0 8px;font-size:18px}
+.session-card p{margin:0 0 12px;font-size:13px;color:var(--tx2);line-height:1.5}
+.session-card code{background:var(--bg3);padding:2px 6px;border-radius:4px;font-family:var(--mono);font-size:12px;color:var(--cy)}
+.session-card .session-err{font-size:12px;color:var(--rd);margin-top:8px;min-height:16px}
 </style>
 <!-- X0X_TOKEN_INJECTION_POINT -->
 </head>
 <body>
 <a href="#main" class="skip-link">Skip to content</a>
+<div id="session-overlay" role="dialog" aria-modal="true" aria-labelledby="session-overlay-title">
+  <div class="session-card">
+    <h2 id="session-overlay-title">Connect to x0x</h2>
+    <p id="session-overlay-msg">This tab does not have an active browser session.</p>
+    <p><strong>Recommended:</strong> run <code>x0x gui</code> in your terminal to open an authenticated tab automatically.</p>
+    <p style="margin-bottom:8px"><strong>Or paste a browser session token</strong> from <code>x0x auth session</code> (not your durable <code>api-token</code>):</p>
+    <div class="row" style="gap:8px">
+      <input id="session-token-input" type="password" placeholder="Paste session_token…" autocomplete="off" style="flex:1" onkeydown="if(event.key==='Enter')submitSessionToken()">
+      <button class="pri" id="session-token-btn" onclick="submitSessionToken()">Connect</button>
+    </div>
+    <div id="session-overlay-err" class="session-err"></div>
+  </div>
+</div>
 <button id="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')" aria-label="Toggle navigation">&#9776;</button>
 <div id="gui-show-banner" role="status" aria-live="polite">
   <span class="banner-text" id="gui-show-banner-text"></span>
@@ -819,6 +839,7 @@ function endSession(message,revoke){
   el.className='toast error';
   el.textContent=message;
   document.getElementById('toasts').appendChild(el);
+  if(typeof showSessionOverlay==='function')showSessionOverlay(message);
 }
 function maybeRefreshSession(){
   if(SESSION_TOKEN&&sessionIdleLapsed()){endSession('Session expired — reopen with `x0x gui`',true);return}
@@ -873,7 +894,7 @@ function readOwnerToken(){try{return sessionStorage.getItem('x0x_owner_token')||
 let OWNER_TOKEN=readOwnerToken();
 function durableRequired(r){return !!(r&&r._http_status===403&&String(r.error||'').indexOf('durable')!==-1)}
 function forgetRejectedOwnerToken(token,r){
-  if(!token||!r||r._http_status!==401)return false;
+  if(!token||!r||(r._http_status!==401&&!durableRequired(r)))return false;
   // An older request must not erase a token entered while it was in flight.
   if(OWNER_TOKEN===token){
     OWNER_TOKEN='';
@@ -884,9 +905,17 @@ function forgetRejectedOwnerToken(token,r){
 async function ownerApi(path,opt){
   const token=OWNER_TOKEN;
   let r=await apiWith(token||SESSION_TOKEN,path,opt);
-  if(forgetRejectedOwnerToken(token,r))r=await apiWith(SESSION_TOKEN,path,opt);
+  const rejected=forgetRejectedOwnerToken(token,r);
+  if(rejected)r=await apiWith(SESSION_TOKEN,path,opt);
   if(durableRequired(r)&&!OWNER_TOKEN){
-    const t=prompt("This action requires the durable API token (owner authority).\nPaste it — it is kept only in this tab's sessionStorage:");
+    const prefix=rejected?'That token was rejected (paste the durable api-token, not a session token).\n\n':'This action requires the durable API token (owner authority).\n\n';
+    const t=prompt(
+      prefix
+      +"Read it from your data directory:\n"
+      +"  macOS: ~/Library/Application Support/x0x/api-token\n"
+      +"  Linux: ~/.local/share/x0x/api-token\n\n"
+      +"Paste it here — kept only in this tab's sessionStorage:"
+    );
     if(t&&t.trim()){
       OWNER_TOKEN=t.trim();
       try{sessionStorage.setItem('x0x_owner_token',OWNER_TOKEN)}catch(e){}
@@ -908,8 +937,62 @@ async function apiWith(bearer,path,opt){
       data._http_status=r.status;
       if(!r.ok&&!data.error)data.error=r.statusText||('HTTP '+r.status);
     }
+    if(r.status===401&&bearer&&bearer===SESSION_TOKEN&&typeof sessionRefreshing!=='undefined'&&!sessionRefreshing&&typeof endSession==='function'&&path!=='/auth/session/refresh'&&path!=='/auth/session/revoke'){
+      endSession('Session expired or daemon restarted — reopen with `x0x gui`',false);
+    }
     return data;
   }catch(e){return null}
+}
+function showSessionOverlay(msg){
+  const ov=document.getElementById('session-overlay');
+  if(!ov)return;
+  const m=document.getElementById('session-overlay-msg');
+  if(m)m.textContent=msg||'This tab does not have an active browser session.';
+  const err=document.getElementById('session-overlay-err');
+  if(err)err.textContent='';
+  ov.classList.add('open');
+  const inp=document.getElementById('session-token-input');
+  if(inp){inp.value='';setTimeout(()=>inp.focus(),50)}
+}
+function hideSessionOverlay(){
+  const ov=document.getElementById('session-overlay');
+  if(ov)ov.classList.remove('open');
+}
+async function submitSessionToken(){
+  const inp=document.getElementById('session-token-input');
+  const err=document.getElementById('session-overlay-err');
+  const btn=document.getElementById('session-token-btn');
+  const raw=(inp&&inp.value||'').trim();
+  if(!raw){if(err)err.textContent='Paste a session_token from `x0x auth session`.';return}
+  if(err)err.textContent='';
+  if(btn){btn.disabled=true;btn.textContent='Connecting…'}
+  const r=await apiWith(raw,'/auth/session/refresh',{method:'POST',body:JSON.stringify({idle_ms:0})});
+  if(btn){btn.disabled=false;btn.textContent='Connect'}
+  if(r&&r._http_ok&&r.session_token){
+    SESSION_TOKEN=r.session_token;
+    sessionIssuedAt=Date.now();
+    sessionClockKnown=true;
+    sessionExpired=false;
+    lastUserActivity=Date.now();
+    if(r.idle_timeout_secs>0)sessionIdleTimeoutMs=r.idle_timeout_secs*1000;
+    try{
+      sessionStorage.setItem('x0x_session_token',SESSION_TOKEN);
+      sessionStorage.setItem('x0x_session_issued_at',String(sessionIssuedAt));
+      sessionStorage.setItem('x0x_last_activity',String(lastUserActivity));
+      if(sessionIdleTimeoutMs>0)sessionStorage.setItem('x0x_idle_timeout_ms',String(sessionIdleTimeoutMs));
+    }catch(e){}
+    hideSessionOverlay();
+    const t=document.getElementById('toasts');
+    if(t)t.innerHTML='';
+    startGuiActive();
+    return;
+  }
+  if(!r){if(err)err.textContent='Cannot reach x0xd at '+BASE+'. Is the daemon running?';return}
+  if(r._http_status===403){
+    if(err)err.textContent='That is the durable api-token — run `x0x auth session` to mint a browser session token (or run `x0x gui`).';
+    return;
+  }
+  if(err)err.textContent=(r.error||'Invalid or expired session token')+' — run `x0x gui` or `x0x auth session`.';
 }
 
 const DEFAULT_SYMPHONY_DAEMON_URL='http://127.0.0.1:8642';
@@ -6607,14 +6690,22 @@ async function pollAll(){
 applyTheme(LS.get('theme','light'));
 
 // Init. Confirm the daemon token clock before the socket says this tab is live.
-async function startGui(){
-  await bootstrapGuiSession();
+function startGuiActive(){
   wsConnect();
   pollDash();
   pollContacts();
   pollGroups();
   if(!applyHashRoute())renderView();
   renderSidebar();
+}
+async function startGui(){
+  if(!SESSION_TOKEN){
+    showSessionOverlay('Sign in to connect this tab to your local x0x daemon.');
+    return;
+  }
+  await bootstrapGuiSession();
+  if(sessionExpired)return;
+  startGuiActive();
 }
 startGui();
 window.onhashchange=applyHashRoute;
@@ -6631,9 +6722,9 @@ for(const type of ['pointerdown','pointermove','keydown','wheel','touchstart','i
   document.addEventListener(type,noteUserActivity,{capture:true,passive:true});
 }
 
-setInterval(pollAll,5000);
-setInterval(()=>{pollContacts();pollGroups()},8000);
-setInterval(checkNewMachines,30000);
+setInterval(()=>{if(SESSION_TOKEN&&!sessionExpired)pollAll()},5000);
+setInterval(()=>{if(SESSION_TOKEN&&!sessionExpired){pollContacts();pollGroups()}},8000);
+setInterval(()=>{if(SESSION_TOKEN&&!sessionExpired)checkNewMachines()},30000);
 
 // Restore last view
 const lastView=LS.get('last_view','home');

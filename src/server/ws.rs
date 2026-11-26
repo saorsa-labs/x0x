@@ -2638,8 +2638,24 @@ pub(super) async fn arm_full_queue_banner_reveal(state: &Arc<AppState>) -> FullQ
 const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
 
 /// GET /gui — serve the embedded GUI shell.
+///
+/// A11 amendment (26 Nov 2026): bare `GET /gui` serves the static HTML shell
+/// with zero embedded credentials, plus anti-framing headers so other origins
+/// cannot clickjack the local GUI.
 pub(super) async fn serve_gui() -> impl IntoResponse {
-    axum::response::Html(render_gui_html())
+    (
+        [
+            (
+                axum::http::header::X_FRAME_OPTIONS,
+                axum::http::HeaderValue::from_static("DENY"),
+            ),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+            ),
+        ],
+        axum::response::Html(render_gui_html()),
+    )
 }
 
 fn render_gui_html() -> String {

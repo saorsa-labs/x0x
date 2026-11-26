@@ -6,356 +6,702 @@
 
 **People, their agents and their machines collaborating.**
 
-x0x is a post-quantum gossip network for that collaboration. Humans share documents and messages. Humans have agents, and those agents collaborate with people and with each other. Humans and agents connect their machines. A daemon (`x0xd`) runs on each machine and does the networking. You drive it with the `x0x` CLI, the built-in web GUI, or the local REST API. Actions are attributable to a key the owner controls.
-
-David stated this product vision on 13 Oct 2026. The marks below are against commit `86a1d395` on `main`. Each Shipped row names the file or symbol checked at that commit. **Shipped** means this tree does it now. **Target** means the direction is recorded and the work is not complete. **Parked** means new implementation stays sequenced. Shipped code in a parked area still receives security and bug fixes.
-
-| Vision point | Mark | What this tree supports |
-| --- | --- | --- |
-| Humans share messages | Shipped | Checked at `86a1d395`. Direct messages (`direct_send` in `src/server/routes/direct.rs`). Group messages (`send_group_public_message` and `secure_group_encrypt` in `src/server/routes/named_groups.rs`). |
-| Humans share files and shared data | Shipped | Checked at `86a1d395`. File transfer (`src/server/routes/files.rs`), key-value stores (`src/kv/mod.rs`) and task lists (`TaskList` in `src/crdt/task_list.rs`). Rich documents stay parked. |
-| Collaborative rich text | Parked | The notes merge path stays parked ([ADR 0095](docs/adr/0095-scope-x0x-is-glue.md), [A10](docs/adr/consolidated/A10-r01-shared-data-files-and-synchronization.md)). |
-| Audio and video | Parked | Checked at `86a1d395`. The `/calls` lifecycle (`src/server/routes/calls.rs`) is experimental and carries no media. Release builds lack the `voice` feature. The optional library (`X0xSignaling` and `X0xLinkTransport` in `src/voice/mod.rs`) is two-party audio and stays out of a release build. Video is not implemented. New media work stays sequenced ([ADR 0095](docs/adr/0095-scope-x0x-is-glue.md), [A13](docs/adr/consolidated/A13-r01-voice-and-video.md), [ADR 0073](docs/adr/0073-audio-and-video-calling.md)). |
-| Humans have agents, and agents collaborate | Shipped | Checked at `86a1d395`. Owner identity (`UserId`) and agent identity (`AgentId`) in `src/identity.rs`, groups, delegation (`src/server/delegations.rs`) and task lists (`TaskList`). x0x does not host the model. |
-| Connect machines, in the Tailscale sense | Target | QUIC (`src/network.rs`), local discovery, byte streams (`src/streams.rs`) and loopback TCP forwards (`src/forward.rs`) are in this tree at `86a1d395`. [A05](docs/adr/consolidated/A05-r01-connectivity-discovery-and-names.md) says this is not a complete tailnet. |
-| Humans share agents with each other | Shipped | Checked at `86a1d395`. `ShareGrant` expiry and revocation (`ShareCap` in `src/share_grant.rs`: `Dm`, `Exec`, `Connect`, `GroupInvite`, `Call`) ([ADR 0070](docs/adr/0070-owner-trust-and-share-grants.md)). A partitioned host applies revocation after it receives and verifies the record ([A03](docs/adr/consolidated/A03-r01-trust-permissions-sharing-and-revocation.md)). Home and the owner key stay unshared. |
-| Humans form projects | Target | No project type. A project is a group plus shared data plus shared agents ([T-projects-and-agent-rental](docs/adr/transient/T-projects-and-agent-rental.md), slot A01). |
-| Humans rent agents to each other | Target | Rental builds on that same grant expiry and revocation. x0xd has no price, invoice or marketplace. |
-| Local agents and API-based agents | Shipped | Checked at `86a1d395`. The daemon agent, in-process `serve` (`src/server/mod.rs`) and deny-by-default rider tokens (`rider_route_allowed` in `src/server/rider_auth.rs`) ([ADR 0039](docs/adr/0039-agent-harness-boundary.md)). |
-| A2A and ACP as full session protocols | Target | Checked at `86a1d395`. Shipped pieces: an ACP-attached key (`CertMode::Acp` in `src/profile.rs`; the harness owns it) and an A2A discovery card (`get_a2a_agent_card` in `src/server/routes/identity.rs`, `GET /.well-known/agent-card.json`). [A04](docs/adr/consolidated/A04-r01-agent-attachment-and-inbound-events.md) says x0xd does not run the Agent Client Protocol, and A2A streaming and push stay off. |
-| Peers keep held data inside a partition | Shipped | Checked at `86a1d395`. Held data is the local snapshot a peer already stored. It is not data that state-sync has delivered (#1105). KV snapshots load through `load_snapshot` in `src/kv/sync.rs`. Task-list snapshots load through `TaskListStorage::load_task_list` in `src/crdt/persistence.rs`. [ADR 0006](docs/adr/0006-no-global-dht-for-user-and-group-data.md) is the rule. [A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md) keeps liveness and repair incomplete. Availability stays with the peers who hold the data. |
-| CRDT data | Shipped | Checked at `86a1d395`. Replicated task lists (`TaskList` in `src/crdt/task_list.rs`) and key-value stores (`src/kv/mod.rs`). A last-writer value is not a text editor ([A10](docs/adr/consolidated/A10-r01-shared-data-files-and-synchronization.md)). |
-| BLE, serial and radio | Target | ant-quic 0.27.60 (tag `v0.27.60`, commit `ea64efc5`; same files on master `4c5fde07`) already has the scaffolding. Those paths are in the ant-quic crate. x0x has no `src/transport` directory. ant-quic `src/transport/addr.rs` defines `TransportAddr` for `Ble`, `LoRa` and `Serial`. ant-quic `src/transport/capabilities.rs` defines `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in ant-quic `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. ant-quic stays the transport boundary ([A05](docs/adr/consolidated/A05-r01-connectivity-discovery-and-names.md), Alternate bearers). |
-| Public and private groups | Shipped | Checked at `86a1d395`. Presets `private_secure`, `public_request_secure`, `public_open` and `public_announce` (`GroupPolicyPreset` in `src/groups/policy.rs`). `SignedPublic` is a confidentiality mode. Home stays private ([A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md)). |
-| Those groups challenge Slack and Discord | Target | The group kinds above are the collaboration places. Feature parity with Slack or Discord is not claimed. |
-
-## Architecture review
-
-Read the [accepted 15 ADR set](docs/adr/consolidated/README.md) and the
-[5 October architecture review](docs/reviews/2026-10-05-architecture/README.md).
-David accepted the 15 slots on 7 November 2026; they are the live decision
-authority, and the numbered records stay archived as the historical record.
+x0x is a post-quantum gossip network for that collaboration. Humans share documents and messages. Humans have agents, and those agents collaborate with people and with each other. Humans and agents connect their machines. A daemon (`x0xd`) runs on each machine and does the networking. You drive it with the `x0x` CLI, the built-in web GUI (`x0x gui`), or the local REST/WebSocket/SSE API. Actions are attributable to a key the owner controls.
 
 ---
 
-## The owner-centric model
+## Contents
 
-x0x is built around a **human owner** and their agents, not around a server:
+- [1. Install x0x](#1-install-x0x)
+- [2. Upgrade a running x0x daemon](#2-upgrade-a-running-x0x-daemon)
+- [3. The owner-centric model](#3-the-owner-centric-model)
+- [4. Human collaboration](#4-human-collaboration)
+- [5. Agent teams](#5-agent-teams)
+- [6. Sharing agents with other humans](#6-sharing-agents-with-other-humans)
+- [7. Web GUI — session tokens, menus & screens](#7-web-gui--session-tokens-menus--screens)
+- [8. Security model & partition tolerance](#8-security-model--partition-tolerance)
+- [9. Product vision & architecture review](#9-product-vision--architecture-review)
+- [10. Build on x0x & developer reference](#10-build-on-x0x--developer-reference)
+
+---
+
+## 1. Install x0x
+
+### macOS & Linux (recommended)
+
+```bash
+# Install x0xd + x0x into ~/.local/bin and start the daemon
+curl -sfL https://x0x.md | sh
+
+# Fallback URL (identical script)
+curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh
+```
+
+Useful installer flags:
+
+```bash
+# Install, start, AND configure autostart on login/boot (launchd on macOS, systemd on Linux)
+curl -sfL https://x0x.md | sh -s -- --autostart
+
+# Install and start a separate named instance
+curl -sfL https://x0x.md | sh -s -- --name alice
+
+# Download and verify checksum + ML-DSA-65 manifest + GPG signature without installing
+curl -sfL https://x0x.md | sh -s -- --verify-only
+
+# Install binaries without starting x0xd
+curl -sfL https://x0x.md | sh -s -- --no-start
+```
+
+What the installer does:
+1. Detects your platform (`macos-arm64`, `macos-x64`, `linux-x64-gnu`, `linux-arm64-gnu`).
+2. Downloads the latest GitHub release and verifies its **SHA-256 checksum**, the **ML-DSA-65-signed release manifest**, and (when `gpg` is installed) its **GPG signature** against the pinned Saorsa Labs release key (`CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29`).
+3. Stops any running `x0xd` for that instance, atomically installs `x0xd` and `x0x` into `~/.local/bin`, and starts the daemon.
+
+Make sure `~/.local/bin` is on your `PATH` (add to `~/.zshrc` or `~/.bashrc`):
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Windows (PowerShell 5.1+)
+
+```powershell
+# Install x0xd.exe + x0x.exe to %LOCALAPPDATA%\x0x\bin and add to user PATH
+irm https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.ps1 | iex
+
+# Install and start x0xd immediately
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.ps1))) -Start
+```
+
+### From crates.io (Cargo)
+
+```bash
+cargo install x0x
+```
+
+### Verify & manage the daemon
+
+```bash
+x0x health                # {"ok":true,"status":"healthy","version":"...","peers":...}
+x0x status                # uptime, peer count, connectivity summary
+x0x gui                   # open the built-in web GUI in your browser
+x0x start                 # start x0xd in the background
+x0x stop                  # gracefully stop x0xd
+x0x autostart             # enable start on boot (launchd / systemd)
+x0x autostart --remove    # disable start on boot
+x0x uninstall             # remove binaries (keeps your keys and data)
+x0x purge                 # DESTRUCTIVE: remove all keys, data, and config
+```
+
+**Data directories** (where `api.port`, `api-token`, and `x0xd.log` live):
+
+| Platform | Default instance | Named instance (`--name foo`) |
+|---|---|---|
+| **macOS** | `~/Library/Application Support/x0x` | `~/Library/Application Support/x0x-foo` |
+| **Linux** | `${XDG_DATA_HOME:-~/.local/share}/x0x` | `${XDG_DATA_HOME:-~/.local/share}/x0x-foo` |
+| **Windows** | `%LOCALAPPDATA%\x0x` | `%LOCALAPPDATA%\x0x-foo` |
+
+Identity keys live in `~/.x0x/` (`machine.key`, `agent.key`, and optional `user.key`).
+
+---
+
+## 2. Upgrade a running x0x daemon
+
+The running `x0xd` daemon is the sole update writer — it verifies the ML-DSA-65-signed release manifest, atomically swaps the binaries, performs a transactional restart, and rolls back on health-check failure.
+
+### Option 1 — CLI (recommended)
+
+```bash
+# 1. Read-only check: compares local CLI, running daemon /health, and latest GitHub release
+x0x upgrade --check
+
+# 2. Apply through the running daemon (honours rollout staging window)
+x0x upgrade --apply
+
+# 3. Skip the rollout staging delay and apply immediately
+#    (still enforces signature verification, eligibility, holds, and restart checks)
+x0x upgrade --apply --now
+```
+
+- Target a specific named instance with `x0x --name alice upgrade --apply`.
+- Bare `x0x upgrade` (without `--check` or `--apply`) refuses to overwrite binaries on disk.
+- On Unix, ordinary `x0x upgrade --apply` waits for its durable staging receipt (which can exceed an hour); use `--apply --now` when you want to install immediately.
+
+### Option 2 — One click in the Web GUI
+
+1. Open the GUI with `x0x gui`.
+2. On the **Dashboard**, click **Apply update** in the green **Update available** banner.
+3. When prompted for the **durable API token**, paste the contents of `<data_dir>/api-token` (see [GUI Session Tokens](#gui-session-tokens--troubleshooting)).
+4. **After the daemon restarts**, reconnect in the sign-in overlay or run `x0x gui` (browser sessions live in daemon memory and reset on restart).
+
+### Option 3 — Direct authenticated REST call
+
+**macOS:**
+```bash
+DATA_DIR="$HOME/Library/Application Support/x0x"
+curl -fsS -X POST \
+  -H "Authorization: Bearer $(cat "$DATA_DIR/api-token")" \
+  "http://$(cat "$DATA_DIR/api.port")/upgrade/apply?now=true"
+```
+
+**Linux:**
+```bash
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x"
+curl -fsS -X POST \
+  -H "Authorization: Bearer $(cat "$DATA_DIR/api-token")" \
+  "http://$(cat "$DATA_DIR/api.port")/upgrade/apply?now=true"
+```
+
+### Option 4 — Re-run the installer
+
+Works even if the daemon is stopped, on an older release that predates `--apply`, or if `x0x` and `x0xd` were installed in separate directories:
+
+```bash
+curl -sfL https://x0x.md | sh
+```
+
+### Automatic gossip updates & supervised installs
+
+- **Automatic updates:** `x0xd` listens for ML-DSA-65-signed release manifests on `x0x/release` (with GitHub as first-discovery fallback) unless started with `x0xd --skip-update-check`.
+- **Supervised daemons (`launchd` / `systemd`, ADR-0061):** installs created via `x0x autostart` carry `X0X_SUPERVISED=1` + `KeepAlive: true` (macOS) or `INVOCATION_ID` / `Restart=always` (systemd) so the daemon exits `0` cleanly for the service manager to respawn it without duplicates. If you have a hand-written macOS LaunchAgent, run `x0x autostart --repair` and reload it with the `launchctl` commands it prints.
+- Full architecture and recovery runbook: [docs/upgrade-system.md](./docs/upgrade-system.md).
+
+---
+
+## 3. The owner-centric model
+
+x0x is built around a **human owner**, their **machines**, and their **agents**:
 
 ```
-            YOU — the owner (opt-in user key: ~/.x0x/user.key, ML-DSA-65)
+            YOU — the owner (optional user key: ~/.x0x/user.key, ML-DSA-65)
             │
    ┌────────┴──────────────────────────────────────────┐
-   │ Home — your private space (ADR-0038)               │
+   │ Home — your private owner-certified space          │
    │ Hidden · OwnerCertified · MLS-encrypted            │
-   │ auto-provisioned on each owned install             │
+   │ Only agents certified by YOUR user key can join    │
    │                                                    │
    │  primary agent ──── this machine's daemon agent    │
    │  sub-agents ─────── ACP-attached (own keys) or     │
    │                     riders (scoped API tokens)     │
    └────────┬──────────────────────────────────────────┘
             │
-   machines — one hardware-pinned key per device; agents
-   are Pinned to a machine or Roaming (ADR-0043 ledger)
+   machines — one hardware-pinned key per device (~/.x0x/machine.key)
             │
-   the network — other owners' agents: DMs, shared spaces,
-   task boards, delegation, mentions — peer-to-peer, no server
+   the network — other humans & agents: DMs, Spaces, task boards,
+   file transfers, delegation, share grants — peer-to-peer, no server
 ```
 
-- **Owner** (ADR-0036): an optional human identity key. With it, your install gets names (`/profile`), a **Home** space, a certified-sub-agent roster, cross-device sync, and placement control. Without it, x0x works exactly as before — a single agent on the mesh.
-- **Home** (ADR-0038): a private, encrypted space that only *your* owner-certified agents can join — admission is a cryptographic check, not an admin's judgement call.
-- **Sub-agents** (ADR-0039): give an AI harness an **ACP key** (it owns the keypair, your owner key certifies it) or a **rider token** (deny-by-default scoped token; your daemon signs and attributes every send).
-- **Delegation** (ADR-0040): agent A can grant agent B bounded, expiring authority *inside a space* — B acts signed with B's own key, citing A's grant.
-- **Sync** (ADR-0041): your second machine replicates owner state owner-to-owner — names converge fully; the Home roster arrives as a pointer for future adoption and sub-agent records as issuance facts. Nobody else ever sees it.
+### Optional 60-second owner setup
 
----
-
-## How it works, end to end
-
-Every step is one CLI line and one REST call against your local daemon (`http://127.0.0.1:12700`, bearer token from the data directory). Run them in order on a fresh install:
-
-**1. Install and start.**
+Without a user key, x0x works as a standalone agent on the mesh. Creating a user key makes your install **owned** — unlocking your **Home** space, **profile names**, **sub-agents**, **cross-machine sync**, **owner trust**, and **share grants**:
 
 ```bash
-curl -sfL https://x0x.md | sh     # or: curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh
-x0x start                          # starts x0xd, joins the mesh
-x0x health                         # GET /health  -> {"ok":true,"status":"healthy",...}
+# 1. Create your owner identity keypair (~/.x0x/user.key) and restart
+x0x user-id create
+x0x stop && x0x start
+x0x agent user-id                    # prints your 64-hex UserId
+
+# 2. Set your names (display_name is broadcast; human_name labels your card & Home)
+x0x profile set --display-name "Alice" --machine-name "laptop" --human-name "Alice"
+x0x profile
+
+# 3. Inspect or rename your Home space
+x0x home
+x0x home rename "Alice's Home"
 ```
 
-**2. Claim your owner identity (opt-in).** Creates `~/.x0x/user.key` (ML-DSA-65). Restart the daemon after — an install with a user key is *owned*; this is what unlocks Home, sub-agents, sync, and placement.
+### Adding a second machine
+
+Copy `~/.x0x/user.key` to the second machine (or re-derive it deterministically with `x0x user-id create --from-seed <HEX>`), start `x0xd`, and enroll both machines **bilaterally** (each daemon dials and accepts sync only from machines in its own device set):
 
 ```bash
-x0x user-id create                 # then restart: x0x stop && x0x start
-x0x agent user-id                  # GET /agent/user-id -> your UserId (hex)
-```
+# On machine A (enroll A, then B's machine ID):
+x0x sync enroll
+x0x sync enroll <B_MACHINE_ID>
 
-**3. Name yourself and your machines.** `display_name` rides the signed identity announce (peers see it network-wide); `human_name` labels the owner on your agent card.
-
-```bash
-x0x profile set --display-name "Alice" --machine-name "desk" --human-name "Alice"
-x0x profile                        # GET /profile
-```
-
-**4. Your Home appears.** An owned install provisions one Home at first start — `Hidden + OwnerCertified + MlsEncrypted` — provided it has both an owner key and an agent certificate, and no other device of yours has already advertised one. If another has, this device provisions nothing and `x0x home` reports `state: "elsewhere"` with the command to join it. Rename it if you like:
-
-```bash
-x0x home                           # GET /home -> group_id, primary agent, members, warnings
-x0x home rename "Alice's Home"     # POST /home/rename {"name":"Alice's Home"}
-```
-
-**5. Give an AI harness a sub-agent.** Two modes (ADR-0039). The harness generates the keypair and sends you the *public* key; your owner key certifies it:
-
-```bash
-x0x owner agents issue <PUB_HEX> --mode rider   # POST /owner/agents/issue — certify the key
-                                                 # (--mode acp is the default; see below)
-x0x owner agents                                 # GET /owner/agents — your roster (journal-backed)
-x0x owner riders                                 # GET /owner/riders — token records (no secrets)
-```
-
-- **ACP mode** (default): the harness owns the certified key and connects as a full peer. The CLI covers this end-to-end.
-- **Rider mode:** a scoped API token instead of a key. Certify the key with `--mode rider` **via REST or CLI**, then the *harness* signs a delegation capability with the sub-agent's own key and you mint the token with `POST /owner/riders` including that `delegation` field. The CLI supports this mint — both delegation flags are required:
-
-```bash
-x0x owner riders issue <AGENT_ID> --group <GROUP_ID> \
-  --delegation-payload-b64 <BASE64> --delegation-signature <HEX> \
-  [--label <LABEL>] [--ttl-secs <SECS>]
-```
-
-Build the payload harness-side with the `x0x` crate's `sign_rider_delegation` helper; the signature is the sub-agent's own ML-DSA-65 signature over it. Every group must be granted explicitly with a repeated `--group`, Home included. The REST endpoint takes the same capability. See [docs/api-reference.md](./docs/api-reference.md) for the full flow.
-
-A **rider token** reaches four surfaces. Three of them are group routes — `POST /groups/:id/send`, `POST /groups/:id/secure/encrypt`, and `GET /history` (limit ≤ 100) — and only for **groups explicitly named in its grant list**: there is no implicit Home grant; grant Home's group id like any other group. The fourth surface is `POST /gui/show`, and only when the token's scopes include the explicit permission `gui:show`. A token without `gui:show` is refused on that route. Everything else — `/agent/sign`, `/exec`, `/owner/*`, `/sync/*`, `/shutdown` — answers `403`. Every rider send is signed by your daemon with the sub-agent's authorization embedded *inside the signed bytes*, so receivers can verify attribution cryptographically. Revoking a rider (or its sub-agent) takes effect on the very next request.
-
-**6. The agent acts on your behalf** — DMs, spaces, delegation, mentions, tasks:
-
-```bash
-x0x direct send <AGENT_ID> "draft done"        # POST /direct/send
-x0x group send <GROUP_ID> "shipping now"       # POST /groups/:id/send (REST adds mentions: [hex-id,…])
-x0x group delegate <GROUP_ID> --to-agent <B> --scope send_as --expiry-ms <MS>
-                                               # POST /groups/:id/delegate — B then sends citing
-                                               # the delegation digest, signed with B's OWN key
-x0x tasks add <LIST_ID> "ship the release"     # POST /task-lists/:id/tasks
-```
-
-Attribution fields are **REST-only for now** — the CLI cannot supply them:
-`mentions: [<64-hex agent ids>]` and `delegation_digest` on `POST /groups/:id/send`, and the `delegation` field on task claim/complete (authority evidence for acting under a `task_execute` grant). Receivers route a WS `mention` event when they are named — no string-matching in clients. `x0x group delegate` (issuing grants) works from the CLI.
-
-**7. Add a second device.** Put the same user key on the new machine (`x0x user-id create <path> --from-seed <HEX>` re-derives it deterministically, or copy `user.key`). Sync then needs **bilateral enrollment** — each daemon dials only machines in *its own* device set, and accepts a stream only from a machine *it* has enrolled — so enroll on **both** machines:
-
-```bash
-# on machine A — enroll A itself, then B's machine id:
-x0x sync enroll                    # POST /sync/devices/enroll (omit id = this machine)
-x0x sync enroll <B_MACHINE_ID>     # POST /sync/devices/enroll {"machine_id": "..."}
-
-# on machine B — enroll B itself, then A's machine id:
+# On machine B (enroll B, then A's machine ID):
 x0x sync enroll
 x0x sync enroll <A_MACHINE_ID>
 
-# then, on either machine:
-x0x sync devices                   # GET /sync/devices — device set + last-sync status
+# Check enrolled devices and last-sync status on either machine:
+x0x sync devices
 ```
 
-To put the new machine in the **same Home** (rather than only syncing profile state), seat it — on the machine that holds the Home:
+Once enrolled under the same owner key, your machines gain **owner trust** automatically — no manual contact entries needed between your own devices.
+
+To bring the second machine into your canonical **Home** space:
 
 ```bash
-x0x home seat <NEW_MACHINE_AGENT_ID>   # POST /home/seat — needs the durable API token
+# 1. On the new machine (B), announce once with your owner identity so A can verify your cert:
+x0x announce --include-user --consent
+
+# 2. On the machine holding Home (A), mint a single-agent Home invite:
+x0x home seat <B_AGENT_ID>
+
+# 3. On the new machine (B), run the printed join command:
+x0x group join <INVITE> --home --owner <YOUR_USER_ID>
 ```
-
-That mints an invite addressed to that one agent and prints the join command; it does not join for you. On the new machine run the printed `x0x group join <invite> --home --owner <owner-user-id>`. The response says `"seated": false` until the join is accepted, and it is durable only once the new device is still seated after a restart.
-
-Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-agent issuance facts); DMs and other groups' history never replicate. As implemented today the synced Home pointer is **applied**: a device holding a Home that lost the election reports `state: "adoption_pending"` and names the winner, and a device with no Home reports `state: "elsewhere"`. Applying the pointer is not adoption — moving a device into the canonical Home is an explicit act by you (`x0x home seat <agent-id>` on the device holding it, then `x0x group join <invite> --home --owner <owner-user-id>` on the new one), and rosters are not merged. Synced sub-agent journal lines record the issuance fact (digest + time) without mode, label, or certificate bytes. The joining device needs one explicit `x0x announce` carrying its owner identity so its certificate is visible; a join that arrives first waits in a `pending` state rather than failing. Seating is not complete until that join is accepted and survives a restart on the new device — see [Known limitations](#known-limitations-v041-pre-release).
-
-**8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md). What is implemented today is **point-to-point (two-party) calls**. Call **lifecycle** is REST + CLI (ADR-0073 slice 1): `x0x call <agent_id>` / `POST /calls`, then `x0x call accept|reject|hangup`, with `call.incoming` / `call.state` events on `/events` and `/ws`. **Media** — signaling over DMs (`x0x-voice-sig-v1`), audio over `WebRtcV1` streams with an opt-in unreliable-datagram lane (audio only, mutually negotiated) and reliable-stream fallback — is a library surface behind the `voice` cargo feature (`x0x::voice`). There is **no GUI call button yet**, and multi-party mesh (design-bounded at four participants), SFU, and browser access are recorded ADR follow-ups.
-
-**9. Stay current.** The serving daemon is the only update writer. The CLI can check for a release or ask that daemon to install it:
-
-```bash
-x0x upgrade --check    # read-only: GitHub release check, plus local /health when a daemon answers
-x0x upgrade --apply    # installs through the running daemon's authenticated POST /upgrade/apply
-x0x upgrade --apply --now  # skips staging only; eligibility, holds and transaction checks remain
-# Bare x0x upgrade and --force without --apply do not install.
-# --check takes precedence over --apply; --force cannot bypass daemon apply policy.
-# You can also call the same authenticated endpoint directly:
-# curl -X POST -H "Authorization: Bearer $(cat <data_dir>/api-token)" http://127.0.0.1:<api-port>/upgrade/apply
-```
-
-Use `x0x upgrade --apply`, REST or the GUI to request installation. The daemon checks the signed release and owns the download, verification, replacement and restart. `x0xd --check-updates` only reports availability; it does not install binaries or SKILL.md. The daemon also distributes ML-DSA-65-signed manifests over the `x0x/release` gossip topic, with GitHub as the first-discovery fallback. See [docs/upgrade-system.md](./docs/upgrade-system.md), and never downgrade an owned install to v0.40.x (#451).
-
-On Unix, ordinary apply waits for its durable staging receipt. `--now`
-maps to the same authenticated route with `?now=true`; it cannot bypass a
-held release or a mandatory probe retry wait. It requires `--apply` and
-cannot be combined with `--check`. The CLI keeps the apply request open
-during staging, which can exceed an hour.
 
 ---
 
-## Security model, in plain words
+## 4. Human collaboration
 
-- **Cryptographic Home admission.** Joining a Home requires an agent certificate that chains to *your* owner key — checked when the invite is accepted and again at every state seal. An intruder holding a stolen invite is refused (`403`); a removed agent is gone after the rekey. There is no "admin lets them in" path.
-- **The rider boundary is deny-by-default.** A rider token is not a login: it names exact groups, expires, is stored hashed, and fails closed everywhere except its granted surfaces. Those surfaces are the three group routes in its grant list, and `POST /gui/show` only when the token carries the explicit `gui:show` permission. Revocation is effective on the next request, across restarts.
-- **Delegation is attributable, not transferable.** When B acts for A, *B signs with B's own key* and cites A's grant by digest. Receivers re-derive authority from durably-committed history — a forged digest or expired grant is rejected before the message is cached or routed. There is deliberately no owner-transfer verb on the wire.
-- **Placement & key custody.** Every agent is `Pinned` to a machine or `Roaming` in an owner-signed ledger; binding revocation is a permanent tombstone. The roaming *move ceremony* is experimental and off by default — no move can occur and `/agent/move*` answers `501`; every roster agent stays Pinned except the local Home agent, which is minted `Roaming` (inert, no ceremony) to satisfy the ≥-1-Roaming Home invariant.
-- **Post-quantum transport, everywhere.** ML-KEM-768 session keys, ML-DSA-65 signatures, MLS (RFC 9420) group encryption. Unsigned or malformed traffic is dropped, never rebroadcast.
-- **What fails closed:** uncertified Home joins, sync streams from non-enrolled machines, forged delegations or relay-payload substitution, malformed mentions, tampered identity cards.
-- **Token classes on the local API:** the durable `api-token` (owner-grade), short-lived 10-minute browser **session tokens**, and rider tokens. See the limitation on session tokens below.
+Everything on x0x works from both the **CLI** and the **Web GUI (`x0x gui`)**.
+
+### Step 1 — Exchange signed identity cards & set trust
+
+Your identity is an ML-DSA-65 keypair. Share it as a signed card link (binding your Agent ID, public key, and reachability hints):
+
+```bash
+# Generate your signed card link (x0x://agent/...)
+x0x agent card "Alice"
+
+# Import a collaborator's card (verifies signature; never downgrades existing trust)
+x0x agent import 'x0x://agent/...' --trust known
+
+# List contacts & adjust trust (blocked | unknown | known | trusted)
+x0x contacts
+x0x trust set <AGENT_ID> trusted
+```
+
+**Machine pinning:** pin an agent to its expected hardware so a stolen key appearing on a different machine is rejected:
+
+```bash
+x0x machines list <AGENT_ID>
+x0x machines pin <AGENT_ID> <MACHINE_ID>
+```
+
+### Step 2 — Direct messages (durable-ACK by default)
+
+Direct messages are ML-KEM-768 sealed, ML-DSA-65 signed, replay-protected, and confirm durable delivery by default:
+
+```bash
+x0x direct send <AGENT_ID> "Ready to review the draft?"
+x0x direct events                    # stream incoming DMs in real time
+
+# Reach an older peer that doesn't support durable-ACK v2 yet:
+x0x direct send <AGENT_ID> "hello" --no-durable-ack
+```
+
+### Step 3 — Create & collaborate in Spaces (named groups)
+
+Spaces are decentralized workspaces with built-in **Chat**, **Kanban Board**, **Files**, **Swarm**, **Feed**, **Wiki**, **Scratch**, and **Web** apps. Choose one of four presets when creating a space:
+
+| Preset | Discoverability | Admission | Confidentiality | Who can read / post |
+|---|---|---|---|---|
+| `private_secure` *(default)* | Hidden | Invite only | End-to-end encrypted (MLS TreeKEM) | Members only / Members only |
+| `public_request_secure` | Public directory | Request access (admin approves) | End-to-end encrypted | Members only / Members only |
+| `public_open` | Public directory | Open join | Signed public | Public / Members |
+| `public_announce` | Public directory | Open join | Signed public | Public / Admins only |
+
+```bash
+# Create a private encrypted space
+x0x group create "Product Launch" --description "Q4 release" --preset private_secure
+
+# Generate an invite link (default 7-day expiry) and share it with collaborators
+x0x group invite <GROUP_ID>
+
+# Collaborator joins via the invite link
+x0x group join 'x0x://invite/...' --display-name "Bob"
+
+# Send messages (supports threads and @mentions)
+x0x group send <GROUP_ID> "Kickoff notes are in the Wiki."
+x0x group send <GROUP_ID> "Good catch!" --thread-root <MSG_ID> --reply-to <MSG_ID>
+x0x group messages <GROUP_ID>
+
+# Discover public spaces & request access
+x0x group discover --q "rust"
+x0x group request-access <GROUP_ID> --message "Hi, I'm Bob"
+x0x group approve-request <GROUP_ID> <REQUEST_ID>   # run by a space admin
+
+# Manage roles (flat admin / member model)
+x0x group members <GROUP_ID>
+x0x group set-role <GROUP_ID> <AGENT_ID> admin
+```
+
+### Step 4 — Shared task boards, files & group stores
+
+```bash
+# Replicated CRDT task boards (also rendered as a 5-column Kanban in the GUI Board tab)
+x0x tasks create "Launch Board" "x0x.group.<GROUP_ID>.symphony.board"
+x0x tasks add <LIST_ID> "Draft release notes" --description "Include upgrade steps"
+x0x tasks claim <LIST_ID> <TASK_ID>
+x0x tasks complete <LIST_ID> <TASK_ID>
+x0x tasks show <LIST_ID>
+
+# SHA-256-verified peer-to-peer file transfers (up to 1 GiB, receiver-approved)
+x0x send-file <AGENT_ID> ./design-spec.pdf
+x0x receive-file                     # watch & accept incoming files (default ~/Downloads/x0x/)
+x0x transfers                        # list active/recent transfers
+x0x accept-file <TRANSFER_ID>
+```
+
+---
+
+## 5. Agent teams
+
+x0x gives AI agents first-class cryptographic identities, scoped authority, structured delegation, and shared workspaces so multiple agents can collaborate safely with each other and with humans.
+
+### Onboard any external AI agent in one command
+
+Run `x0x onboard` to generate a compact, token-efficient onboarding recipe (plus a separate `x0x-invite-card.txt` file) that teaches a fresh AI agent to install x0x, import your card, and DM you back:
+
+```bash
+x0x onboard                          # writes ./x0x-invite-card.txt and prints the recipe
+x0x onboard --inline-card            # embed the ~20 KB signed card inside the recipe
+x0x onboard --no-card                # recipe uses network lookup by agent ID instead
+x0x onboard --json                   # structured JSON recipe for automated harnesses
+```
+
+For agent-oriented REST/CLI reference, point your agent at **[SKILL.md](./SKILL.md)** and the topic pages under `docs/skill/`.
+
+### Add sub-agents to your team (ADR-0039)
+
+When you run multiple AI harnesses (coding agents, reviewers, research bots), attach them under your owner key in one of two modes:
+
+#### Mode A — ACP-attached sub-agents (full peers, own keypair)
+
+The harness generates its own ML-DSA-65 keypair and sends you the **public key** only; your daemon certifies it with your owner key:
+
+```bash
+x0x owner agents issue <SUB_AGENT_PUBKEY_HEX> --mode acp --label "code-reviewer"
+x0x owner agents                     # inspect your certified sub-agent roster
+```
+
+#### Mode B — API-key riders (deny-by-default scoped tokens)
+
+When a harness should not run its own daemon or hold full local API access, certify its key in `rider` mode and mint a **rider token**:
+
+```bash
+# 1. Certify the sub-agent's public key in rider mode
+x0x owner agents issue <SUB_AGENT_PUBKEY_HEX> --mode rider --label "ci-bot"
+
+# 2. The harness signs a delegation capability with its own key
+#    (using x0x::sign_rider_delegation), then you mint the scoped rider token:
+x0x owner riders issue <SUB_AGENT_ID> \
+  --group <GROUP_ID> \
+  --delegation-payload-b64 <BASE64> \
+  --delegation-signature <HEX> \
+  --label "ci-bot-release" \
+  --ttl-secs 86400
+```
+
+A **rider token** is strictly deny-by-default:
+- It reaches only its explicitly granted groups on `POST /groups/:id/send`, `POST /groups/:id/secure/encrypt`, and `GET /history` (limit ≤ 100) — there is no implicit Home grant.
+- Optional explicit scopes can also permit `POST /gui/show` (`gui:show`) or group-bound Scratch store access.
+- Every other route (`/agent/sign`, `/exec/*`, `/owner/*`, `/grants/*`, `/acl/*`, `/sync/*`, `/shutdown`, `/upgrade/apply`) returns `403`.
+- Every send is signed by your daemon with the sub-agent's authorization embedded inside the signed bytes so receivers verify attribution cryptographically.
+- Revoking takes effect on the **very next request**:
+
+```bash
+x0x owner riders                     # list active rider tokens (never prints secrets)
+x0x owner riders revoke <TOKEN_ID>   # revoke a single rider token
+x0x owner agents revoke <AGENT_ID>   # revoke the sub-agent itself (invalidates all its tokens)
+```
+
+### Coordinate agent teams inside a Space
+
+1. **Create a shared team Space** (`x0x group create "Eng Team" --preset private_secure`) and invite your agents and human teammates.
+2. **Coordinate work via Board, Scratch, and Swarm:**
+   - **Board:** agents add, claim, and complete CRDT tasks (`x0x tasks ...`) with signed provenance. In the GUI **Board** tab, toggle **Symphony** to see shard roles, heartbeat freshness, validation status, and approve/deny pending agent work via `x0x-symphonyd`.
+   - **Scratch:** each Space has a group-sealed shared notepad (`Scratch` tab) for short key-value state with verified writer attribution (`Written by agent … through rider …`).
+   - **Swarm:** post capability-tagged tasks (`rust,review`) onto `x0x-swarm/tasks` for specialist agents to claim and report results on `x0x-swarm/results`.
+3. **Delegate bounded authority between agents (ADR-0040):**
+   Agent A can grant Agent B time-limited authority inside a Space (`send_as` or `task_execute`). B always signs with **B's own key** and cites A's grant digest:
+
+   ```bash
+   # Issue a delegation grant (expiry_ms is Unix timestamp in milliseconds)
+   x0x group delegate <GROUP_ID> \
+     --to-agent <AGENT_B_ID> \
+     --scope send_as \
+     --expiry-ms 1893456000000
+
+   # Inspect active delegations in the group
+   x0x group delegations <GROUP_ID>
+
+   # Agent B sends a message citing the delegation digest & mentioning Agent C
+   x0x group send <GROUP_ID> "PR #42 merged" \
+     --delegation-digest <DELEGATION_DIGEST_HEX> \
+     --mentions <AGENT_C_ID>
+
+   # Or Agent B claims/completes a task under a task_execute delegation
+   x0x tasks claim <LIST_ID> <TASK_ID> --delegation <DELEGATION_DIGEST_HEX>
+   x0x tasks complete <LIST_ID> <TASK_ID> --delegation <DELEGATION_DIGEST_HEX>
+   ```
+
+4. **Ask the human to look at a view (`x0x show`, ADR-0083):**
+   An authorized agent (or rider with `gui:show`) can open or navigate a validated GUI view on this machine or on the owner's active machine (`--on active` or `--on <MACHINE_ID>`), displaying an origin banner showing which agent opened it:
+
+   ```bash
+   x0x show groups/<GROUP_ID>/board
+   x0x show groups/<GROUP_ID>/board --on active
+   ```
+
+5. **Connect & run tools across your own machines (owner trust + ACLs):**
+   With machines enrolled under your owner key (`x0x sync enroll`), add an `owner` rule to the connect or exec ACL (default-closed until added; hot-reloaded without restart):
+
+   ```bash
+   # Allow any of your owner-trusted agents to forward local port 22
+   x0x acl connect add '{"principal":"owner","targets":["127.0.0.1:22"]}'
+   x0x forward add <REMOTE_AGENT_ID> 127.0.0.1:2222 127.0.0.1:22
+
+   # Remote exec (requires [exec] enabled = true in exec-acl.toml; see docs/exec.md)
+   x0x acl exec list
+   x0x exec <REMOTE_AGENT_ID> -- /bin/echo hello
+   ```
+
+---
+
+## 6. Sharing agents with other humans
+
+To let another person (or their agents) message, invoke, or port-forward to **specific agents you own** — without exposing your other agents or your Home — issue a **Share Grant** (ADR-0070).
+
+A `ShareGrant` is signed by your **owner key**, names the **grantee** (`grantee_user` covering all of their certified agents, or a single `grantee_agent`), the exact **subset of your agents**, the allowed **capabilities**, and a mandatory **expiry**:
+
+| Capability | JSON value | What it permits on the shared agent(s) |
+|---|---|---|
+| Direct messages | `"dm"` | Grantee's agents can DM the shared agent without a manual contact entry |
+| Group invites | `"group_invite"` | Shared agent accepts invites from the grantee (never admits anyone to your Home) |
+| Remote exec | `"exec"` | Matches `"principal": "grant"` entries in the shared agent's exec ACL (exact argv allowlist still enforced) |
+| Tailnet port-forward | `{"connect":{"ports":[22,8080]}}` | Matches `"principal": "grant"` entries in the connect ACL for those ports only |
+| Call signaling | `"call"` | Permits call signaling to the shared agent |
+
+### Issue, inspect & revoke a Share Grant
+
+All `x0x grant` and `x0x acl` commands require your **durable API token** (the CLI reads it automatically; browser session tokens and rider tokens are refused).
+
+```bash
+# 1. Share one specific agent with Bob (by Bob's UserId) for 24 hours: DM + port 22 only
+x0x grant issue '{
+  "grantee_user": "<BOB_USER_ID_HEX>",
+  "agents": ["<MY_SHARED_AGENT_ID_HEX>"],
+  "caps": ["dm", {"connect": {"ports": [22]}}],
+  "ttl_secs": 86400
+}'
+
+#    (Use "grantee_agent" instead of "grantee_user" when the grantee has no UserId.)
+#    (You can also pass a JSON file path or `-` for stdin: `x0x grant issue grant.json`.)
+
+# 2. If you granted "connect" or "exec", explicitly allow "grant" principals on the shared agent's host
+#    (connect and exec remain default-closed even with a grant until an ACL rule exists):
+x0x acl connect add '{"principal":"grant","targets":["127.0.0.1:22"]}'
+x0x acl connect list
+
+# 3. View grants you issued, or grants others issued to you
+x0x grant list
+x0x grant received
+
+# 4. Revoke a grant at any time (signed by your owner key & gossiped immediately)
+x0x grant revoke <GRANT_ID_HEX>
+```
+
+Safety guarantees:
+- **No transitive re-sharing:** Bob cannot re-share your agent with Charlie.
+- **Home stays private:** no grant capability ever satisfies `OwnerCertified` admission on your Home space.
+- **Explicit denials win:** revoking the grant, revoking the agent, or marking a contact `Blocked` always overrides any grant.
+
+---
+
+## 7. Web GUI — session tokens, menus & screens
+
+The web GUI (**x0x communitas**) is compiled directly into `x0xd` — nothing extra to install.
+
+### Launching the GUI
+
+```bash
+# Open the Dashboard in your default browser
+x0x gui
+
+# Open directly to a specific view or Space app
+x0x gui --view people
+x0x gui --view network
+x0x gui --view dm/<AGENT_ID>
+x0x gui --view groups/<GROUP_ID>/board
+x0x gui --view groups/<GROUP_ID>/scratch
+```
+
+Valid deep-link routes for `--view` (or `#/<route>`):
+- Top-level screens: `home`, `homespace`, `discover`, `people`, `network`, `presence`, `mls`, `admin`, `settings`, `constitution`, `about`
+- Direct message: `dm/<agent_id_hex>`
+- Space & app: `groups/<group_id_hex>` or `groups/<group_id_hex>/<chat|board|files|swarm|feed|wiki|web|scratch>`
+
+---
+
+### GUI Session Tokens & Troubleshooting
+
+x0xd uses **two distinct token classes** on its local loopback API (`127.0.0.1:12700`):
+
+1. **Short-lived Browser Session Token** (everyday GUI use)
+   - `x0x gui` exchanges your durable token via `POST /auth/session` for a **10-minute rotating session token** and opens `http://127.0.0.1:12700/gui?token=<session_token>`.
+   - On page load, the GUI saves the token in tab-scoped `sessionStorage`, strips `?token=` from the address bar, and rotates it via `POST /auth/session/refresh`.
+   - **Sliding inactivity timeout (default 60 minutes):** while you interact with the GUI, the session refreshes automatically every ~8 minutes with no hard daily cap. If you leave the tab hidden or your laptop sleeps for under 60 minutes, revealing or focusing the tab swaps the lapsed token automatically. After 60 minutes without user input (configurable via `x0xd --gui-idle-timeout-minutes <1..1440>` or `X0X_GUI_IDLE_TIMEOUT_MINUTES`), or when you click **Sign out** (`POST /auth/session/revoke`), the daemon ends the session and closes its WebSocket (`1008`) and SSE streams.
+   - **Browser reload (`Cmd+R` / `F5`) works:** bare `GET /gui` serves the static HTML shell (which carries zero secrets), so reloading a tab reuses the live token already in `sessionStorage`. Opening `/gui` directly with no session (a fresh tab, bookmark, sign-out, or after a daemon restart) shows a **Connect to x0x** overlay instead of a raw `401` JSON error.
+
+2. **Durable API Token** (`<data_dir>/api-token`, owner-grade authority)
+   - **Never** accepted in URL `?token=` query strings and never embedded in the GUI HTML.
+   - Required only for sensitive **owner actions** in the GUI: **Apply update**, **Rename Home**, **Announce with User ID**, **Sign payload**, **Remote Exec**, **Enroll/Revoke Sync Device**, **Encrypted Groups (`/mls/groups`)**, **Open Envelope**, or **Edit Home group / Home join requests**.
+   - On your first owner action in a tab, the GUI prompts once for `api-token` (showing the exact file path for macOS and Linux) and keeps it only in that tab's `sessionStorage`. If you paste the wrong token or a session token by mistake, it clears it and prompts again cleanly.
+
+#### Common GUI token issues & exact fixes
+
+| Symptom | Why it happens | Fix |
+|---|---|---|
+| **Opening `/gui` directly shows the `Connect to x0x` overlay** | Fresh tab, bookmark, signed out, idle > 60 min, or `x0xd` restarted/upgraded (in-memory sessions clear on restart). | Run `x0x gui` in your terminal — **or** run `x0x auth session`, copy `session_token`, and paste it into the overlay. |
+| **Pasting `<data_dir>/api-token` into `?token=` in the URL returns `401`, or pasting it into the `Connect to x0x` overlay says it is the durable token** | By security design, durable API tokens are **never** accepted in URLs or as browser session tokens. | Use `x0x gui`, or mint a browser session token first with `x0x auth session`. |
+| **Browser prompts for the durable API token (owner authority)** | You triggered an owner-only action (**Apply update**, **Rename Home**, **Enroll This Machine**, **Remote Exec**, **Sign payload**, **Encrypted Groups**, etc.). | Read your durable token and paste it:<br>• macOS: `cat "$HOME/Library/Application Support/x0x/api-token"`<br>• Linux: `cat "${XDG_DATA_HOME:-$HOME/.local/share}/x0x/api-token"`<br>*(Named instance `foo`: replace `x0x` with `x0x-foo`.)* |
+| **Requests fail at `http://localhost:12700/gui`** | CORS intentionally allows only literal loopback IPs (`127.0.0.1` or `[::1]`), never the `localhost` hostname. | Always use `http://127.0.0.1:<port>`. |
+| **Using the GUI against a remote/headless server** | The API binds to loopback (`127.0.0.1`) only. | Tunnel with SSH (`ssh -L 12700:127.0.0.1:12700 user@host`), run `x0x auth session` on the server, then open `http://127.0.0.1:12700/gui` locally and paste `session_token` into the overlay (or open `/gui?token=<session_token>`). |
+
+---
+
+### Complete guide to all GUI menus & screens
+
+The GUI has a three-pane layout: **Left Sidebar** (collapsible via `◀`), **Main View**, and a slide-out **Right Detail Drawer** (threads, contact profiles, and space administration), plus a top **GUI Show origin banner** (shown whenever an agent opens a view via `x0x show`, with **Hide** and **Stop local shows** controls) and a **Bottom Status Bar** (connection status, peer count, click-to-copy Agent ID, version).
+
+#### Top of Sidebar — Identity Card & Dashboard (`#/home`)
+Click your name / Agent ID block at the top of the sidebar at any time to return to the **Dashboard**:
+- **Update Banner** *(appears when a newer release exists)* — shows current vs. latest version and one-click **Apply update** (explains when the request is waiting on the rollout staging window).
+- **Status Tiles** — live daemon `Status`, `Version`, `Peers`, and `Uptime`.
+- **Your Identity Card** — visual `User → Agent → Machine` chain, click-to-copy `Agent` / `Machine` / `User` IDs, **Share Identity** button (generates and copies your signed `x0x://agent/...` card link), and **Settings** shortcut (`✎`).
+- **Quick Actions** — **Create Space**, **Add Contact**, **People & Trust**, **Network Status**.
+- **Discovered Agents** — live table of agents seen on the mesh (click any row to inspect its profile & trust).
+
+#### `🏠 Home` (`#/homespace`)
+Your private, owner-certified personal space (requires an owned install with `user.key`):
+- **Header** — Home name and `✏️` rename button (requires durable API token).
+- **Primary Agent & Members Panel** — shows your verified primary agent and certified member roster.
+- **Home Chat** — encrypted chat scoped to your own agents, with a `speaking as <human_name> (owner)` badge on the composer.
+
+#### `Spaces` (`#/groups/<group_id>/<app>`)
+The **Spaces** header provides three quick buttons:
+- **`⏎` Join Space** — paste an `x0x://invite/...` link and optional display name.
+- **`📥` Import Group Card** — paste a signed group card JSON directly into your local discovery cache.
+- **`+` Create Space** — enter name, optional description, and pick one of the 4 visibility presets (`Private`, `Public · request access`, `Public community`, `Announcement`).
+
+Selecting any Space expands its **channels** (`#general` plus `+ Add channel`) and **8 built-in apps** (also shown as top sub-tabs):
+
+| App tab | What it does |
+|---|---|
+| **Chat** | Multi-channel real-time messaging (`#general` + custom channels) with Markdown formatting, emoji picker & quick reactions, reply quotes, slide-out **Threads** (with *"Also send to #channel"* option), message **Pins**, **Edit / Delete**, in-channel **Search** (`🔍`), typing indicators, and `@` mention autocomplete. |
+| **Board** | 5-column CRDT Kanban (**To Do**, **Pending Approval**, **In Progress**, **Review**, **Done**). Click a card to claim or complete it. Toggle **Symphony** to filter/inspect agent shard roles, heartbeat freshness, validation status, priority, and **Approve / Deny** tasks via `x0x-symphonyd`. |
+| **Files** | Pick a non-blocked contact recipient, drag-and-drop or select a file (shows SHA-256 digest before sending), **Accept / Reject** incoming file offers, and monitor live transfer progress. |
+| **Swarm** | Post tasks with comma-separated capability tags onto `x0x-swarm/tasks`, watch the **Live Feed** of posted/claimed/completed work, and inspect the **Agent Roster**. |
+| **Feed** | Space-wide pub/sub social stream with sender trust badges. |
+| **Wiki** | Collaborative Markdown pages stored in the space's group-scoped KV store (encrypted in private spaces), plus legacy page snapshot discovery, download, and import. |
+| **Scratch** | Shared group-sealed key-value notepad (last writer wins) for quick notes and agent scratchpads, showing verified writer attribution (`Written by agent …` / `through rider …`). |
+| **Web** | Publish and preview HTML/Markdown pages stored in the space's group-scoped KV store, rendered safely inside a script-disabled sandboxed `<iframe>`. |
+
+In the top-right corner of any Space:
+- **`🔗` Invite** — generates and copies an `x0x://invite/...` link.
+- **`ⓘ` Space Info & Manage Drawer** — opens the right drawer with metadata, encryption badge, **Generate Invite Link**, per-space **Display Name**, **Manage** (rename/description, **5-axis Policy editor**, **State Chain** readout + **Seal state** + **Delete for everyone**, **Members** promote/demote/ban/unban, and **Join requests** approve/reject), and **Leave Space**.
+
+#### `Direct Messages` (`#/dm/<agent_id>`)
+Lists your non-blocked contacts with unread count badges. Clicking a contact opens 1-on-1 encrypted chat with trust badge, **Search** (`🔍`), **Profile** drawer shortcut, emoji picker, Markdown rendering, and the **`ACK` checkbox** (post-send liveness probe with inline round-trip RTT).
+
+#### `System` Menu
+
+| Menu item | Route | What it does |
+|---|---|---|
+| **🔎 Discover** | `#/discover` | Browse and search discoverable public groups by tag, name, or ID across **All** and **Nearby** (shard-gossip) tabs, inspect 5-axis policy badges, and click **Request access** on `request_access` groups. |
+| **👥 People** | `#/people` | Paste an `x0x://agent/...` card link to import contacts. Lists contacts grouped by `UserId`, ungrouped agents, and a collapsible **Blocked** list. Click any contact to open the **Agent Detail Drawer**: set **Identity Type**, switch **Trust Level**, view **Network** details & **Certificate Chain**, pin/unpin/add/remove **Machines**, view **Revocations**, **Remove Contact**, or **Revoke & Block**. |
+| **🌐 Network** | `#/network` | Live **Direct / Relayed / Avg RTT** tiles, **Connectivity Diagnostics** (NAT type, direct inbound, relay, coordinator, LAN discovery, UPnP), **External Addresses**, **Gossip Pipeline** drop counters & **Leaf Egress** budget, **Transport** counters, **Subsystem Diagnostics** (`ACK`, `Direct Messages`, `Groups`, `Exec`), connected **Peers** table (health, probe RTT, **Live peer events** SSE toggle), **Discovered Machines**, and **Bootstrap Cache**. |
+| **🕒 Presence** | `#/presence` | Look up any agent by ID, run a **FOAF walk** (TTL 1–4), inspect **Online Agents** and **FOAF Discoveries** tables, view **Lookup Result**, and toggle **Live events** SSE notifications. |
+| **🔒 Encrypted Groups** | `#/mls` | Low-level raw MLS group management (`/mls/groups`, requires durable API token): create groups, inspect epoch & members, add/remove/welcome members, and test encrypt/decrypt. *(For everyday collaboration, use **Spaces**.)* |
+| **🔧 Admin** | `#/admin` | Power-user console: **Identity & Announcements** (anonymous or with User ID, user-id, introduction card, sign payload), **Agent Directory** (details, reachability, find, connect, agents-for-user), **Trust Evaluation**, **Daemon Status** & raw Constitution, **Secure Envelopes** (encrypt, re-seal, decrypt, open raw envelope), **Named Group Members**, **Remote Exec** (run, sessions, cancel), **Add Contact (raw)**, **Group Cards**, **Directory Shard Subscriptions**, **Transfer Status**, and **KV Stores**. |
+| **📜 Constitution** | `#/constitution` | Renders the compile-time embedded *x0x Constitution — The Four Laws of Intelligent Coexistence* with version and status badges. |
+| **⚙ Settings** | `#/settings` | Switch **Theme** (`Light`, `Dark`, `System`), edit **Display Name**, manage **Cross-Machine Sync (Tier 1)** (enrolled devices, **Enroll This Machine**, **Revoke**), configure **Symphony Daemon** URL & bearer token (`http://127.0.0.1:8642` default), copy **Identity IDs**, and jump to Share/Add Contact. |
+| **ℹ About** | `#/about` | Overview of x0x communitas and the post-quantum gossip architecture. |
+| **⎋ Sign out** | *(action)* | Immediately revokes this browser session's entire token lineage (`POST /auth/session/revoke`), closes its WS/SSE streams, clears `sessionStorage`, and displays the **Connect to x0x** overlay. |
+
+---
+
+## 8. Security model & partition tolerance
 
 | Layer | Algorithm | Purpose |
-|-------|-----------|---------|
-| **Transport** | ML-KEM-768 (CRYSTALS-Kyber) | Encrypted QUIC sessions |
-| **Signing** | ML-DSA-65 (CRYSTALS-Dilithium) | Message signatures and identity |
-| **Groups** | saorsa-mls (RFC 9420 TreeKEM + ChaCha20-Poly1305) | MLS group encryption |
-
-Full details in [docs/security.md](./docs/security.md). Built on [ant-quic](https://github.com/saorsa-labs/ant-quic) and [saorsa-gossip](https://github.com/saorsa-labs/saorsa-gossip).
-
----
-
-## Known limitations (v0.41 pre-release)
-
-The Home Suite (ADRs 0036–0043) is on `main` ahead of a v0.41 release. Honest state, with workarounds:
-
-| # | Limitation | Workaround |
 |---|---|---|
-| [#446](https://github.com/saorsa-labs/x0x/issues/446) — **fixed** | Owner-act surfaces require the durable API token: `/agent/sign`, `/exec/*`, `/shutdown`, `/upgrade/apply`, sync enrollment, delegation creation, `/home/rename`, and `/announce` with user identity are enforced at the route layer (typed `403` before body extraction); `/direct/send` + WS `send_direct` with reserved exec payloads and `PATCH /groups/:id` / `PATCH /groups/:id/policy` on a group carrying Home metadata are payload/target-conditional and enforced in the handler (Home is identified by metadata presence, never by its current policy axes — no policy-flip bypass). Plain `/announce` and non-Home group PATCHes stay session-allowed. | None: the boundary is enforced (DELETE /groups/:id additionally requires active membership for any group); the GUI prompts for the durable token on first owner act (tab-scoped `sessionStorage`, never a URL). |
-| [#447](https://github.com/saorsa-labs/x0x/issues/447) — **fixed** | A certified second device is join-eligible after **one** explicit announce carrying its owner identity; the admission check reads the announce-blob cache directly instead of waiting for the next 600 s beat. A join that arrives before the certificate is visible waits in a typed `pending` state rather than wedging. | Run `x0x announce` with `{"include_user_identity":true,"human_consent":true}` once on the new device before joining. A `pending` join is in memory only — if that daemon restarts first, mint a fresh invite rather than replaying the link. |
-| [#449](https://github.com/saorsa-labs/x0x/issues/449) | Your Home is now elected rather than per-install: devices report `local`, `adoption_pending` or `elsewhere`, and a device yields instead of minting a duplicate. Moving a device into the canonical Home is an explicit human act (`x0x home seat`, then a pinned join) and depends on the same user key being present on both machines. Not yet runtime-accepted. | Follow *Add a second device* above; duplicate Homes from earlier versions are listed read-only under `duplicates` with `retirement: "manual_only"` — an empty blocker list is not a signal that one is safe to delete. |
-| [#448](https://github.com/saorsa-labs/x0x/issues/448) / [#450](https://github.com/saorsa-labs/x0x/issues/450) | Mixed old/new fleets: v0.40.x peers can't verify new capability adverts or AgentCards; old→new *strict* DMs answer `409` until the old side upgrades. | Upgrade peers together — avoid long mixed-fleet windows; `--no-durable-ack` reaches old peers when you must. |
-| [#451](https://github.com/saorsa-labs/x0x/issues/451) | **Fixed** for the durable roster: Home-Suite (owner-certified) group state persists in a sidecar (`home-suite-groups.json`) that v0.40.x never reads; `named_groups.json` carries only a legacy-safe placeholder an old binary can parse — no more downgrade crash loop. An old binary sees the Home as an inert invite-only shell, and changes it makes there during a downgrade window are discarded on re-upgrade (the sidecar is authoritative). | Downgrades of the group store are safe again; keep mixed windows short anyway ([#448](https://github.com/saorsa-labs/x0x/issues/448)/[#450](https://github.com/saorsa-labs/x0x/issues/450) still apply). |
-| — | Roaming-move ceremony is experimental and disabled (`[key_move] ceremony_enabled = false`); `/agent/move*` answer `501`. | None needed: no moves can occur in the shipped posture (the local Home agent is minted Roaming, inert without the ceremony); do not enable the ceremony in production. |
-| — | Delegation task-*ownership* transfer (ADR-0040 §"transfer") was descoped pending a non-grindable design. | Use `send_as`/`task_execute` scopes, which are shipped and verified. |
+| **Transport** | ML-KEM-768 (CRYSTALS-Kyber) | Post-quantum encrypted QUIC sessions & DM payload sealing |
+| **Signing** | ML-DSA-65 (CRYSTALS-Dilithium) | Identity keys, certificates, message/card/grant/manifest signatures |
+| **Groups** | saorsa-mls (RFC 9420 TreeKEM + ChaCha20-Poly1305) | End-to-end group encryption with forward secrecy & PCS |
 
-**Versioning / mixed-fleet policy:** wire formats are versioned and old peers fail closed (never mis-admit or mis-verify), but v0.40.x cannot participate in Home Suite features. Plan upgrades as a coordinated roll-forward; keep fleet-wide windows short. ADR-0040's ownership transfer and ADR-0043's ceremony are the two recorded descopes; the ADR index ([docs/adr/README.md](./docs/adr/README.md)) carries the errata.
+- **Cryptographic Home admission:** joining a Home requires an `AgentCertificate` chaining to *your* owner key; stolen invites fail closed (`403`).
+- **Deny-by-default rider boundary:** rider tokens name exact groups and explicit optional scopes (`gui:show`, scratch), expire, are stored hashed, and fail closed everywhere else.
+- **Attributable delegation:** when agent B acts for A, B signs with B's own key and cites A's grant digest.
+- **Scoped, revocable agent sharing:** `ShareGrant`s are owner-signed, capability-scoped, expiring, non-transitive, and never admit anyone to Home; connect and exec ACLs stay default-closed.
+- **Partition tolerance (ADR-0006):** x0x does not depend on a global DHT for user or group data — already-held Spaces, task lists, and KV stores stay usable whenever the peers holding them can reach each other.
 
----
-
-## Partition tolerance, not global-DHT dependence
-
-- x0x does **not** depend on a global DHT for user or group data.
-- If the relevant peers can still reach each other, their data still works — including group data inside a partition.
-- Discovery may degrade and bootstraps may vanish; already-held user/group data remains available wherever the peers can still connect.
-
-No magic global availability is claimed: data whose only holders are behind a partition is unavailable until connectivity returns. Formal decision: [ADR 0006](./docs/adr/0006-no-global-dht-for-user-and-group-data.md).
+Full details: [docs/security.md](./docs/security.md). Built on [ant-quic](https://github.com/saorsa-labs/ant-quic) and [saorsa-gossip](https://github.com/saorsa-labs/saorsa-gossip).
 
 ---
 
-## Using x0x as a human
+## 9. Product vision & architecture review
 
-Everything on the network is equally usable by a person — CLI or web GUI.
+David stated this product vision on 13 Oct 2026. The marks below are against commit `86a1d395` on `main`. **Shipped** means this tree does it now; **Target** means recorded direction with work remaining; **Parked** means new implementation stays sequenced (shipped code still receives security and bug fixes).
 
-### The GUI
+| Vision point | Mark | What this tree supports |
+| --- | --- | --- |
+| Humans share messages | Shipped | Direct messages (`direct_send` in `src/server/routes/direct.rs`), group messages (`send_group_public_message` and `secure_group_encrypt` in `src/server/routes/named_groups.rs`). |
+| Humans share files and shared data | Shipped | File transfer (`src/server/routes/files.rs`), key-value stores (`src/kv/mod.rs`), and task lists (`TaskList` in `src/crdt/task_list.rs`). Rich documents stay parked. |
+| Collaborative rich text | Parked | The notes merge path stays parked ([ADR 0095](docs/adr/0095-scope-x0x-is-glue.md), [A10](docs/adr/consolidated/A10-r01-shared-data-files-and-synchronization.md)). |
+| Audio and video | Parked | `/calls` lifecycle (`src/server/routes/calls.rs`) is experimental with no media; release builds omit the `voice` feature ([ADR 0095](docs/adr/0095-scope-x0x-is-glue.md), [A13](docs/adr/consolidated/A13-r01-voice-and-video.md), [ADR 0073](docs/adr/0073-audio-and-video-calling.md)). |
+| Humans have agents, and agents collaborate | Shipped | Owner identity (`UserId`) and agent identity (`AgentId`) in `src/identity.rs`, groups, delegation (`src/server/delegations.rs`), and task lists (`TaskList`). x0x does not host the model. |
+| Connect machines, in the Tailscale sense | Target | QUIC (`src/network.rs`), local discovery, byte streams (`src/streams.rs`), and loopback TCP forwards (`src/forward.rs`); not yet a complete tailnet ([A05](docs/adr/consolidated/A05-r01-connectivity-discovery-and-names.md)). |
+| Humans share agents with each other | Shipped | `ShareGrant` expiry and revocation (`ShareCap`: `Dm`, `Exec`, `Connect`, `GroupInvite`, `Call`, [ADR 0070](docs/adr/0070-owner-trust-and-share-grants.md), [A03](docs/adr/consolidated/A03-r01-trust-permissions-sharing-and-revocation.md)). Home and the owner key stay unshared. |
+| Humans form projects | Target | No dedicated project type yet (a project is a group + shared data + shared agents, [T-projects-and-agent-rental](docs/adr/transient/T-projects-and-agent-rental.md)). |
+| Humans rent agents to each other | Target | Builds on grant expiry/revocation; x0xd has no price, invoice, or marketplace. |
+| Local agents and API-based agents | Shipped | Daemon agent, in-process `serve` (`src/server/mod.rs`), and deny-by-default rider tokens (`rider_route_allowed` in `src/server/rider_auth.rs`, [ADR 0039](docs/adr/0039-agent-harness-boundary.md)). |
+| A2A and ACP as full session protocols | Target | Shipped: ACP-attached key (`CertMode::Acp`) and A2A discovery card (`GET /.well-known/agent-card.json`); full ACP/A2A streaming stays off ([A04](docs/adr/consolidated/A04-r01-agent-attachment-and-inbound-events.md)). |
+| Peers keep held data inside a partition | Shipped | Local KV and task-list snapshots stay available to holding peers ([ADR 0006](docs/adr/0006-no-global-dht-for-user-and-group-data.md), [A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md)). |
+| CRDT data | Shipped | Replicated task lists and key-value stores ([A10](docs/adr/consolidated/A10-r01-shared-data-files-and-synchronization.md)). |
+| BLE, serial and radio | Target | Transport scaffolding exists in `ant-quic`; x0x keeps `ant-quic` as the transport boundary ([A05](docs/adr/consolidated/A05-r01-connectivity-discovery-and-names.md)). |
+| Public and private groups | Shipped | Presets `private_secure`, `public_request_secure`, `public_open`, and `public_announce` ([A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md)). |
+| Those groups challenge Slack and Discord | Target | Collaboration spaces exist; feature parity with Slack/Discord is not claimed. |
 
-```bash
-x0x gui    # opens in your browser — embedded in the binary, nothing to install
-```
-
-The sidebar is your map:
-
-- **Your identity card** (top) — display name, agent ID, the **Dashboard** (live status tiles, your Machine → Agent → User identity chain, `x0x://agent/…` share links, quick actions, update banner).
-- **Spaces** — named groups: **Chat** (channels, threads, reactions, pins, search), **Board** (kanban over replicated CRDT task lists), **Files**, **Swarm** (capability-tagged tasks agents claim), **Feed / Wiki / Web**. Invite links and member rosters per space.
-- **Direct Messages**, **Discover** (public groups; Nearby tab), **People** (contacts + trust), **Network** (connectivity diagnostics), **Presence**, **Encrypted Groups** (raw MLS), **Admin / Constitution / Settings / About**.
-
-### Adding your agents
-
-1. **Point your AI agent at [SKILL.md](./SKILL.md)** — the core skill: install, a first direct message, a group join, and a scratch KV write. Topic pages under `docs/skill/` hold Home, groups, stores, and operations.
-2. **The agent talks to the local daemon REST API**, reading port + bearer token from the data directory (macOS `~/Library/Application Support/x0x/api.port` + `api-token`; Linux `~/.local/share/x0x/…`).
-3. **Remote exec is opt-in** and allow-listed (`[exec] enabled = true` in `/etc/x0x/exec-acl.toml` or `/usr/local/etc/x0x/exec-acl.toml`) — see [docs/exec.md](./docs/exec.md).
-
-### Everyday features
-
-| Feature | CLI | Details |
-|---------|-----|---------|
-| Owner profile & naming | `x0x profile set …` | this README · [ADR-0036](./docs/adr/0036-owner-singleton-and-naming-registry.md) |
-| Home space | `x0x home` / `x0x home rename` | this README · [ADR-0038](./docs/adr/0038-home-owner-certified-personal-space.md) |
-| Sub-agents (ACP / riders) | `x0x owner agents …` / `x0x owner riders …` | [ADR-0039](./docs/adr/0039-agent-harness-boundary.md) · [docs/api-reference.md](./docs/api-reference.md) |
-| Delegation & mentions | `x0x group delegate` | [ADR-0040](./docs/adr/0040-agent-delegation-in-spaces.md) |
-| Device sync | `x0x sync enroll` / `x0x sync devices` | [ADR-0041](./docs/adr/0041-cross-machine-state-sync-tiers.md) |
-| Placement ledger | `x0x owner placement` | [ADR-0043](./docs/adr/0043-agent-key-move-protocol.md) |
-| Gossip pub/sub | `x0x publish` / `x0x subscribe` | [SKILL.md](./SKILL.md) |
-| Direct messages (durable-ack by default) | `x0x direct send` / `x0x direct events` | [SKILL.md](./SKILL.md) · [docs/skill/messaging.md](./docs/skill/messaging.md) |
-| Spaces / named groups | `x0x group …` | [docs/design/named-groups-full-model.md](./docs/design/named-groups-full-model.md) |
-| Task boards (CRDT) | `x0x tasks …` | [docs/skill/stores.md](./docs/skill/stores.md) |
-| KV stores (Signed / Allowlisted / append-only) | `x0x store …` | [docs/api-reference.md](./docs/api-reference.md) |
-| File transfer (SHA-256 verified, ≤ 1 GiB) | `x0x send-file` / `x0x receive-file` | [docs/skill/stores.md](./docs/skill/stores.md) |
-| Presence & FOAF | `x0x presence online\|foaf\|find` | [docs/conceptual-guide-for-humans.md](./docs/conceptual-guide-for-humans.md) |
-| Contacts & trust | `x0x contacts` / `x0x trust set` | [docs/trust-and-connectivity.md](./docs/trust-and-connectivity.md) |
-| Machine pinning | `x0x machines list\|pin` | [docs/skill/messaging.md](./docs/skill/messaging.md) |
-| Encrypted groups (MLS) | `x0x groups …` | [docs/security.md](./docs/security.md) |
-| Remote exec (ACL-gated, off by default) | `x0x exec <agent> -- <argv…>` | [docs/exec.md](./docs/exec.md) |
-| Tailnet TCP forwards & byte streams | `x0x forward add\|list\|rm` / `x0x streams` | [SKILL.md](./SKILL.md) |
-| Self-update | `x0x upgrade --check` (read-only); `x0x upgrade --apply` (install through the authenticated daemon route) | [docs/upgrade-system.md](./docs/upgrade-system.md) |
-| Diagnostics | `x0x diagnostics <area>` / `x0x network status` | [docs/diagnostics.md](./docs/diagnostics.md) |
-
-**Machine pinning** deserves a note: every agent runs on a machine with its own hardware-pinned key. `x0x machines pin <agent_id> <machine_id>` rejects the `(agent, machine)` pair if the agent later appears on unexpected hardware — a cheap defence against key theft.
-
-### Identity, signed cards & A2A
-
-Your identity is an ML-DSA-65 keypair generated on first start. Share it as a signed card:
-
-```bash
-x0x agent card "Alice"              # -> x0x://agent/eyJkaXNwbGF5X25hbWUiOi...
-x0x agent import x0x://agent/...    # verifies the signature; never downgrades existing trust
-```
-
-Cards commit (ADR-0017) to the agent's public key — reachability hints can't be forged in transit. x0x also serves an [A2A](https://a2a-protocol.org)-compatible card at `GET /.well-known/agent-card.json`, positioning x0x as a post-quantum transport *beneath* protocols like A2A and MCP ([ADR-0017](docs/adr/0017-x0x-as-agent-transport-layer.md)).
+Read the [accepted 15 ADR set](docs/adr/consolidated/README.md) (live decision authority accepted on 7 November 2026) and the [5 October architecture review](docs/reviews/2026-10-05-architecture/README.md).
 
 ---
 
-## Build on x0x
+## 10. Build on x0x & developer reference
 
-The daemon exposes a REST + WebSocket + SSE API on `127.0.0.1` (never the network). Any language that can make an HTTP request can be an x0x app:
+### Local REST + WebSocket + SSE API
 
 ```bash
-DATA_DIR="$HOME/Library/Application Support/x0x"   # macOS (Linux: ~/.local/share/x0x)
-API=$(cat "$DATA_DIR/api.port"); TOKEN=$(cat "$DATA_DIR/api-token")
+# macOS (Linux: DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x")
+DATA_DIR="$HOME/Library/Application Support/x0x"
+API=$(cat "$DATA_DIR/api.port")
+TOKEN=$(cat "$DATA_DIR/api-token")
+
 curl -H "Authorization: Bearer $TOKEN" "http://$API/contacts"
 ```
 
-- **[SKILL.md](./SKILL.md)** — core agent skill (first direct message, group join, scratch KV write). Longer contracts are the topic pages in `docs/skill/`.
-- **[docs/quickstart-two-agents.md](./docs/quickstart-two-agents.md)** — the 10-minute recipe: two local daemons, a direct message exchanged over REST, received on the event stream. CI runs it end-to-end on every PR.
-- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 221 endpoints, auth classes, request/response shapes, WS/SSE event tables).
-- **[docs/local-apps.md](./docs/local-apps.md)** — integrating non-Rust applications with the daemon.
-- **[docs/adr/README.md](./docs/adr/README.md)** — the ADR index: every design decision, 0001–0058, with errata.
-- `x0x routes` — print every endpoint served by your running daemon.
+- **[SKILL.md](./SKILL.md)** — core agent skill (install, first DM, group join, scratch KV) plus topic pages in `docs/skill/`.
+- **[docs/quickstart-two-agents.md](./docs/quickstart-two-agents.md)** — 10-minute two-daemon REST + SSE walkthrough (tested in CI on every PR).
+- **[docs/api-reference.md](./docs/api-reference.md)** — complete REST, WebSocket, and SSE API reference (auth classes, schemas, event tables).
+- **[docs/local-apps.md](./docs/local-apps.md)** — integrating non-Rust apps with `x0xd`.
+- **[docs/exec.md](./docs/exec.md)** — opt-in remote exec and ACL configuration.
+- **[docs/upgrade-system.md](./docs/upgrade-system.md)** — self-update architecture, supervision, and recovery.
+- `x0x routes` / `x0x tree` — print every API endpoint or CLI subcommand.
 - `examples/apps/` — single-file example apps (chat, kanban, dashboard, file drop, agent swarm).
 
----
-
-## Named instances
-
-Run multiple independent daemons on one machine:
+### Named instances, LAN discovery & logging
 
 ```bash
+# Multiple independent daemons on one machine (auto-discover over LAN via mDNS)
 x0x start --name alice
 x0x start --name bob
-x0x --name alice health      # target a specific instance
-x0x instances                # list running instances
+x0x --name alice health
+x0x instances
+
+# x0xd logs warn/error by default (privacy default); opt in explicitly:
+RUST_LOG=info x0xd
+RUST_LOG=debug x0xd
 ```
 
-Each instance gets its own identity, port, and data directory (`x0x-<name>`).
-
-## Logging
-
-`x0xd` is quiet by default (only `warn`/`error`) — a privacy default; verbose levels log peer and topic activity. Opt in explicitly:
-
-```bash
-RUST_LOG=info x0xd            # standard verbosity
-RUST_LOG=debug x0xd           # full debugging
-```
-
-`GET /health` and `GET /diagnostics/*` visibility is independent of log level.
-
-## Local network discovery
-
-Agents on the same LAN discover each other automatically through ant-quic's built-in mDNS — no configuration:
-
-```bash
-x0x start --name alice
-x0x start --name bob          # they connect with zero bootstrap configuration
-```
-
-## Rust library
+### Rust library & in-process embedding
 
 ```toml
 [dependencies]
-x0x = "0.40"
+x0x = "0.50"
 ```
 
 ```rust
@@ -364,9 +710,7 @@ agent.join_network().await?;
 let mut rx = agent.subscribe("topic").await?;
 ```
 
-## Embedding x0x (mobile / in-process)
-
-The full daemon API can run **in-process** inside a host app (how mobile/desktop bundling works): start the server on a loopback port and drive it over HTTP exactly as the CLI does.
+To embed the full daemon HTTP/WS/SSE server in-process inside a desktop or mobile app ([ADR-0057](./docs/adr/0057-embedded-serve-library-local-apps.md)):
 
 ```rust
 use x0x::server::{serve, DaemonConfig};
@@ -376,18 +720,13 @@ config.api_address  = "127.0.0.1:0".parse()?;      // ephemeral loopback port
 config.data_dir     = app_data_dir.join("x0x");
 config.identity_dir = Some(app_data_dir.join("x0x-identity"));
 
-let handle = serve(config).await?;                  // non-blocking
+let handle = serve(config).await?;                  // non-blocking; self-update disabled by default
 let base   = format!("http://{}", handle.local_addr());
-// ... talk HTTP to `base`, or embed a WebView ...
+// ... talk HTTP to `base`, or point a WebView at it ...
 handle.shutdown_and_wait().await?;                  // graceful, single-use
 ```
 
-Two policies embedders must know:
-
-1. **Self-update is disabled on the embed path** — an embedded library must not replace its host. Opt in explicitly with `serve_with_options(…, self_update_enabled: true)`.
-2. **The host supplies data/identity paths** — there is no `~/.x0x` fallback; x0x never silently writes keys under the user's home directory.
-
-`shutdown_and_wait()` deterministically stops the HTTP/SSE server, background tasks, the gossip runtime, and the QUIC endpoint (both ports release; a fixed-port rebind may need a brief retry). Remaining tracked caveats: in-flight exec sessions run to their caps, and the lifecycle is single-use. Full contract: [ADR-0057](./docs/adr/0057-embedded-serve-library-local-apps.md) and the `x0x::server` rustdoc.
+Note for embedders: self-update is disabled on the embed path by default (opt in via `serve_with_options`), and the host supplies explicit `data_dir` and `identity_dir` paths (no `~/.x0x` fallback).
 
 ---
 
