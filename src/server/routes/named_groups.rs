@@ -16093,6 +16093,15 @@ async fn request_treekem_catchup_page(
     );
     #[cfg(test)]
     detached_send_test_seam::park(&format!("treekem-catchup-page:{group_id}")).await;
+    #[cfg(test)]
+    {
+        let sender_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let keys: Vec<String> = fence_aliases
+            .iter()
+            .map(|alias| detached_send_test_seam::catchup_page_from_key(&sender_hex, alias))
+            .collect();
+        detached_send_test_seam::park_every(&keys).await;
+    }
     // #1655 (ADR 0110 §3): re-read the agent revocation immediately
     // before the write. Every caller decided on its peer before one or
     // more awaits (the response handler applies and persists a whole
@@ -25466,6 +25475,80 @@ pub(in crate::server) mod detached_send_test_seam {
         while !pause.released.load(Ordering::SeqCst) {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    /// A gate armed by [`arm_every`]. Unlike [`ArmedSendPause`] it parks
+    /// every send whose key it names, not only the first, until it is
+    /// dropped. Dropping it releases every parked send and disarms the key.
+    pub(in crate::server) struct ArmedSendGate {
+        key: String,
+        pause: Arc<SendPause>,
+    }
+
+    impl ArmedSendGate {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.pause.reached.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for ArmedSendGate {
+        fn drop(&mut self) {
+            self.pause.released.store(true, Ordering::SeqCst);
+            let mut gates = GATES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(gates) = gates.as_mut() {
+                if gates
+                    .get(&self.key)
+                    .is_some_and(|pause| Arc::ptr_eq(pause, &self.pause))
+                {
+                    gates.remove(&self.key);
+                }
+            }
+        }
+    }
+
+    static GATES: Mutex<Option<HashMap<String, Arc<SendPause>>>> = Mutex::new(None);
+
+    /// Park every send whose key is `key` until the gate is dropped.
+    pub(in crate::server) fn arm_every(key: &str) -> ArmedSendGate {
+        let pause = Arc::new(SendPause::default());
+        GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(key.to_string(), Arc::clone(&pause));
+        ArmedSendGate {
+            key: key.to_string(),
+            pause,
+        }
+    }
+
+    /// Park while a gate armed for any of `keys` is held.
+    pub(in crate::server) async fn park_every(keys: &[String]) {
+        let pause = {
+            let gates = GATES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            gates
+                .as_ref()
+                .and_then(|gates| keys.iter().find_map(|key| gates.get(key).cloned()))
+        };
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        while !pause.released.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Every TreeKEM catch-up page ask that the node with agent
+    /// `sender_hex` sends for `group_id` (any spelling of the group).
+    /// Node-scoped: in a W3-H run every node shares this process, and only
+    /// the named node's asks park.
+    pub(in crate::server) fn catchup_page_from_key(sender_hex: &str, group_id: &str) -> String {
+        format!("treekem-catchup-page-from:{sender_hex}:{group_id}")
     }
 
     /// The fan-out race's gossip publish of a public message on `topic`.
