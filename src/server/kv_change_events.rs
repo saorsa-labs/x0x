@@ -64,41 +64,54 @@ type Pending = BTreeMap<String, BTreeSet<KvChangeOrigin>>;
 /// Start the forwarders for the daemon's agent.
 pub(super) fn spawn(state: Arc<AppState>) -> [tokio::task::JoinHandle<()>; 2] {
     let tx = state.broadcast_tx.clone();
+    let shutdown = state.shutdown_started.clone();
     [
         tokio::spawn(forward(
             state.agent.subscribe_kv_changes(),
             tx.clone(),
             CHANGE_COALESCE,
+            shutdown.clone(),
         )),
         tokio::spawn(forward(
             state.agent.subscribe_task_changes(),
             tx,
             CHANGE_COALESCE,
+            shutdown,
         )),
     ]
 }
 
 /// Forward notices from `rx` to `tx` as merged events, until `rx` closes
-/// (the agent is gone).
+/// (the agent is gone) or daemon shutdown starts.
 async fn forward<T: ChangeNotice>(
     mut rx: broadcast::Receiver<T>,
     tx: broadcast::Sender<SseEvent>,
     window: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     loop {
         // The first notice opens a window.
         let mut pending = Pending::new();
         let mut lagged = false;
-        let mut closed = absorb(rx.recv().await, &mut pending, &mut lagged);
+        let first = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            received = rx.recv() => received,
+        };
+        let mut closed = absorb(first, &mut pending, &mut lagged);
         if closed && pending.is_empty() && !lagged {
             return;
         }
         // Collect until the window ends.
         let deadline = tokio::time::Instant::now() + window;
         while !closed {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Err(_elapsed) => break,
-                Ok(received) => closed = absorb(received, &mut pending, &mut lagged),
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                res = tokio::time::timeout_at(deadline, rx.recv()) => match res {
+                    Err(_elapsed) => break,
+                    Ok(received) => closed = absorb(received, &mut pending, &mut lagged),
+                },
             }
         }
         if lagged {
@@ -189,7 +202,12 @@ mod tests {
     async fn issue1094_a_burst_gives_one_event_per_store() {
         let (ntx, nrx) = broadcast::channel(64);
         let (etx, mut erx) = broadcast::channel(64);
-        let task = tokio::spawn(forward(nrx, etx, Duration::from_millis(200)));
+        let task = tokio::spawn(forward(
+            nrx,
+            etx,
+            Duration::from_millis(200),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         for _ in 0..50 {
             ntx.send(notice("store-a", KvChangeOrigin::Remote)).unwrap();
         }
@@ -232,7 +250,12 @@ mod tests {
     async fn issue1094_task_notices_give_task_changed_events() {
         let (ntx, nrx) = broadcast::channel(16);
         let (etx, mut erx) = broadcast::channel(16);
-        let task = tokio::spawn(forward(nrx, etx, Duration::from_millis(200)));
+        let task = tokio::spawn(forward(
+            nrx,
+            etx,
+            Duration::from_millis(200),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         for origin in [
             KvChangeOrigin::Local,
             KvChangeOrigin::Remote,
@@ -269,7 +292,12 @@ mod tests {
             ntx.send(notice(&format!("s{i}"), KvChangeOrigin::Remote))
                 .unwrap();
         }
-        let task = tokio::spawn(forward(nrx, etx, Duration::from_millis(200)));
+        let task = tokio::spawn(forward(
+            nrx,
+            etx,
+            Duration::from_millis(200),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         tokio::time::sleep(Duration::from_millis(250)).await;
         let first = erx.recv().await.unwrap();
         assert_eq!(

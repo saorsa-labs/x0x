@@ -1150,6 +1150,146 @@ macro_rules! arm_flush_regression_tests {
                 assert!(!complete, "an aborted grace straggler must not count as finished");
                 agent.try_shutdown().await.unwrap();
             }
+
+            /// Regression test for #2228: a real `serve_with_options` daemon
+            /// (with its full production `bg_tasks` set, `zero_peer_restart_secs`
+            /// watchdog, and an open REST `/subscribe` forwarder) must finish
+            /// every shutdown producer within the grace window and issue a
+            /// durable acknowledged flush receipt rather than failing with
+            /// `PRODUCERS_UNFINISHED`.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn serve_with_options_acknowledged_shutdown_flush_completes_all_producers() {
+                use std::io::Write;
+                use tower::ServiceExt;
+                use tracing::instrument::WithSubscriber;
+                use tracing_subscriber::prelude::*;
+
+                struct Sink(Arc<Mutex<Vec<u8>>>);
+                impl Write for Sink {
+                    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                        self.0.lock().unwrap().extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+
+                // Use a short system tempdir so `<data_dir>/upgrade-flush.sock`
+                // stays well below the 104/108-byte Unix sun_path limit even
+                // inside deep worktree paths.
+                let dir = tempfile::tempdir().unwrap();
+                let data_dir = dir.path().join("data");
+                let identity_dir = dir.path().join("id");
+                std::fs::create_dir_all(&data_dir).unwrap();
+                std::fs::create_dir_all(&identity_dir).unwrap();
+                let data_root = data_dir.canonicalize().unwrap();
+
+                let config: crate::server::DaemonConfig = serde_json::from_value(json!({
+                    "bind_address": "127.0.0.1:0",
+                    "api_address": "127.0.0.1:0",
+                    "data_dir": data_dir,
+                    "identity_dir": identity_dir,
+                    "bootstrap_peers": [],
+                    "mdns_enabled": false,
+                    "port_mapping_enabled": false,
+                    "zero_peer_restart_secs": 60,
+                    "network_id": format!(
+                        "x0x.test.2228.flush.{}.{:08x}",
+                        std::process::id(),
+                        rand::random::<u32>()
+                    ),
+                    "update": {
+                        "enabled": false
+                    }
+                }))
+                .unwrap();
+
+                let bytes = Arc::new(Mutex::new(Vec::new()));
+                let (mut writer, mut guard) = log_flush::acknowledged(Sink(Arc::clone(&bytes))).unwrap();
+                writer.write_all(b"daemon flush log").unwrap();
+                let dispatch = tracing::Dispatch::new(
+                    tracing_subscriber::registry()
+                        .with(log_flush::FlushLayer::new(vec![writer]).unwrap()),
+                );
+
+                let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+                let observed_exit = Arc::clone(&exit_code);
+                let options = crate::server::ServeOptions {
+                    skip_update_check: false,
+                    self_update_enabled: true,
+                    cli_no_port_mapping: true,
+                    cli_disable_peer_cache: true,
+                    flush_exit: Some(Arc::new(move |code| {
+                        observed_exit.store(code, std::sync::atomic::Ordering::SeqCst);
+                    })),
+                    ..crate::server::ServeOptions::default()
+                };
+
+                let handle = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    crate::server::serve_with_options(config, options).with_subscriber(dispatch),
+                )
+                .await
+                .expect("daemon starts within 60 s")
+                .expect("serve_with_options succeeds");
+
+                // Exercise an active REST `/subscribe` forwarder as well.
+                let token = {
+                    let state = handle.test_state.upgrade().expect("live daemon state");
+                    state.api_token.clone()
+                };
+                let req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/subscribe")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({ "topic": "x0x.test.2228.sub" })).unwrap(),
+                    ))
+                    .unwrap();
+                let resp = handle.test_router.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+                let binding = shutdown_flush::Binding::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    1,
+                    &"plan-2228",
+                )
+                .unwrap();
+                let ack_root = data_root.clone();
+                let ack_binding = binding.clone();
+                let receipt = tokio::task::spawn_blocking(move || {
+                    shutdown_flush::acknowledge(&ack_root, ack_binding, || Ok(()))
+                })
+                .await
+                .expect("acknowledge thread joins")
+                .expect("all serve_with_options producers must finish cleanly without PRODUCERS_UNFINISHED");
+
+                receipt.authorize(&binding).expect("receipt binding must match");
+                assert_eq!(
+                    exit_code.load(std::sync::atomic::Ordering::SeqCst),
+                    -1,
+                    "successful flush must not trigger EX_TEMPFAIL exit"
+                );
+                assert!(
+                    bytes
+                        .lock()
+                        .unwrap()
+                        .windows(b"daemon flush log".len())
+                        .any(|w| w == b"daemon flush log"),
+                    "log barrier must flush buffered daemon logs before receipt"
+                );
+
+                let shutdown = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    handle.shutdown_and_wait(),
+                )
+                .await
+                .expect("daemon supervisor exits cleanly after receipt");
+                assert!(shutdown.is_ok(), "clean shutdown expected: {shutdown:?}");
+                let _ = guard.shutdown_until(Instant::now() + Duration::from_secs(1));
+            }
         }
     };
 }

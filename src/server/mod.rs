@@ -612,6 +612,8 @@ async fn serve_with_options_inner(
         self_update_enabled,
         daemon_config_path,
         gui_show_write_path,
+        #[cfg(test)]
+        flush_exit,
     } = options;
     let self_update_enabled = effective_self_update_enabled(self_update_enabled, skip_update_check);
     crate::w3h_inline::fs::create_dir_all(&config.data_dir)
@@ -967,12 +969,27 @@ async fn serve_with_options_inner(
     if let Some(window) = config.zero_peer_restart_secs {
         let watchdog_agent = Arc::clone(&agent);
         let watchdog_shutdown = shutdown_tx.clone();
+        let mut watchdog_stop = shutdown_notify.subscribe();
         startup_tasks.push(spawn_built(move || async move {
+            if *watchdog_stop.borrow() {
+                return;
+            }
             let window = std::time::Duration::from_secs(window.max(60));
             let mut zero_since: Option<std::time::Instant> = None;
-            tokio::time::sleep(window).await;
+            tokio::select! {
+                biased;
+                _ = watchdog_stop.changed() => return,
+                _ = tokio::time::sleep(window) => {}
+            }
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::select! {
+                    biased;
+                    _ = watchdog_stop.changed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                }
+                if *watchdog_stop.borrow() {
+                    return;
+                }
                 let peers = watchdog_agent
                     .peers()
                     .await
@@ -1481,6 +1498,11 @@ async fn serve_with_options_inner(
                 Some(root) => root,
                 None => crate::storage::x0x_dir().await?,
             };
+            #[cfg(test)]
+            let exit: std::sync::Arc<dyn Fn(i32) + Send + Sync> = flush_exit
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(|code| std::process::exit(code)));
+            #[cfg(not(test))]
             let exit: std::sync::Arc<dyn Fn(i32) + Send + Sync> =
                 std::sync::Arc::new(|code| std::process::exit(code));
             upgrade_flush::FlushOwner::start(&state, &config.data_dir, &identity_root, exit)
@@ -1892,7 +1914,11 @@ async fn serve_with_options_inner(
     let roster_refresh_state = Arc::clone(&state);
     bg_tasks.push(spawn_built(move || async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                biased;
+                () = roster_refresh_state.shutdown_started.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
             routes::named_groups::refresh_group_rosters_for_gossip(&roster_refresh_state).await;
         }
     }));
@@ -1953,9 +1979,20 @@ async fn serve_with_options_inner(
     if republish_interval_secs > 0 {
         let state_for_republish = Arc::clone(&state);
         bg_tasks.push(spawn_built(move || async move {
-            tokio::time::sleep(Duration::from_secs(2)).await;
             let mut shutdown = state_for_republish.shutdown_notify.subscribe();
+            if *shutdown.borrow() || state_for_republish.shutdown_started.is_cancelled() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                () = state_for_republish.shutdown_started.cancelled() => return,
+                _ = shutdown.changed() => return,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
             loop {
+                if *shutdown.borrow() || state_for_republish.shutdown_started.is_cancelled() {
+                    break;
+                }
                 let current_ids: Vec<String> = {
                     let groups = state_for_republish.named_groups.read().await;
                     groups
@@ -1970,8 +2007,10 @@ async fn serve_with_options_inner(
                     publish_group_card_to_discovery(&state_for_republish, &id).await;
                 }
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(republish_interval_secs)) => {}
+                    biased;
+                    () = state_for_republish.shutdown_started.cancelled() => break,
                     _ = shutdown.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(republish_interval_secs)) => {}
                 }
             }
         }));
@@ -2004,6 +2043,7 @@ async fn serve_with_options_inner(
         dm_inbox_gui_show_route_tx,
         dm_inbox_revocation_push_route_tx,
         dm_inbox_data_read_route_tx,
+        state.shutdown_started.clone(),
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -2299,7 +2339,12 @@ async fn serve_with_options_inner(
             }
             let mut rx = file_state.agent.subscribe_direct();
             loop {
-                let Some(msg) = rx.recv().await else { break };
+                let msg = tokio::select! {
+                    biased;
+                    () = file_state.shutdown_started.cancelled() => break,
+                    msg = rx.recv() => msg,
+                };
+                let Some(msg) = msg else { break };
                 let Some((sender, file_msg)) = routes::decode_file_message(&msg) else {
                     continue;
                 };
@@ -2325,7 +2370,12 @@ async fn serve_with_options_inner(
         bg_tasks.push(spawn_built(move || async move {
             let mut rx = welcome_state.agent.subscribe_direct();
             loop {
-                let Some(msg) = rx.recv().await else { break };
+                let msg = tokio::select! {
+                    biased;
+                    () = welcome_state.shutdown_started.cancelled() => break,
+                    msg = rx.recv() => msg,
+                };
+                let Some(msg) = msg else { break };
                 let Some((sender, welcome_msg)) =
                     routes::named_groups::decode_welcome_blob_message(&msg)
                 else {
@@ -2351,7 +2401,12 @@ async fn serve_with_options_inner(
         bg_tasks.push(spawn_built(move || async move {
             let mut rx = control_state.agent.subscribe_direct();
             loop {
-                let Some(msg) = rx.recv().await else { break };
+                let msg = tokio::select! {
+                    biased;
+                    () = control_state.shutdown_started.cancelled() => break,
+                    msg = rx.recv() => msg,
+                };
+                let Some(msg) = msg else { break };
                 let Ok(control_msg) = crate::wire_compat::decode_json::<ControlBlobMessage>(
                     "ControlBlobMessage",
                     "control_blob_",
@@ -2376,7 +2431,12 @@ async fn serve_with_options_inner(
         bg_tasks.push(spawn_built(move || async move {
             let mut rx = catchup_state.agent.subscribe_direct();
             loop {
-                let Some(msg) = rx.recv().await else { break };
+                let msg = tokio::select! {
+                    biased;
+                    () = catchup_state.shutdown_started.cancelled() => break,
+                    msg = rx.recv() => msg,
+                };
+                let Some(msg) = msg else { break };
                 if !routes::named_groups::dispatch_treekem_catchup_message(
                     &catchup_state,
                     &msg.sender,
@@ -2397,7 +2457,12 @@ async fn serve_with_options_inner(
         bg_tasks.push(spawn_built(move || async move {
             let mut rx = bootstrap_state.agent.subscribe_direct();
             loop {
-                let Some(msg) = rx.recv().await else { break };
+                let msg = tokio::select! {
+                    biased;
+                    () = bootstrap_state.shutdown_started.cancelled() => break,
+                    msg = rx.recv() => msg,
+                };
+                let Some(msg) = msg else { break };
                 let Ok(bootstrap) = serde_json::from_slice::<PublicGroupBootstrap>(&msg.payload)
                 else {
                     continue;
@@ -2493,7 +2558,13 @@ async fn serve_with_options_inner(
     {
         let public_dm_state = Arc::clone(&state);
         bg_tasks.push(spawn_built(move || async move {
-            while let Some(typed) = group_public_dm_rx.recv().await {
+            loop {
+                let typed = tokio::select! {
+                    biased;
+                    () = public_dm_state.shutdown_started.cancelled() => break,
+                    typed = group_public_dm_rx.recv() => typed,
+                };
+                let Some(typed) = typed else { break };
                 let Some(payload) = typed.payload.strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
                 else {
                     continue;
@@ -2533,7 +2604,13 @@ async fn serve_with_options_inner(
         let relay_state = Arc::clone(&state);
         let local_agent_hex = hex::encode(relay_state.agent.agent_id().as_bytes());
         bg_tasks.push(spawn_built(move || async move {
-            while let Some(typed) = predecessor_relay_dm_rx.recv().await {
+            loop {
+                let typed = tokio::select! {
+                    biased;
+                    () = relay_state.shutdown_started.cancelled() => break,
+                    typed = predecessor_relay_dm_rx.recv() => typed,
+                };
+                let Some(typed) = typed else { break };
                 let apply_state = Arc::clone(&relay_state);
                 let local_agent_hex = local_agent_hex.clone();
                 let handled = relay_state
@@ -2556,7 +2633,13 @@ async fn serve_with_options_inner(
     {
         let kv_delta_state = Arc::clone(&state);
         bg_tasks.push(spawn_built(move || async move {
-            while let Some(typed) = kv_store_delta_dm_rx.recv().await {
+            loop {
+                let typed = tokio::select! {
+                    biased;
+                    () = kv_delta_state.shutdown_started.cancelled() => break,
+                    typed = kv_store_delta_dm_rx.recv() => typed,
+                };
+                let Some(typed) = typed else { break };
                 if !typed.verified {
                     continue;
                 }
@@ -2595,6 +2678,9 @@ async fn serve_with_options_inner(
         bg_tasks.push(spawn_built(move || async move {
             let mut shutdown_rx = relay_step_state.shutdown_notify.subscribe();
             loop {
+                if *shutdown_rx.borrow() || relay_step_state.shutdown_started.is_cancelled() {
+                    break;
+                }
                 let now_ms = now_millis_u64();
                 let next_deadline_ms = {
                     let outbox = relay_step_state.predecessor_relay_outbox.read().await;
@@ -2612,6 +2698,8 @@ async fn serve_with_options_inner(
                     _ => std::time::Duration::from_millis(500),
                 };
                 tokio::select! {
+                    biased;
+                    () = relay_step_state.shutdown_started.cancelled() => break,
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(sleep_dur) => {
                         causal_relay_step(&relay_step_state).await;
@@ -2630,7 +2718,12 @@ async fn serve_with_options_inner(
                 .capability_store()
                 .subscribe_obligation_adverts();
             loop {
+                if *shutdown_rx.borrow() || offer_state.shutdown_started.is_cancelled() {
+                    break;
+                }
                 tokio::select! {
+                    biased;
+                    () = offer_state.shutdown_started.cancelled() => break,
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {
                         requester_offer_step(&offer_state).await;
@@ -2647,7 +2740,12 @@ async fn serve_with_options_inner(
                                 .agent
                                 .capability_store()
                                 .subscribe_obligation_adverts();
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::select! {
+                                biased;
+                                () = offer_state.shutdown_started.cancelled() => break,
+                                _ = shutdown_rx.changed() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                            }
                         }
                     },
                 }
@@ -2665,9 +2763,15 @@ async fn serve_with_options_inner(
         let acks = state.agent.dm_inflight_acks();
         let mut orphan_acks = acks.subscribe_orphan_acks();
         let ack_tx = wake_tx.clone();
+        let orphan_shutdown = state.shutdown_started.clone();
         bg_tasks.push(spawn_built(move || async move {
             loop {
-                match orphan_acks.recv().await {
+                let recv = tokio::select! {
+                    biased;
+                    () = orphan_shutdown.cancelled() => break,
+                    recv = orphan_acks.recv() => recv,
+                };
+                match recv {
                     Ok(ack) => {
                         if ack_tx.send(DirectSendWake::LateAck(ack)).await.is_err() {
                             break;
@@ -2679,9 +2783,15 @@ async fn serve_with_options_inner(
             }
         }));
         let mut adverts = state.agent.capability_store().subscribe_durable_adverts();
+        let advert_shutdown = state.shutdown_started.clone();
         bg_tasks.push(spawn_built(move || async move {
             loop {
-                match adverts.recv().await {
+                let recv = tokio::select! {
+                    biased;
+                    () = advert_shutdown.cancelled() => break,
+                    recv = adverts.recv() => recv,
+                };
+                match recv {
                     Ok(recipient) => {
                         if wake_tx
                             .send(DirectSendWake::Advert(recipient))
@@ -2699,6 +2809,7 @@ async fn serve_with_options_inner(
         let send_state = Arc::clone(&state);
         bg_tasks.push(spawn_built(move || async move {
             let mut shutdown_rx = send_state.shutdown_notify.subscribe();
+            let worker_shutdown = send_state.shutdown_started.clone();
             let transport = AgentDirectSendTransport(send_state.as_ref());
             let ledger = |request_id: &[u8; 16]| LedgerReceipt::of(&acks, request_id);
             run_direct_send_worker(
@@ -2708,7 +2819,14 @@ async fn serve_with_options_inner(
                 &DirectSendNow::current,
                 wake_rx,
                 async move {
-                    let _ = shutdown_rx.changed().await;
+                    if *shutdown_rx.borrow() || worker_shutdown.is_cancelled() {
+                        return;
+                    }
+                    tokio::select! {
+                        biased;
+                        () = worker_shutdown.cancelled() => {}
+                        _ = shutdown_rx.changed() => {}
+                    }
                 },
             )
             .await;
@@ -2718,7 +2836,13 @@ async fn serve_with_options_inner(
     {
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(spawn_built(move || async move {
-            while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
+            loop {
+                let typed = tokio::select! {
+                    biased;
+                    () = bootstrap_state.shutdown_started.cancelled() => break,
+                    typed = public_group_bootstrap_dm_rx.recv() => typed,
+                };
+                let Some(typed) = typed else { break };
                 let apply_state = Arc::clone(&bootstrap_state);
                 let admitted = bootstrap_state
                     .run_shielded(Box::pin(async move {
@@ -2735,7 +2859,13 @@ async fn serve_with_options_inner(
     {
         let grant_state = Arc::clone(&state);
         bg_tasks.push(spawn_built(move || async move {
-            while let Some(typed) = share_grant_dm_rx.recv().await {
+            loop {
+                let typed = tokio::select! {
+                    biased;
+                    () = grant_state.shutdown_started.cancelled() => break,
+                    typed = share_grant_dm_rx.recv() => typed,
+                };
+                let Some(typed) = typed else { break };
                 let _ = dispatch_share_grant_typed(&grant_state, typed).await;
             }
         }));
@@ -2743,9 +2873,16 @@ async fn serve_with_options_inner(
 
     {
         let push_agent = Arc::clone(&agent);
+        let push_shutdown = state.shutdown_started.clone();
         bg_tasks.push(spawn_built(move || async move {
             let limiter = tokio::sync::Mutex::new(x0x::revocation_push::PushRateLimiter::new());
-            while let Some(typed) = revocation_push_dm_rx.recv().await {
+            loop {
+                let typed = tokio::select! {
+                    biased;
+                    () = push_shutdown.cancelled() => break,
+                    typed = revocation_push_dm_rx.recv() => typed,
+                };
+                let Some(typed) = typed else { break };
                 let _ = push_agent
                     .handle_grant_revocation_push_delivery(&limiter, typed)
                     .await;
@@ -2760,7 +2897,13 @@ async fn serve_with_options_inner(
     {
         let gui_show_state = Arc::clone(&state);
         bg_tasks.push(spawn_built(move || async move {
-            while let Some(typed) = gui_show_dm_rx.recv().await {
+            loop {
+                let typed = tokio::select! {
+                    biased;
+                    () = gui_show_state.shutdown_started.cancelled() => break,
+                    typed = gui_show_dm_rx.recv() => typed,
+                };
+                let Some(typed) = typed else { break };
                 crate::server::gui_show_remote::handle_gui_show_typed(&gui_show_state, typed).await;
             }
         }));
@@ -2821,7 +2964,12 @@ async fn serve_with_options_inner(
         bg_tasks.push(spawn_built(move || async move {
             let mut shutdown_rx = bootstrap_state.shutdown_notify.subscribe();
             loop {
+                if *shutdown_rx.borrow() || bootstrap_state.shutdown_started.is_cancelled() {
+                    break;
+                }
                 tokio::select! {
+                    biased;
+                    () = bootstrap_state.shutdown_started.cancelled() => break,
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {
                         // #1288: the step persists the outbox around its send.
@@ -3430,8 +3578,8 @@ async fn drain_server_tasks(
     // which holds `history.db`. Dropping the map would detach that task and
     // leave the database locked after `shutdown_and_wait`. Admission is
     // `shutdown_started`, cancelled above and checked under this lock by
-    // `subscribe`. These tasks only forward, so the grace window below
-    // aborts any still blocked on receive.
+    // `subscribe`. Forwarders select on `shutdown_started` and exit cleanly
+    // within the grace window (#2228).
     bg_tasks.extend(routes::take_rest_subscribe_forwarders(state).await);
     bg_tasks.extend(
         std::mem::take(&mut *state.group_metadata_tasks.write().await)
@@ -3771,8 +3919,12 @@ async fn start_dm_inbox_when_gossip_ready(
     gui_show_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     revocation_push_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     data_read_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
+        if shutdown.is_cancelled() {
+            return;
+        }
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
             .with_validated_typed_payload_route(
                 x0x::exec::EXEC_DM_PREFIX,
@@ -3888,7 +4040,11 @@ async fn start_dm_inbox_when_gossip_ready(
             }
             Err(e) if attempt < DM_INBOX_START_MAX_ATTEMPTS => {
                 tracing::debug!(attempt, "DM inbox not ready yet: {e}");
-                tokio::time::sleep(DM_INBOX_START_RETRY_DELAY).await;
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(DM_INBOX_START_RETRY_DELAY) => {}
+                }
             }
             Err(e) => {
                 tracing::warn!(

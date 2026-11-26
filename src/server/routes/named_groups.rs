@@ -4234,7 +4234,11 @@ pub(in crate::server) async fn spawn_directory_resubscribe(
         };
         let state_for_spawn = Arc::clone(&state);
         handles.push(tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::select! {
+                biased;
+                () = state_for_spawn.shutdown_started.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+            }
             subscribe_shard(state_for_spawn, rec.kind, rec.shard).await;
         }));
     }
@@ -16789,6 +16793,9 @@ pub(in crate::server) async fn run_treekem_start_catchup(state: Arc<AppState>) {
     }
     let mut shutdown = state.shutdown_notify.subscribe();
     loop {
+        if *shutdown.borrow() || state.shutdown_started.is_cancelled() {
+            return;
+        }
         if let Err(error) =
             crate::profile::write_atomically(&path, treekem_unix_now_ms().to_string().as_bytes())
                 .await
@@ -16796,6 +16803,8 @@ pub(in crate::server) async fn run_treekem_start_catchup(state: Arc<AppState>) {
             tracing::debug!("TreeKEM up-time record was not written: {error}");
         }
         tokio::select! {
+            biased;
+            () = state.shutdown_started.cancelled() => return,
             _ = shutdown.changed() => return,
             _ = tokio::time::sleep(TREEKEM_ALIVE_INTERVAL) => {}
         }
@@ -17141,7 +17150,12 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
     let mut tick = tokio::time::interval(TREEKEM_ISOLATION_CHECK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        if *shutdown.borrow() || state.shutdown_started.is_cancelled() {
+            return;
+        }
         tokio::select! {
+            biased;
+            () = state.shutdown_started.cancelled() => return,
             _ = shutdown.changed() => return,
             _ = tick.tick() => {}
             event = events.recv() => match event {
