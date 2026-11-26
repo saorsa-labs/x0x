@@ -198,6 +198,9 @@ pub(super) async fn auth_middleware(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let has_auth_header = req
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION);
     let header_token = extract_bearer(req.headers());
     let query_token = extract_query_token(req.uri().query());
 
@@ -208,7 +211,17 @@ pub(super) async fn auth_middleware(
         query_token.as_deref(),
         &state.api_token,
         &state.sessions,
-    );
+    )
+    .and_then(|grant| {
+        // A11 amendment (26 Nov 2026): a malformed/non-Bearer Authorization
+        // header on bare GET /gui must still be rejected as 401 rather than
+        // falling through to the unauthenticated shell grant.
+        if grant == Grant::Open && is_gui_shell_path(&path) && has_auth_header {
+            Err(StatusCode::UNAUTHORIZED)
+        } else {
+            Ok(grant)
+        }
+    });
 
     if let Ok(grant) = grant {
         // Review fix #4: distinguish the DURABLE token (full authority,
@@ -2848,5 +2861,104 @@ mod tests {
         assert!(!requires_durable_owner(&Method::GET, "/gui/"));
         assert!(!requires_durable_owner(&Method::POST, "/gui"));
         assert!(!requires_durable_owner(&Method::GET, "/gui/show"));
+    }
+
+    #[tokio::test]
+    async fn gui_shell_middleware_serves_bare_get_and_rejects_malformed_auth_header() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(crate::identity::AgentKeypair::generate().expect("key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .build()
+                .await
+                .expect("agent"),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            agent,
+        )
+        .await
+        .expect("state");
+        let app = axum::Router::new()
+            .route("/gui", get(super::super::ws::serve_gui))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware,
+            ));
+
+        let bare = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/gui")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(bare.status(), StatusCode::OK);
+        assert_eq!(
+            bare.headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+        assert_eq!(
+            bare.headers()
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok()),
+            Some("frame-ancestors 'none'")
+        );
+
+        let non_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/gui")
+                    .header(axum::http::header::AUTHORIZATION, "Basic invalid")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(non_bearer.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/gui")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(wrong_bearer.status(), StatusCode::UNAUTHORIZED);
+
+        let durable_query = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/gui?token={}", state.api_token))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(durable_query.status(), StatusCode::UNAUTHORIZED);
+
+        let session = state.sessions.issue();
+        let valid_session = app
+            .oneshot(
+                axum::http::Request::get(format!("/gui?token={session}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(valid_session.status(), StatusCode::OK);
     }
 }

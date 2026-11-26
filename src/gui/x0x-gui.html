@@ -839,6 +839,7 @@ function endSession(message,revoke){
   el.className='toast error';
   el.textContent=message;
   document.getElementById('toasts').appendChild(el);
+  if(typeof closeActiveWs==='function')closeActiveWs();
   if(typeof showSessionOverlay==='function')showSessionOverlay(message);
 }
 function maybeRefreshSession(){
@@ -984,6 +985,7 @@ async function submitSessionToken(){
     hideSessionOverlay();
     const t=document.getElementById('toasts');
     if(t)t.innerHTML='';
+    closeActiveWs();
     startGuiActive();
     return;
   }
@@ -1043,11 +1045,20 @@ async function refreshAgentIdentity(){
   return a;
 }
 
+function closeActiveWs(){
+  const prev=ws;
+  ws=null;
+  if(prev){try{prev.close()}catch(e){}}
+  S.set('connected',false);
+}
 function wsConnect(){
   if(ws&&ws.readyState<2)return;
   try{ws=new WebSocket(wsUrl())}catch(e){setTimeout(wsConnect,3000);return}
+  const sock=ws;
   ws.onopen=async()=>{
+    if(ws!==sock)return;
     await refreshAgentIdentity();
+    if(ws!==sock)return;
     S.set('connected',true);
     advertiseGuiVisibility();
     wsSubs.forEach(t=>wsSend({type:'subscribe',topics:[t]}));
@@ -1055,12 +1066,13 @@ function wsConnect(){
   // #2079: the daemon closes a signed-out or idle-expired session's socket
   // with 1008; reconnecting would only retry a dead token.
   ws.onclose=e=>{
+    if(ws!==sock)return;
     S.set('connected',false);
     if(e&&e.code===1008){endSession('Session ended — reopen with `x0x gui`');return}
     if(!sessionExpired)setTimeout(wsConnect,3000);
   };
   ws.onerror=()=>{};
-  ws.onmessage=e=>{try{handleWsMsg(JSON.parse(e.data))}catch(e){}};
+  ws.onmessage=e=>{if(ws!==sock)return;try{handleWsMsg(JSON.parse(e.data))}catch(e){}};
 }
 function wsSend(obj){if(ws&&ws.readyState===1)ws.send(JSON.stringify(obj))}
 function wsSub(topic){wsSubs.add(topic);wsSend({type:'subscribe',topics:[topic]})}
