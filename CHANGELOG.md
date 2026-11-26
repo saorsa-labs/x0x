@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-11-26
+
+### Fixed
+
+- **Acknowledged shutdown flush completes: every background producer now stops
+  inside the drain grace (#2228, #2230).** `drain_server_tasks` counted any
+  task aborted at the 2 s grace as an unfinished producer (ADR 0094 §4), and
+  22 unconditional background loops (timer/event workers, DM and KV channel
+  consumers, REST `/subscribe` forwarders, startup sleeps) never stopped on
+  their own, so every acknowledged-flush upgrade out of an affected release
+  failed with `PRODUCERS_UNFINISHED` and held the new version. All of them now
+  select on shutdown, and a regression test boots a real `serve_with_options`
+  daemon and drives `shutdown_flush::acknowledge` to a durable receipt with
+  zero aborted stragglers. **A daemon running 0.49.x still fails its own
+  flush**: the fleet needs one operator-driven upgrade onto 0.50.0, after
+  which self-upgrade works again (#2228).
+- Two `w3h_1357` choreography tests are deterministic under saorsa-gossip
+  0.6.1's immediate control flush (test-only, node-scoped send gate); a
+  pre-existing S4 restart head-sync liveness gap found in the process is
+  tracked as #2231.
+
 ### Changed
 
 - **Dependencies: saorsa-gossip `=0.6.1` (Wave 2), new
