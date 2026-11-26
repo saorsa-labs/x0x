@@ -1,0 +1,112 @@
+name: Publish crate
+
+# Publishes the x0x crate to crates.io when a GitHub release is published
+# (the human act of flipping the draft public), or on manual dispatch with a
+# tag. The `release` environment gates the job behind a deployment approval,
+# the same gate as build/sign/create-release in release.yml.
+#
+# Requires the CARGO_REGISTRY_TOKEN secret (crates.io API token with
+# publish-update scope) visible to this repo — as a `release` environment
+# secret, a repo secret, or an org secret.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (vX.Y.Z)"
+        required: true
+        type: string
+
+concurrency:
+  group: publish-crates-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same CMake 4 / audiopus_sys workaround as release.yml (#1816).
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_x86_64_unknown_linux_gnu: ${{ github.workspace }}/scripts/ci/cmake-policy-min.sh
+
+jobs:
+  publish-crate:
+    name: cargo publish (crates.io)
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Resolve and validate tag
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::not a release tag: $TAG (pre-releases are not published to crates.io)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Validate release metadata
+        run: |
+          python3 .github/scripts/validate_release_metadata.py \
+            --mode release_tag \
+            --tag "${{ steps.tag.outputs.tag }}" \
+            --ref "refs/tags/${{ steps.tag.outputs.tag }}"
+
+      - name: Skip if this version is already on crates.io
+        id: check
+        run: |
+          set -euo pipefail
+          V="${{ steps.tag.outputs.version }}"
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: x0x-release-ci (https://github.com/saorsa-labs/x0x)' \
+            "https://crates.io/api/v1/crates/x0x/$V")
+          if [ "$STATUS" = "200" ]; then
+            echo "x0x $V is already on crates.io; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$STATUS" = "404" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::crates.io version check returned HTTP $STATUS"
+            exit 1
+          fi
+
+      - name: Install Rust stable
+        if: steps.check.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo publish
+        if: steps.check.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set for this repo/environment"
+            exit 1
+          fi
+          cargo publish --locked
+
+      - name: Verify the publish landed
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          V="${{ steps.tag.outputs.version }}"
+          for _ in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H 'User-Agent: x0x-release-ci (https://github.com/saorsa-labs/x0x)' \
+              "https://crates.io/api/v1/crates/x0x/$V")
+            [ "$STATUS" = "200" ] && { echo "x0x $V is live on crates.io"; exit 0; }
+            sleep 10
+          done
+          echo "::error::x0x $V not visible on crates.io after publish"
+          exit 1
