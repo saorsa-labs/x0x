@@ -87,7 +87,13 @@ pub(super) async fn run_data_read_consumer(
     mut rx: tokio::sync::mpsc::Receiver<DmTypedPayload>,
 ) {
     let slots = Arc::new(Semaphore::new(DATA_SERVE_SLOTS));
-    while let Some(typed) = rx.recv().await {
+    loop {
+        let typed = tokio::select! {
+            biased;
+            () = state.shutdown_started.cancelled() => break,
+            typed = rx.recv() => typed,
+        };
+        let Some(typed) = typed else { break };
         handle_data_read_typed(&state, &slots, typed);
     }
 }

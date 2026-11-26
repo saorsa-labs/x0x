@@ -191,7 +191,11 @@ pub(super) async fn write(
 /// the record if it changed.
 async fn run_writer(state: Arc<AppState>, interval: Duration, mut written: u64) {
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            biased;
+            () = state.shutdown_started.cancelled() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
         refresh_scope(&state).await;
         let (generation, entries) = state.agent.capability_store().sticky_snapshot();
         if generation == written {

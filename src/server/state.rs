@@ -143,6 +143,11 @@ pub struct ServeOptions {
     /// The daemon passes the loaded config, or the default config path
     /// when startup loaded no file. Stop does not create or modify it.
     pub gui_show_write_path: Option<std::path::PathBuf>,
+    /// Test-only override for the acknowledged shutdown-flush failure exit
+    /// callback so regression tests observe an exit code instead of
+    /// terminating the test harness process.
+    #[cfg(test)]
+    pub(crate) flush_exit: Option<Arc<dyn Fn(i32) + Send + Sync>>,
 }
 
 pub(super) const fn effective_self_update_enabled(
