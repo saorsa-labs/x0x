@@ -157,10 +157,39 @@ async fn query_token_authenticates_every_allowlisted_path() {
     // #127 / WS1.6: only short-lived session tokens are accepted via ?token=
     // on browser endpoints — the durable API token is never valid in a URL.
     let session = d.session_token().await;
-    // Mirror of `accepts_query_token` in src/server/mod.rs.
+    // A11 amendment (26 Nov 2026): bare GET /gui and /gui/ serve the static
+    // HTML shell (no secrets) so browser reload/bookmarks work; supplied
+    // `?token=` credentials are still strictly validated (durable/bad -> 401).
+    for path in ["/gui", "/gui/"] {
+        let bare = c().get(d.url(path)).send().await.unwrap();
+        assert_eq!(
+            bare.status(),
+            StatusCode::OK,
+            "bare GET {path} must serve static HTML shell (200)"
+        );
+        let durable_q = c()
+            .get(format!("{}?token={}", d.url(path), d.api_token()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            durable_q.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path}?token=<durable> must be 401"
+        );
+        let with_token = c()
+            .get(format!("{}?token={session}", d.url(path)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            with_token.status(),
+            StatusCode::OK,
+            "{path}?token=<session> must authenticate (200)"
+        );
+    }
+    // Mirror of WS/SSE paths on `accepts_query_token` in src/server/auth.rs.
     let paths = [
-        "/gui",
-        "/gui/",
         "/ws",
         "/ws/direct",
         "/events",

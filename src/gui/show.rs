@@ -2999,7 +2999,7 @@ const timers = [];
 function setTimeout(fn, ms) { timers.push(ms); }
 const S = { set() {} };
 let ws = null;
-class WebSocket { constructor() { this.readyState = 0; } }
+class WebSocket { constructor() { this.readyState = 0; } close() { this.readyState = 3; } }
 function wsUrl() { return 'ws://127.0.0.1:9/ws?token=t'; }
 async function refreshAgentIdentity() {}
 function advertiseGuiVisibility() {}
@@ -3007,9 +3007,15 @@ const wsSubs = [];
 function handleWsMsg() {}
 function fail(message) { throw new Error(message); }
 "#,
-            fn_source(html, "function wsConnect()", "function wsSend("),
+            fn_source(html, "function closeActiveWs()", "function wsSend("),
             r#"
 wsConnect();
+const stale = ws;
+closeActiveWs();
+wsConnect();
+stale.readyState = 3;
+stale.onclose({ code: 1008 });
+if (ended.length !== 0 || sessionExpired) fail('a stale socket 1008 close must not end the new session');
 ws.readyState = 3;
 ws.onclose({ code: 1006 });
 if (timers.length !== 1) fail('an abnormal close must reconnect');

@@ -75,6 +75,21 @@ pub(super) fn authorize(
             }
         }
     }
+    // (4b) Embedded GUI static shell (A11 amendment of 26 Nov 2026):
+    // `GET /gui` and `GET /gui/` serve a static compile-time HTML shell with
+    // no secrets or daemon state. Allow bare `GET` with no supplied
+    // credential so browser reload (after `?token=` is stripped), bookmarks,
+    // and direct navigation load the shell (which reuses `sessionStorage` or
+    // renders a sign-in overlay). Any supplied `?token=` or `Authorization`
+    // header must still validate above, so `?token=<durable>` and replaced
+    // or invalid tokens keep returning 401.
+    if method == Method::GET
+        && is_gui_shell_path(path)
+        && header_token.is_none()
+        && query_token.is_none()
+    {
+        return Ok(Grant::Open);
+    }
     // (5) A lapsed session token reaches refresh and revoke and nothing else.
     // Revoke also takes a token a refresh just replaced, so a sign-out that
     // lost the race to a refresh still ends the session.
@@ -183,6 +198,9 @@ pub(super) async fn auth_middleware(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let has_auth_header = req
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION);
     let header_token = extract_bearer(req.headers());
     let query_token = extract_query_token(req.uri().query());
 
@@ -193,7 +211,17 @@ pub(super) async fn auth_middleware(
         query_token.as_deref(),
         &state.api_token,
         &state.sessions,
-    );
+    )
+    .and_then(|grant| {
+        // A11 amendment (26 Nov 2026): a malformed/non-Bearer Authorization
+        // header on bare GET /gui must still be rejected as 401 rather than
+        // falling through to the unauthenticated shell grant.
+        if grant == Grant::Open && is_gui_shell_path(&path) && has_auth_header {
+            Err(StatusCode::UNAUTHORIZED)
+        } else {
+            Ok(grant)
+        }
+    });
 
     if let Ok(grant) = grant {
         // Review fix #4: distinguish the DURABLE token (full authority,
@@ -520,6 +548,10 @@ pub(in crate::server) fn has_valid_owner_bearer(
 
 fn is_auth_exempt_path(path: &str) -> bool {
     path == "/health" || path.starts_with("/constitution")
+}
+
+fn is_gui_shell_path(path: &str) -> bool {
+    matches!(path, "/gui" | "/gui/")
 }
 
 fn accepts_query_token(path: &str) -> bool {
@@ -1637,13 +1669,84 @@ mod tests {
     // -- Auth-exempt / query-token path predicates.
 
     #[test]
-    fn gui_requires_auth_but_accepts_query_token_bootstrap() {
+    fn gui_shell_allows_bare_get_but_validates_supplied_credentials() {
+        // A11 amendment of 26 Nov 2026: bare GET /gui serves the static HTML
+        // shell so reload/bookmarks work via sessionStorage or sign-in UI,
+        // while any supplied credential (including ?token=<durable>) is still
+        // validated and rejected if invalid.
         assert!(!is_auth_exempt_path("/gui"));
         assert!(!is_auth_exempt_path("/gui/"));
+        assert!(is_gui_shell_path("/gui"));
+        assert!(is_gui_shell_path("/gui/"));
         assert!(accepts_query_token("/gui"));
         assert!(accepts_query_token("/gui/"));
         assert!(accepts_query_token("/peers/events"));
         assert!(accepts_query_token("/presence/events"));
+
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let session = sessions.issue();
+        for path in ["/gui", "/gui/"] {
+            assert_eq!(
+                authorize(path, &Method::GET, None, None, TEST_API_TOKEN, &sessions),
+                Ok(Grant::Open),
+                "bare GET {path} must serve static GUI shell"
+            );
+            assert!(
+                matches!(
+                    authorize(
+                        path,
+                        &Method::GET,
+                        None,
+                        Some(&session),
+                        TEST_API_TOKEN,
+                        &sessions
+                    ),
+                    Ok(Grant::Session(_))
+                ),
+                "GET {path}?token=<session> must authenticate session"
+            );
+            assert_eq!(
+                authorize(
+                    path,
+                    &Method::GET,
+                    None,
+                    Some(TEST_API_TOKEN),
+                    TEST_API_TOKEN,
+                    &sessions
+                ),
+                Err(StatusCode::UNAUTHORIZED),
+                "GET {path}?token=<durable> must stay 401"
+            );
+            assert_eq!(
+                authorize(
+                    path,
+                    &Method::GET,
+                    None,
+                    Some("bogus-token"),
+                    TEST_API_TOKEN,
+                    &sessions
+                ),
+                Err(StatusCode::UNAUTHORIZED),
+                "GET {path}?token=<bogus> must stay 401"
+            );
+            assert_eq!(
+                authorize(
+                    path,
+                    &Method::GET,
+                    Some("bogus-bearer"),
+                    None,
+                    TEST_API_TOKEN,
+                    &sessions
+                ),
+                Err(StatusCode::UNAUTHORIZED),
+                "GET {path} with invalid bearer must stay 401"
+            );
+            assert_eq!(
+                authorize(path, &Method::POST, None, None, TEST_API_TOKEN, &sessions),
+                Err(StatusCode::UNAUTHORIZED),
+                "POST {path} without credential must stay 401"
+            );
+        }
     }
 
     // ========================================================================
@@ -2758,5 +2861,104 @@ mod tests {
         assert!(!requires_durable_owner(&Method::GET, "/gui/"));
         assert!(!requires_durable_owner(&Method::POST, "/gui"));
         assert!(!requires_durable_owner(&Method::GET, "/gui/show"));
+    }
+
+    #[tokio::test]
+    async fn gui_shell_middleware_serves_bare_get_and_rejects_malformed_auth_header() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(crate::identity::AgentKeypair::generate().expect("key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .build()
+                .await
+                .expect("agent"),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            agent,
+        )
+        .await
+        .expect("state");
+        let app = axum::Router::new()
+            .route("/gui", get(super::super::ws::serve_gui))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware,
+            ));
+
+        let bare = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/gui")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(bare.status(), StatusCode::OK);
+        assert_eq!(
+            bare.headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+        assert_eq!(
+            bare.headers()
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok()),
+            Some("frame-ancestors 'none'")
+        );
+
+        let non_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/gui")
+                    .header(axum::http::header::AUTHORIZATION, "Basic invalid")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(non_bearer.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/gui")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(wrong_bearer.status(), StatusCode::UNAUTHORIZED);
+
+        let durable_query = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/gui?token={}", state.api_token))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(durable_query.status(), StatusCode::UNAUTHORIZED);
+
+        let session = state.sessions.issue();
+        let valid_session = app
+            .oneshot(
+                axum::http::Request::get(format!("/gui?token={session}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(valid_session.status(), StatusCode::OK);
     }
 }
