@@ -608,4 +608,22 @@ fn gui_spaces_community_hardening_invariants() {
         html.contains("data-nag-roster-search") && html.contains("data-nag-roster-filter"),
         "Manage roster must provide search and role/state filtering for large communities"
     );
+    // Review hardening: reaction emoji XSS escape, escJs double-quote safety,
+    // scoped roster listener binding, and fail-closed isEncryptedSpace.
+    assert!(
+        html.contains("esc(emoji)"),
+        "Reaction emoji must be HTML-escaped before insertion into innerHTML"
+    );
+    assert!(
+        html.contains("isSafeReactionEmoji(") && html.contains("isSafeRemoteId("),
+        "Remote reaction emoji and message IDs must be validated before storage/rendering"
+    );
+    assert!(
+        html.contains(r#".replace(/"/g,'\\u0022')"#),
+        "escJs must encode double quotes as \\u0022 to prevent HTML attribute breakout"
+    );
+    assert!(
+        html.contains("function nagBindRosterHandlers(panel,gid)"),
+        "Roster re-renders must bind only the replaced roster panel, never host-wide admin buttons"
+    );
 }

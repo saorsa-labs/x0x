@@ -209,16 +209,6 @@ fn validate_projection_entries(roster: &BaseRosterProjection) -> bool {
     })
 }
 
-fn has_matching_waiter(state: &Arc<AppState>, key: &str, sender: &AgentId) -> bool {
-    let slots = state
-        .base_roster_fetch_slots
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    slots
-        .get(key)
-        .is_some_and(|waiters| waiters.iter().any(|w| w.inviter == *sender))
-}
-
 /// Joiner side: admit one `BaseRoster` reply from `sender`. The payload is
 /// admitted only when a join is WAITING on this key with `sender` as its
 /// expected inviter, and only when it re-derives `roster_root` over its
@@ -308,15 +298,25 @@ pub(in crate::server) fn deliver_base_roster_chunk(
         return;
     }
     let key = slot_key(group_id, roster_root);
-    if !has_matching_waiter(state, &key, sender) {
-        tracing::debug!(
-            group_id = %LogHexId::group(group_id),
-            "dropped base-roster chunk no waiting join asked this sender for"
-        );
-        return;
-    }
     let sanitized_chunk = sanitize_fetched(entries);
+    // Lock order matches `WaiterGuard::drop`: `base_roster_fetch_slots` then
+    // `base_roster_chunk_buffers`, preventing an orphaned assembly when a
+    // waiter drops concurrently with chunk arrival.
     let completed = {
+        let slots = state
+            .base_roster_fetch_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let waiting = slots
+            .get(&key)
+            .is_some_and(|list| list.iter().any(|w| &w.inviter == sender));
+        if !waiting {
+            tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                "dropped base-roster chunk no waiting join asked this sender for"
+            );
+            return;
+        }
         let mut buffers = state
             .base_roster_chunk_buffers
             .lock()
@@ -482,6 +482,16 @@ pub(in crate::server) async fn obtain_base_roster(
             .base_roster_fetch_slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_for_inviter = !slots
+            .get(&key)
+            .is_some_and(|list| list.iter().any(|w| w.inviter == inviter));
+        if first_for_inviter {
+            let mut buffers = state
+                .base_roster_chunk_buffers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            buffers.remove(&(key.clone(), inviter));
+        }
         slots
             .entry(key.clone())
             .or_default()

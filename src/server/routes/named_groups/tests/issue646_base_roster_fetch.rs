@@ -1846,3 +1846,146 @@ async fn public_messages_pagination_respects_limit_and_before() -> Result<()> {
     assert_eq!(m2[1]["body"], json!("msg-3"));
     Ok(())
 }
+
+/// Tag validation rejects control characters, whitespace, and non-slug symbols.
+#[tokio::test]
+async fn create_group_rejects_invalid_tag_characters() -> Result<()> {
+    let (state, _dir) = daemon_state().await?;
+    for bad_tag in ["rust\nlang", "evil\0tag", "bad tag", "a/b"] {
+        let resp = create_named_group(
+            State(Arc::clone(&state)),
+            Json(CreateGroupRequest {
+                name: "BadTagSpace".to_string(),
+                description: String::new(),
+                display_name: None,
+                preset: Some("public_open".to_string()),
+                policy: None,
+                tags: vec![bad_tag.to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "tag {bad_tag:?} must be rejected"
+        );
+    }
+    Ok(())
+}
+
+/// Conflicting `total_chunks` drops the assembly, and duplicate chunks are
+/// idempotent once a clean retry completes.
+#[tokio::test]
+async fn chunked_base_roster_rejects_conflicting_total_chunks_and_tolerates_duplicates(
+) -> Result<()> {
+    let (joiner, _jdir) = daemon_state().await?;
+    let inviter_id = AgentId([31u8; 32]);
+    let group_id = format!("d201{}", "00".repeat(30));
+
+    let mut full = BTreeMap::new();
+    for i in 0..200u16 {
+        let mut bytes = [0u8; 32];
+        bytes[0..2].copy_from_slice(&i.to_be_bytes());
+        bytes[2] = 0x55;
+        let hex_id = hex::encode(bytes);
+        full.insert(
+            hex_id,
+            x0x::groups::state_commit::RosterMemberSnapshot {
+                role: if i == 0 {
+                    x0x::groups::GroupRole::Owner
+                } else {
+                    x0x::groups::GroupRole::Member
+                },
+                state: x0x::groups::GroupMemberState::Active,
+                certificate_digest: None,
+                certificate: None,
+                treekem_key_package_hash: None,
+            },
+        );
+    }
+    let root = x0x::groups::state_commit::roster_root_of_projection(&full);
+    let key = format!("{group_id}|{root}");
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    {
+        let mut slots = joiner.base_roster_fetch_slots.lock().expect("slots lock");
+        slots
+            .entry(key.clone())
+            .or_default()
+            .push(base_roster_fetch::BaseRosterWaiter::for_test(
+                inviter_id, tx,
+            ));
+    }
+
+    let entries_vec: Vec<_> = full.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let chunk0: BTreeMap<_, _> = entries_vec[..128].iter().cloned().collect();
+    let chunk1: BTreeMap<_, _> = entries_vec[128..].iter().cloned().collect();
+
+    // Deliver chunk 0 claiming total=2, then conflicting total=3 (resets assembly).
+    base_roster_fetch::deliver_base_roster_chunk(
+        &joiner,
+        &inviter_id,
+        &group_id,
+        &root,
+        0,
+        2,
+        &chunk0,
+    );
+    base_roster_fetch::deliver_base_roster_chunk(
+        &joiner,
+        &inviter_id,
+        &group_id,
+        &root,
+        1,
+        3,
+        &chunk1,
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "conflicting total_chunks must reset assembly and not wake waiter"
+    );
+
+    // Clean retry with duplicate chunk 0 followed by chunk 1 succeeds.
+    base_roster_fetch::deliver_base_roster_chunk(
+        &joiner,
+        &inviter_id,
+        &group_id,
+        &root,
+        0,
+        2,
+        &chunk0,
+    );
+    base_roster_fetch::deliver_base_roster_chunk(
+        &joiner,
+        &inviter_id,
+        &group_id,
+        &root,
+        0,
+        2,
+        &chunk0,
+    );
+    base_roster_fetch::deliver_base_roster_chunk(
+        &joiner,
+        &inviter_id,
+        &group_id,
+        &root,
+        1,
+        2,
+        &chunk1,
+    );
+    let reply = rx.try_recv().expect("reassembled chunked reply");
+    match reply {
+        base_roster_fetch::BaseRosterFetchReply::Served(assembled) => {
+            assert_eq!(assembled.len(), 200);
+            assert_eq!(
+                x0x::groups::state_commit::roster_root_of_projection(&assembled),
+                root
+            );
+        }
+        base_roster_fetch::BaseRosterFetchReply::Unavailable => {
+            panic!("expected Served after clean retry")
+        }
+    }
+    Ok(())
+}

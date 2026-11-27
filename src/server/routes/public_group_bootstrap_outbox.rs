@@ -1565,21 +1565,27 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         return Ok(DmTypedPayloadCompletion::Duplicate);
     }
 
+    let stable_group_id = group.stable_group_id().to_string();
+    let mut replaced_old_key: Option<String> = None;
     let outcome = persist_named_groups_mutation(state, |groups| {
         if let Some((existing_key, existing)) =
             crate::server::resolve_group_entry_locked(groups, &group_id)
                 .map(|(k, info)| (k.to_string(), info))
         {
+            // Only replace a true card-import stub with no membership entry
+            // for this agent (never overwrite Removed/Left/Banned/Active rows).
             let replaceable_open_join_stub = open_join_consent
                 && !existing.withdrawn
-                && !existing.has_active_member(&local_agent_hex)
-                && !existing.is_banned(&local_agent_hex)
+                && !existing.members_v2.contains_key(&local_agent_hex)
                 && existing.invite_lineage.is_none()
                 && existing.policy.admission == x0x::groups::GroupAdmission::OpenJoin
                 && existing.policy.confidentiality
                     == x0x::groups::GroupConfidentiality::SignedPublic;
             if !replaceable_open_join_stub {
                 return false;
+            }
+            if existing_key != group_id {
+                replaced_old_key = Some(existing_key.clone());
             }
             groups.remove(&existing_key);
         } else if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS {
@@ -1595,7 +1601,22 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     // it withholds the ACK and the sender retries.
     if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
         if open_join_consent {
-            crate::server::routes::named_groups::clear_pending_open_join(state, &group_id, sender);
+            crate::server::routes::named_groups::clear_pending_open_join(
+                state,
+                &stable_group_id,
+                sender,
+            );
+            if stable_group_id != group_id {
+                crate::server::routes::named_groups::clear_pending_open_join(
+                    state, &group_id, sender,
+                );
+            }
+        }
+        if let Some(old_key) = replaced_old_key {
+            crate::server::routes::named_groups::stop_named_group_metadata_listener(
+                state, &old_key,
+            )
+            .await;
         }
         ensure_named_group_listeners(Arc::clone(state), &group_id).await;
         tracing::info!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "installed signed-public group bootstrap");

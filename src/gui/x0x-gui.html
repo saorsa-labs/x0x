@@ -1220,9 +1220,10 @@ function storeKeyCard(label,hint,onClick,labelFont){
   card.addEventListener('click',onClick);
   return card;
 }
-// JS-string escaper for use inside onclick='...' inline handlers.
-// Escapes quotes, backslashes, and control chars so the value is safe inside a JS string literal.
-function escJs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/</g,'\\x3c').replace(/>/g,'\\x3e')}
+// JS-string escaper safe inside both single/double-quoted JS literals AND
+// double-quoted HTML event attributes (encodes quotes/angle brackets as \uXXXX
+// so the HTML parser can never terminate an attribute on a raw `"`).
+function escJs(s){return String(s??'').replace(/\\/g,'\\\\').replace(/'/g,'\\u0027').replace(/"/g,'\\u0022').replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/&/g,'\\u0026').replace(/\r/g,'\\r').replace(/\n/g,'\\n')}
 // Unicode-safe base64 encode/decode for KvStore values (wiki, web, etc.)
 function u8encode(s){return btoa(unescape(encodeURIComponent(s)))}
 function u8decode(s){return decodeURIComponent(escape(atob(s)))}
@@ -1463,22 +1464,36 @@ async function loadSpaceChannels(spaceId){
     }
     if(!Array.isArray(channels))channels=[];
   }
-  // Merge any per-channel keys (`ch/*`) so concurrent creators do not clobber each other.
+  // Merge any per-channel keys (`ch/*`) in parallel so concurrent creators do not clobber each other.
   const kr=await api('/stores/'+encSeg(st.id)+'/keys').catch(()=>null);
+  if(!spacePageStoreCurrent(spaceId,st)){
+    channelErrors[spaceId]=SPACE_POLICY_MOVED_AFTER_READ;
+    channelCache[spaceId]=defaultChannels(spaceId);
+    return channelCache[spaceId];
+  }
   if(kr&&kr._http_ok&&Array.isArray(kr.keys)){
     const have=new Set(channels.map(c=>c&&c.name).filter(Boolean));
     const chKeys=kr.keys.map(k=>typeof k==='string'?k:(k&&k.key)||'').filter(k=>k.startsWith('ch/'));
-    for(const ck of chKeys){
+    const fetched=await Promise.all(chKeys.map(async ck=>{
       const cname=ck.slice(3);
-      if(!cname||have.has(cname))continue;
+      if(!cname||have.has(cname)||!/^[a-z0-9-]+$/.test(cname))return null;
       const cr=await api('/stores/'+encSeg(st.id)+'/'+encSeg(ck)).catch(()=>null);
       if(cr&&cr._http_ok&&cr.value){
         try{
           const parsed=JSON.parse(u8decode(cr.value));
-          if(parsed&&parsed.name&&!have.has(parsed.name)){channels.push(parsed);have.add(parsed.name)}
+          if(parsed&&typeof parsed.name==='string'&&/^[a-z0-9-]+$/.test(parsed.name))return parsed;
         }catch(e){}
       }
+      return null;
+    }));
+    if(!spacePageStoreCurrent(spaceId,st)){
+      channelErrors[spaceId]=SPACE_POLICY_MOVED_AFTER_READ;
+      channelCache[spaceId]=defaultChannels(spaceId);
+      return channelCache[spaceId];
     }
+    fetched.forEach(parsed=>{
+      if(parsed&&!have.has(parsed.name)){channels.push(parsed);have.add(parsed.name)}
+    });
   }
   delete channelErrors[spaceId];
   channelCache[spaceId]=channels.length?channels:defaultChannels(spaceId);
@@ -1510,20 +1525,12 @@ function openThread(spaceId,msg){
 async function loadSignedPublicThreadReplies(spaceId,threadRoot){
   const r=await api('/groups/'+encSeg(spaceId)+'/messages?thread_root='+encodeURIComponent(threadRoot)+'&limit=100');
   if(!r||!r.ok||!Array.isArray(r.messages))return;
-  const myAid=S.get('agentId')||'';
   for(const m of r.messages){
-    const id=m.msg_id||((m.author_agent_id||'')+':'+(m.timestamp||0)+':'+((m.signature||'').slice(0,12)));
-    addThreadReply(threadRoot,{
-      id,
-      text:m.body||'',
-      sender_name:resolveSpaceSenderName(spaceId,m.author_agent_id),
-      sender_id:m.author_agent_id||'',
-      timestamp:m.timestamp||Date.now(),
-      thread_root:threadRoot,
-      channel:'general',
-      signed_public:true,
-      own:m.author_agent_id===myAid,
-    });
+    const {dedupKey,msg}=normalizeSignedPublicMsg(spaceId,m);
+    if(signedPublicSeen.has(dedupKey))continue;
+    signedPublicSeen.add(dedupKey);
+    if(msg.id===threadRoot&&!msg.thread_root)continue;
+    addThreadReply(threadRoot,{...msg,thread_root:threadRoot});
   }
 }
 
@@ -1566,7 +1573,16 @@ function toggleReaction(chatKey,msgId,emoji){
   renderReactionsOnMsg(chatKey,msgId);
 }
 
+function isSafeReactionEmoji(emoji){
+  return typeof emoji==='string'&&emoji.length>0&&emoji.length<=16&&!/[<>&"'\x00-\x1f]/.test(emoji);
+}
+
+function isSafeRemoteId(id){
+  return typeof id==='string'&&id.length>0&&id.length<=128&&/^[a-zA-Z0-9_.:-]+$/.test(id);
+}
+
 function applyRemoteReaction(chatKey,msgId,emoji,senderId,action){
+  if(!isSafeReactionEmoji(emoji)||!isSafeRemoteId(msgId))return;
   if(!reactionStore[chatKey])reactionStore[chatKey]={};
   if(!reactionStore[chatKey][msgId])reactionStore[chatKey][msgId]={};
   const r=reactionStore[chatKey][msgId];
@@ -1584,9 +1600,9 @@ function renderReactionsOnMsg(chatKey,msgId){
   if(!el)return;
   const r=getReactions(chatKey,msgId);
   const me=S.get('agentId');
-  el.innerHTML=Object.entries(r).map(([emoji,users])=>
+  el.innerHTML=Object.entries(r).filter(([emoji])=>isSafeReactionEmoji(emoji)).map(([emoji,users])=>
     '<button class="rxn'+(users.includes(me)?' mine':'')+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(emoji)+'\')">'
-    +emoji+'<span class="cnt">'+users.length+'</span></button>'
+    +esc(emoji)+'<span class="cnt">'+users.length+'</span></button>'
   ).join('');
 }
 
@@ -1701,12 +1717,16 @@ function startEditMsg(chatKey,msgId){
   document.getElementById('edit-'+msgId).focus();
 }
 
-function confirmEdit(chatKey,msgId){
+async function confirmEdit(chatKey,msgId){
   if(S.get('view')==='space'&&currentSpaceConfidentiality==='signed_public')return;
   const inp=document.getElementById('edit-'+msgId);
   if(!inp)return;
   const newText=inp.value.trim();
   if(!newText)return;
+  if(currentChannelTopic){
+    const ok=await publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'edit',msg_id:msgId,text:newText,sender_id:S.get('agentId'),timestamp:Date.now()});
+    if(!ok)return;
+  }
   const msgs=chatHistory[chatKey]||[];
   const msg=msgs.find(m=>m.id===msgId);
   if(msg)msg.text=newText;
@@ -1714,9 +1734,6 @@ function confirmEdit(chatKey,msgId){
   editedMsgs[chatKey][msgId]={text:newText,timestamp:Date.now()};
   saveEditsDeletes(chatKey);
   LS.set('chat_'+chatKey,(chatHistory[chatKey]||[]).slice(-200));
-  if(currentChannelTopic){
-    publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'edit',msg_id:msgId,text:newText,sender_id:S.get('agentId'),timestamp:Date.now()});
-  }
   const body=document.querySelector('#msg-'+msgId+' .body');
   if(body)body.innerHTML=renderMd(newText)+'<span class="edited-tag">(edited)</span>';
 }
@@ -1731,14 +1748,15 @@ function cancelEdit(chatKey,msgId){
   }
 }
 
-function deleteMsg(chatKey,msgId){
+async function deleteMsg(chatKey,msgId){
   if(S.get('view')==='space'&&currentSpaceConfidentiality==='signed_public')return;
+  if(currentChannelTopic){
+    const ok=await publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'delete',msg_id:msgId,sender_id:S.get('agentId'),timestamp:Date.now()});
+    if(!ok)return;
+  }
   if(!deletedMsgs[chatKey])deletedMsgs[chatKey]=new Set();
   deletedMsgs[chatKey].add(msgId);
   saveEditsDeletes(chatKey);
-  if(currentChannelTopic){
-    publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'delete',msg_id:msgId,sender_id:S.get('agentId'),timestamp:Date.now()});
-  }
   const msgEl=document.getElementById('msg-'+msgId);
   if(msgEl){
     msgEl.classList.add('deleted');
@@ -2539,23 +2557,25 @@ function isSignedPublicSpace(gOrSid){
 }
 
 function isEncryptedSpace(gOrSid){
-  const sid=typeof gOrSid==='string'?gOrSid:(gOrSid&&gOrSid.group_id);
-  if(sid&&sid===S.get('spaceId')&&currentSpaceConfidentiality)return currentSpaceConfidentiality==='mls_encrypted';
-  const g=typeof gOrSid==='object'&&gOrSid?gOrSid:(S.get('groups')||[]).find(x=>x.group_id===sid);
-  if(g&&g.policy&&g.policy.confidentiality)return g.policy.confidentiality==='mls_encrypted';
-  if(g&&g.policy_summary&&g.policy_summary.confidentiality)return g.policy_summary.confidentiality==='mls_encrypted';
+  // Fail-closed: anything not positively identified as signed_public is
+  // treated as encrypted so unknown future confidentiality modes never degrade to plaintext.
   return !isSignedPublicSpace(gOrSid);
 }
 
-function resolveSpaceSenderName(sid,agentId){
-  if(!agentId)return 'peer';
+function resolveKnownSenderName(sid,agentId){
+  if(!agentId)return '';
   const bySpace=currentSpaceMembers[sid];
   if(bySpace&&bySpace[agentId])return bySpace[agentId];
   const contact=(S.get('contacts')||[]).find(c=>c.agent_id===agentId);
   if(contact&&contact.label)return contact.label;
   const disc=(S.get('discovered')||[]).find(d=>d.agent_id===agentId);
   if(disc&&disc.display_name)return disc.display_name;
-  return short(agentId);
+  return '';
+}
+
+function resolveSpaceSenderName(sid,agentId){
+  if(!agentId)return 'peer';
+  return resolveKnownSenderName(sid,agentId)||short(agentId);
 }
 
 async function publishSpaceGossip(sid,topic,payload){
@@ -2763,6 +2783,7 @@ async function openJoinFromSpace(sid){
 }
 
 function updateLoadOlderBar(sid){
+  if(S.get('view')!=='space'||S.get('spaceId')!==sid)return;
   const bar=document.getElementById('chat-load-older');
   if(!bar)return;
   const pg=signedPublicPagination[sid];
@@ -2811,7 +2832,7 @@ async function sendSpaceChat(){
 }
 
 async function sendSpaceChatSignedPublic(sid,text,inp){
-  const r=await api('/groups/'+sid+'/send',{
+  const r=await api('/groups/'+encSeg(sid)+'/send',{
     method:'POST',
     body:JSON.stringify({body:text,kind:'chat'})
   });
@@ -2833,11 +2854,12 @@ const signedPublicSeen=new Set();
 
 function normalizeSignedPublicMsg(sid,m){
   const myAid=S.get('agentId')||'';
-  const dedupKey=m.msg_id||((m.author_agent_id||'')+':'+(m.timestamp||0)+':'+((m.signature||'').slice(0,12)));
+  const sigKey=(m.author_agent_id||'')+':'+(m.timestamp||0)+':'+((m.signature||'').slice(0,12));
+  const id=m.msg_id||sigKey;
   return {
-    dedupKey,
+    dedupKey:sigKey,
     msg:{
-      id:dedupKey,
+      id,
       text:m.body||'',
       sender_name:resolveSpaceSenderName(sid,m.author_agent_id),
       sender_id:m.author_agent_id||'',
@@ -2853,11 +2875,18 @@ function normalizeSignedPublicMsg(sid,m){
 async function signedPublicPoll(sid,force){
   if(!sid)return;
   if(currentSpaceConfidentiality!=='signed_public')return;
-  const r=await api('/groups/'+sid+'/messages?limit=100');
+  const r=await api('/groups/'+encSeg(sid)+'/messages?limit=100');
   if(!r||!r.ok||!Array.isArray(r.messages))return;
   const chatKey=sid+'_general';
-  if(force||!signedPublicPagination[sid]){
+  const prevPg=signedPublicPagination[sid];
+  if(!prevPg){
     signedPublicPagination[sid]={hasMore:!!r.has_more,nextBefore:r.next_before||null,loading:false};
+  }else{
+    // Preserve an already-walked older cursor; only extend earlier or reflect hasMore when still at page 1.
+    if(r.next_before&&(prevPg.nextBefore===null||r.next_before<prevPg.nextBefore)){
+      prevPg.nextBefore=r.next_before;
+    }
+    if(r.has_more)prevPg.hasMore=true;
   }
   let appended=false;
   for(const m of r.messages){
@@ -2885,7 +2914,7 @@ async function loadOlderSignedPublicMessages(sid){
   pg.loading=true;
   updateLoadOlderBar(sid);
   try{
-    const r=await api('/groups/'+sid+'/messages?limit=100&before='+encodeURIComponent(pg.nextBefore));
+    const r=await api('/groups/'+encSeg(sid)+'/messages?limit=100&before='+encodeURIComponent(pg.nextBefore));
     if(!r||!r.ok||!Array.isArray(r.messages)){
       toast('Could not load older messages: '+apiError(r),'error');
       return;
@@ -2907,6 +2936,7 @@ async function loadOlderSignedPublicMessages(sid){
         older.push(msg);
       }
     }
+    older.sort((a,b)=>(a.timestamp||0)-(b.timestamp||0));
     if(older.length){
       chatHistory[chatKey]=older.concat(chatHistory[chatKey]);
       if(chatHistory[chatKey].length>1000)chatHistory[chatKey]=chatHistory[chatKey].slice(-1000);
@@ -2914,9 +2944,10 @@ async function loadOlderSignedPublicMessages(sid){
       const msgsEl=document.getElementById('chat-msgs');
       if(msgsEl&&S.get('view')==='space'&&S.get('spaceId')===sid&&S.get('spaceApp')==='chat'){
         const prevHeight=msgsEl.scrollHeight;
+        const prevScrollTop=msgsEl.scrollTop;
         msgsEl.innerHTML='';
         chatHistory[chatKey].forEach(m=>appendChatMsg(msgsEl,m,sid));
-        msgsEl.scrollTop=Math.max(0,msgsEl.scrollHeight-prevHeight);
+        msgsEl.scrollTop=Math.max(0,prevScrollTop+(msgsEl.scrollHeight-prevHeight));
       }
     }
   }finally{
@@ -3006,8 +3037,8 @@ function appendChatMsg(container,m,spaceId){
       +'</div>'):'';
   const rxns=isSignedPub?{}:getReactions(chatKey,msgId);
   const me=S.get('agentId');
-  const rxnHtml=(msgId&&!isSignedPub)?'<div class="msg-reactions" id="rxn-'+esc(msgId)+'">'+Object.entries(rxns).map(([emoji,users])=>
-    '<button class="rxn'+(users.includes(me)?' mine':'')+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(emoji)+'\')">'+emoji+'<span class="cnt">'+users.length+'</span></button>'
+  const rxnHtml=(msgId&&!isSignedPub)?'<div class="msg-reactions" id="rxn-'+esc(msgId)+'">'+Object.entries(rxns).filter(([emoji])=>isSafeReactionEmoji(emoji)).map(([emoji,users])=>
+    '<button class="rxn'+(users.includes(me)?' mine':'')+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(emoji)+'\')">'+esc(emoji)+'<span class="cnt">'+users.length+'</span></button>'
   ).join('')+'</div>':'';
 
   d.innerHTML=`${actionsHtml}${quoteHtml}<div class="meta">
@@ -3365,7 +3396,7 @@ function renderFileRecipientOptions(){
   const myAid=S.get('agentId')||'';
   const contacts=fileRecipients();
   const seen=new Set();
-  const members=spaceFileMembers.filter(m=>m&&m.agent_id&&m.agent_id!==myAid&&m.state!=='banned');
+  const members=spaceFileMembers.filter(m=>m&&m.agent_id&&m.agent_id!==myAid&&m.state==='active');
   let html='<option value="">Select a recipient…</option>';
   if(members.length){
     html+='<optgroup label="Space members">';
@@ -3932,7 +3963,7 @@ async function deleteWikiPage(sid){
   if(!r||!r._http_ok){wikiError('Not deleted. '+apiError(r));return}
   if(!spacePageStoreCurrent(sid,st)){wikiError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   if(currentWikiSlug===slug){document.getElementById('wiki-editor').style.display='none';currentWikiSlug=''}
-  toast('Page deleted on this device','success');
+  toast('Page deleted','success');
   loadWikiPages(sid);
 }
 
@@ -4204,7 +4235,7 @@ async function deleteWebPage(sid){
   if(!r||!r._http_ok){webError('Not deleted. '+apiError(r));return}
   if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   if(currentWebPath===path){document.getElementById('web-editor').style.display='none';currentWebPath=''}
-  toast('Page deleted on this device','success');
+  toast('Page deleted','success');
   loadWebPages(sid);
 }
 
@@ -5948,7 +5979,7 @@ async function sendThreadReply(){
   const chan=isSignedPub?'general':(S.get('channel')||'general');
   if(!threadId||!spaceId)return;
   if(isSignedPub){
-    const r=await api('/groups/'+spaceId+'/send',{
+    const r=await api('/groups/'+encSeg(spaceId)+'/send',{
       method:'POST',
       body:JSON.stringify({body:t,kind:'chat',thread_root:threadId})
     });
@@ -6300,11 +6331,16 @@ function nagRenderDiscoverList(){
   });
 }
 
+function isSafeGroupId(gid){
+  return typeof gid==='string'&&/^[0-9a-fA-F]{16,128}$/.test(gid);
+}
+
 function nagDiscoverCardHtml(card){
   const policy=card.policy_summary||{};
-  const canRequest=card.request_access_enabled && policy.admission==='request_access' && !card.withdrawn;
-  const canOpenJoin=policy.admission==='open_join' && policy.confidentiality==='signed_public' && !card.withdrawn;
-  const canBrowse=policy.read_access==='public' && !card.withdrawn;
+  const validId=isSafeGroupId(card.group_id);
+  const canRequest=validId && card.request_access_enabled && policy.admission==='request_access' && !card.withdrawn;
+  const canOpenJoin=validId && policy.admission==='open_join' && policy.confidentiality==='signed_public' && !card.withdrawn;
+  const canBrowse=validId && policy.read_access==='public' && !card.withdrawn;
   const status=nagDiscover.reqStatus[card.group_id]||{kind:'idle'};
   const jstatus=nagDiscover.joinStatus[card.group_id]||{kind:'idle'};
   const badges=[
@@ -6350,6 +6386,7 @@ function nagDiscoverCardHtml(card){
 }
 
 async function nagOpenJoin(gid){
+  if(!isSafeGroupId(gid))return;
   const existing=nagDiscover.joinStatus[gid];
   if(existing&&(existing.kind==='pending'||existing.kind==='submitted'))return;
   nagDiscover.joinStatus[gid]={kind:'pending'};
@@ -6358,7 +6395,7 @@ async function nagOpenJoin(gid){
     const dn=LS.get('display_name','').trim();
     const body={};
     if(dn)body.display_name=dn;
-    const r=await api('/groups/'+gid+'/open-join',{method:'POST',body:JSON.stringify(body)});
+    const r=await api('/groups/'+encSeg(gid)+'/open-join',{method:'POST',body:JSON.stringify(body)});
     if(r&&r.ok){
       nagDiscover.joinStatus[gid]={kind:'submitted'};
       toast('Open-join requested — opening space once confirmed','success');
@@ -6373,6 +6410,7 @@ async function nagOpenJoin(gid){
 }
 
 async function nagBrowsePublicGroup(gid){
+  if(!isSafeGroupId(gid))return;
   const card=nagDiscover.cards.find(c=>c.group_id===gid);
   if(card){
     const cardPayload=JSON.stringify(card);
@@ -6387,12 +6425,13 @@ async function nagBrowsePublicGroup(gid){
 }
 
 async function nagRequestAccess(gid){
+  if(!isSafeGroupId(gid))return;
   const existing=nagDiscover.reqStatus[gid];
   if(existing && (existing.kind==='pending'||existing.kind==='submitted'))return;
   nagDiscover.reqStatus[gid]={kind:'pending'};
   nagRenderDiscoverList();
   try{
-    const r=await api('/groups/'+gid+'/requests',{method:'POST',body:JSON.stringify({})});
+    const r=await api('/groups/'+encSeg(gid)+'/requests',{method:'POST',body:JSON.stringify({})});
     if(r && r.ok){nagDiscover.reqStatus[gid]={kind:'submitted'}}
     else{nagDiscover.reqStatus[gid]={kind:'failed',msg:(r&&r.error)||'unknown'}}
   }catch(e){nagDiscover.reqStatus[gid]={kind:'failed',msg:e.message||'network error'}}
@@ -6616,16 +6655,48 @@ async function nagEnterDurableToken(gid){
   nagRenderAdmin(gid);
 }
 
+function nagBindRosterHandlers(panel,gid){
+  if(!panel)return;
+  panel.querySelectorAll('[data-nag-role-agent][data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role-agent'),btn.getAttribute('data-nag-role'))));
+  panel.querySelectorAll('[data-nag-remove]').forEach(btn=>btn.addEventListener('click',()=>nagRemoveMember(gid,btn.getAttribute('data-nag-remove'))));
+  panel.querySelectorAll('[data-nag-ban]').forEach(btn=>btn.addEventListener('click',()=>nagBan(gid,btn.getAttribute('data-nag-ban'))));
+  panel.querySelectorAll('[data-nag-unban]').forEach(btn=>btn.addEventListener('click',()=>nagUnban(gid,btn.getAttribute('data-nag-unban'))));
+  const addBtn=panel.querySelector('[data-nag-member-add]');
+  if(addBtn)addBtn.addEventListener('click',()=>nagAddMember(gid));
+  const searchEl=panel.querySelector('[data-nag-roster-search]');
+  if(searchEl)searchEl.addEventListener('input',e=>{
+    if(nagRosterState[gid]){
+      nagRosterState[gid].query=e.target.value;
+      nagRosterState[gid].limit=50;
+      const newPanel=nagRerenderRosterOnly(gid);
+      const s=newPanel&&newPanel.querySelector('[data-nag-roster-search]');
+      if(s){s.focus();s.setSelectionRange(s.value.length,s.value.length)}
+    }
+  });
+  const filterEl=panel.querySelector('[data-nag-roster-filter]');
+  if(filterEl)filterEl.addEventListener('change',e=>{
+    if(nagRosterState[gid]){nagRosterState[gid].filter=e.target.value;nagRosterState[gid].limit=50;nagRerenderRosterOnly(gid)}
+  });
+  const moreBtn=panel.querySelector('[data-nag-roster-more]');
+  if(moreBtn)moreBtn.addEventListener('click',()=>{
+    if(nagRosterState[gid]){nagRosterState[gid].limit=(nagRosterState[gid].limit||50)+50;nagRerenderRosterOnly(gid)}
+  });
+}
+
 function nagRerenderRosterOnly(gid){
   const host=document.getElementById('nag-admin-'+gid);
   const rs=nagRosterState[gid];
-  if(!host||!rs)return;
+  if(!host||!rs)return null;
   const oldPanel=host.querySelector(`[data-nag-roster="${gid}"]`);
-  if(!oldPanel)return;
+  if(!oldPanel)return null;
   const tmp=document.createElement('div');
   tmp.innerHTML=nagRosterPanelHtml(gid,rs.members,rs.myAid,rs.canManage);
-  oldPanel.replaceWith(tmp.firstElementChild);
-  nagBindAdminHandlers(gid);
+  const newPanel=tmp.firstElementChild;
+  oldPanel.replaceWith(newPanel);
+  // Bind ONLY the newly inserted roster panel so host-wide policy/withdraw/request
+  // buttons never accumulate duplicate listeners on each filter keystroke.
+  nagBindRosterHandlers(newPanel,gid);
+  return newPanel;
 }
 
 function nagBindAdminHandlers(gid){
@@ -6637,24 +6708,7 @@ function nagBindAdminHandlers(gid){
   if(seal)seal.addEventListener('click',()=>nagSealState(gid));
   const withdraw=host.querySelector('[data-nag-state-withdraw]');
   if(withdraw)withdraw.addEventListener('click',()=>nagWithdrawState(gid));
-  host.querySelectorAll('[data-nag-role-agent][data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role-agent'),btn.getAttribute('data-nag-role'))));
-  host.querySelectorAll('[data-nag-remove]').forEach(btn=>btn.addEventListener('click',()=>nagRemoveMember(gid,btn.getAttribute('data-nag-remove'))));
-  host.querySelectorAll('[data-nag-ban]').forEach(btn=>btn.addEventListener('click',()=>nagBan(gid,btn.getAttribute('data-nag-ban'))));
-  host.querySelectorAll('[data-nag-unban]').forEach(btn=>btn.addEventListener('click',()=>nagUnban(gid,btn.getAttribute('data-nag-unban'))));
-  const addBtn=host.querySelector('[data-nag-member-add]');
-  if(addBtn)addBtn.addEventListener('click',()=>nagAddMember(gid));
-  const searchEl=host.querySelector('[data-nag-roster-search]');
-  if(searchEl)searchEl.addEventListener('input',e=>{
-    if(nagRosterState[gid]){nagRosterState[gid].query=e.target.value;nagRosterState[gid].limit=50;nagRerenderRosterOnly(gid);const s=host.querySelector('[data-nag-roster-search]');if(s){s.focus();s.setSelectionRange(s.value.length,s.value.length)}}
-  });
-  const filterEl=host.querySelector('[data-nag-roster-filter]');
-  if(filterEl)filterEl.addEventListener('change',e=>{
-    if(nagRosterState[gid]){nagRosterState[gid].filter=e.target.value;nagRosterState[gid].limit=50;nagRerenderRosterOnly(gid)}
-  });
-  const moreBtn=host.querySelector('[data-nag-roster-more]');
-  if(moreBtn)moreBtn.addEventListener('click',()=>{
-    if(nagRosterState[gid]){nagRosterState[gid].limit=(nagRosterState[gid].limit||50)+50;nagRerenderRosterOnly(gid)}
-  });
+  nagBindRosterHandlers(host.querySelector(`[data-nag-roster="${gid}"]`),gid);
   host.querySelectorAll('[data-nag-req-token]').forEach(btn=>btn.addEventListener('click',()=>nagEnterDurableToken(gid)));
   host.querySelectorAll('[data-nag-req-approve]').forEach(btn=>btn.addEventListener('click',()=>nagApproveRequest(gid,btn.getAttribute('data-nag-req-approve'))));
   host.querySelectorAll('[data-nag-req-reject]').forEach(btn=>btn.addEventListener('click',()=>nagRejectRequest(gid,btn.getAttribute('data-nag-req-reject'))));
@@ -6751,7 +6805,7 @@ async function nagAddMember(gid){
   const body={agent_id};
   if(display_name)body.display_name=display_name;
   nagSetFeedback(`[data-nag-roster="${gid}"] [data-k="roster-add-feedback"]`,'Adding…');
-  const r=await api(`/groups/${gid}/members`,{method:'POST',body:JSON.stringify(body)});
+  const r=await api('/groups/'+encSeg(gid)+'/members',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.ok){
     if(aidInp)aidInp.value='';
     if(nameInp)nameInp.value='';
@@ -6765,14 +6819,14 @@ async function nagAddMember(gid){
 async function nagRemoveMember(gid,aid){
   if(!confirm('Remove member '+nagShort(aid)+' from this space? They can be re-invited later.'))return;
   nagMemberFeedback(gid,aid,'Working…');
-  const r=await api(`/groups/${gid}/members/${aid}`,{method:'DELETE'});
+  const r=await api('/groups/'+encSeg(gid)+'/members/'+encSeg(aid),{method:'DELETE'});
   if(r&&r.ok){nagMemberFeedback(gid,aid,'Removed.','ok');nagRenderAdmin(gid)}
   else{nagMemberFeedback(gid,aid,(r&&r.error)||'Remove failed.','err')}
 }
 
 async function nagSetRole(gid,aid,role){
   nagMemberFeedback(gid,aid,'Working…');
-  const r=await api(`/groups/${gid}/members/${aid}/role`,{method:'PATCH',body:JSON.stringify({role})});
+  const r=await api('/groups/'+encSeg(gid)+'/members/'+encSeg(aid)+'/role',{method:'PATCH',body:JSON.stringify({role})});
   if(r&&r.ok){nagMemberFeedback(gid,aid,`Role → ${role}.`,'ok');nagRenderAdmin(gid)}
   else{nagMemberFeedback(gid,aid,(r&&r.error)||'Role change failed.','err')}
 }
@@ -6780,14 +6834,14 @@ async function nagSetRole(gid,aid,role){
 async function nagBan(gid,aid){
   if(!confirm('Ban '+nagShort(aid)+' from this space?'))return;
   nagMemberFeedback(gid,aid,'Working…');
-  const r=await api(`/groups/${gid}/ban/${aid}`,{method:'POST'});
+  const r=await api('/groups/'+encSeg(gid)+'/ban/'+encSeg(aid),{method:'POST'});
   if(r&&r.ok){nagMemberFeedback(gid,aid,'Banned.','ok');nagRenderAdmin(gid)}
   else{nagMemberFeedback(gid,aid,(r&&r.error)||'Ban failed.','err')}
 }
 
 async function nagUnban(gid,aid){
   nagMemberFeedback(gid,aid,'Working…');
-  const r=await api(`/groups/${gid}/ban/${aid}`,{method:'DELETE'});
+  const r=await api('/groups/'+encSeg(gid)+'/ban/'+encSeg(aid),{method:'DELETE'});
   if(r&&r.ok){nagMemberFeedback(gid,aid,'Unbanned.','ok');nagRenderAdmin(gid)}
   else{nagMemberFeedback(gid,aid,(r&&r.error)||'Unban failed.','err')}
 }
@@ -6803,7 +6857,7 @@ function joinRequestBearer(){return OWNER_TOKEN||SESSION_TOKEN}
 
 async function nagApproveRequest(gid,rid){
   nagRequestFeedback(gid,rid,'Working…');
-  const r=await ownerApi(`/groups/${gid}/requests/${rid}/approve`,{method:'POST'});
+  const r=await ownerApi('/groups/'+encSeg(gid)+'/requests/'+encSeg(rid)+'/approve',{method:'POST'});
   if(r&&r.ok){nagRequestFeedback(gid,rid,'Approved.','ok');nagRenderAdmin(gid)}
   else{nagRequestFeedback(gid,rid,(r&&r.error)||'Approve failed.','err')}
 }
@@ -6814,17 +6868,20 @@ async function nagApproveAllRequests(gid){
   const ids=[...host.querySelectorAll('[data-nag-req-approve]')].map(b=>b.getAttribute('data-nag-req-approve')).filter(Boolean);
   if(!ids.length)return;
   if(!confirm('Approve all '+ids.length+' pending join requests?'))return;
+  let approved=0,failed=0;
   for(const rid of ids){
     nagRequestFeedback(gid,rid,'Approving…');
-    const r=await ownerApi(`/groups/${gid}/requests/${rid}/approve`,{method:'POST'});
-    if(!r||!r.ok){nagRequestFeedback(gid,rid,(r&&r.error)||'Approve failed.','err');break}
+    const r=await ownerApi('/groups/'+encSeg(gid)+'/requests/'+encSeg(rid)+'/approve',{method:'POST'});
+    if(r&&r.ok){approved++;nagRequestFeedback(gid,rid,'Approved.','ok')}
+    else{failed++;nagRequestFeedback(gid,rid,(r&&r.error)||'Approve failed.','err')}
   }
+  toast(failed?('Approved '+approved+' of '+ids.length+' ('+failed+' failed)'):('Approved all '+approved+' requests'),failed?'warning':'success');
   nagRenderAdmin(gid);
 }
 
 async function nagRejectRequest(gid,rid){
   nagRequestFeedback(gid,rid,'Working…');
-  const r=await ownerApi(`/groups/${gid}/requests/${rid}/reject`,{method:'POST'});
+  const r=await ownerApi('/groups/'+encSeg(gid)+'/requests/'+encSeg(rid)+'/reject',{method:'POST'});
   if(r&&r.ok){nagRequestFeedback(gid,rid,'Rejected.','ok');nagRenderAdmin(gid)}
   else{nagRequestFeedback(gid,rid,(r&&r.error)||'Reject failed.','err')}
 }
@@ -7183,7 +7240,10 @@ function applySpaceChannelPayload(groupId,chanName,topic,origin,data){
     return;
   }
   if(data.text){
-    const msg={...data,sender_id:origin,sender_name:data.sender_name||resolveSpaceSenderName(groupId,origin),own:false,channel:chanName};
+    const safeId=isSafeRemoteId(data.id)?data.id:generateMsgId();
+    const safeQuoteId=isSafeRemoteId(data.quote_id)?data.quote_id:'';
+    const knownName=resolveKnownSenderName(groupId,origin);
+    const msg={...data,id:safeId,quote_id:safeQuoteId,sender_id:origin,sender_name:knownName||data.sender_name||short(origin),own:false,channel:chanName};
     addChatMsg(chatKey,msg);
     if(isMentioned(data.text)){
       toast((msg.sender_name||short(origin))+' mentioned you in #'+chanName,'info');
@@ -7226,10 +7286,14 @@ async function onGossipMessage(topic,origin,data){
     const threadId=parts[1];
     const idPrefix=parts[0].replace('x0x.group.','');
     const match=(S.get('groups')||[]).find(g=>g.group_id.startsWith(idPrefix));
+    // Fail-closed: drop group-scoped frames if the group is not loaded yet.
+    if(topic.startsWith('x0x.group.')&&!match)return;
     if(match&&isSignedPublicSpace(match))return;
     const payload=match?await unwrapSpaceGossip(match.group_id,data):data;
-    if(threadId&&payload&&payload.text){
-      addThreadReply(threadId,{...payload,sender_id:origin,own:false});
+    if(threadId&&isSafeRemoteId(threadId)&&payload&&payload.text){
+      const safeId=isSafeRemoteId(payload.id)?payload.id:generateMsgId();
+      const knownName=match?resolveKnownSenderName(match.group_id,origin):'';
+      addThreadReply(threadId,{...payload,id:safeId,sender_id:origin,sender_name:knownName||payload.sender_name||short(origin),own:false});
     }
     return;
   }
@@ -7260,8 +7324,10 @@ async function onGossipMessage(topic,origin,data){
 
   // Per-space Swarm (topic: x0x.group.{id_prefix}.swarm/tasks or /results)
   if(topic.includes('.swarm/tasks')||topic==='x0x-swarm/tasks'){
-    const idPrefix=topic.startsWith('x0x.group.')?topic.split('.swarm/')[0].replace('x0x.group.',''):'';
+    const isGroupScoped=topic.startsWith('x0x.group.');
+    const idPrefix=isGroupScoped?topic.split('.swarm/')[0].replace('x0x.group.',''):'';
     const match=idPrefix?(S.get('groups')||[]).find(g=>g.group_id.startsWith(idPrefix)):null;
+    if(isGroupScoped&&!match)return;
     const payload=match?await unwrapSpaceGossip(match.group_id,data):data;
     if(payload&&payload.id){
       swarmTasks[payload.id]={...swarmTasks[payload.id],...payload,space_id:payload.space_id||(match&&match.group_id)||'',status:payload.event||'posted',from:origin,ts:payload.timestamp||Date.now()};
@@ -7271,8 +7337,10 @@ async function onGossipMessage(topic,origin,data){
     return;
   }
   if(topic.includes('.swarm/results')||topic==='x0x-swarm/results'){
-    const idPrefix=topic.startsWith('x0x.group.')?topic.split('.swarm/')[0].replace('x0x.group.',''):'';
+    const isGroupScoped=topic.startsWith('x0x.group.');
+    const idPrefix=isGroupScoped?topic.split('.swarm/')[0].replace('x0x.group.',''):'';
     const match=idPrefix?(S.get('groups')||[]).find(g=>g.group_id.startsWith(idPrefix)):null;
+    if(isGroupScoped&&!match)return;
     const payload=match?await unwrapSpaceGossip(match.group_id,data):data;
     if(payload&&payload.task_id&&swarmTasks[payload.task_id]){
       swarmTasks[payload.task_id].status='completed';

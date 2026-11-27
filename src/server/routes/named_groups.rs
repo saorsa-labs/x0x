@@ -5685,7 +5685,10 @@ pub(in crate::server) async fn offer_signed_public_kv_catchup(
     }
 }
 
-async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
+pub(in crate::server) async fn stop_named_group_metadata_listener(
+    state: &AppState,
+    group_id: &str,
+) {
     let reg = state.group_metadata_tasks.write().await.remove(group_id);
     if let Some(reg) = reg {
         reg.handle.abort();
@@ -22910,6 +22913,15 @@ pub(in crate::server) async fn create_named_group(
                 x0x::groups::invite::INVITE_MAX_TAG_LEN
             ));
         }
+        if !tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return bad_request(format!(
+                "tag '{}' contains invalid characters (allowed: a-z, 0-9, '-', '_')",
+                tag
+            ));
+        }
         if !normalized_tags.contains(&tag) {
             if normalized_tags.len() >= x0x::groups::MAX_TAGS_PER_GROUP {
                 return bad_request(format!(
@@ -24851,6 +24863,11 @@ pub(in crate::server) async fn get_group_public_messages(
         .unwrap_or_default();
 
     let page_limit = query.limit.unwrap_or(500).clamp(1, 500);
+    let store_query_limit = if query.thread_root.is_some() {
+        500
+    } else {
+        page_limit.saturating_add(1).min(500)
+    };
     let until_ms = query
         .before
         .and_then(|b| i64::try_from(b.saturating_sub(1)).ok());
@@ -24867,7 +24884,7 @@ pub(in crate::server) async fn get_group_public_messages(
                 let q = x0x::history::HistoryQuery {
                     scope: Some(x0x::history::Scope::Group(stable)),
                     until_ms,
-                    limit: 500,
+                    limit: store_query_limit,
                     ..Default::default()
                 };
                 store.query(&q)
@@ -24875,7 +24892,7 @@ pub(in crate::server) async fn get_group_public_messages(
             .await;
             match stored {
                 Ok(Ok(rows)) => {
-                    let hit_cap = rows.len() >= 500;
+                    let hit_cap = rows.len() >= store_query_limit;
                     let mut merged: Vec<x0x::groups::GroupPublicMessage> = rows
                         .iter()
                         .filter_map(|r| r.record.signed_artifact.as_deref())
@@ -24944,7 +24961,7 @@ pub(in crate::server) async fn get_group_public_messages(
         let keep_from = msgs.len() - page_limit;
         msgs.drain(..keep_from);
     }
-    let has_more = truncated || (store_hit_cap && query.thread_root.is_none());
+    let has_more = truncated || store_hit_cap;
     let next_before = if has_more {
         msgs.first().map(|m| m.timestamp)
     } else {
@@ -27647,31 +27664,54 @@ pub(in crate::server) fn clear_pending_open_join(
     pending.remove(&(stable_group_id.to_string(), authority));
 }
 
-fn record_pending_open_join(state: &AppState, stable_group_id: &str, authority: AgentId) {
+const MAX_OPEN_JOIN_DISPLAY_NAME_CHARS: usize = 64;
+
+fn sanitize_open_join_display_name(raw: Option<String>) -> Option<String> {
+    let trimmed = raw?.trim().to_string();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return None;
+    }
+    let bounded: String = trimmed
+        .chars()
+        .take(MAX_OPEN_JOIN_DISPLAY_NAME_CHARS)
+        .collect();
+    if bounded.is_empty() {
+        None
+    } else {
+        Some(bounded)
+    }
+}
+
+fn record_pending_open_join(state: &AppState, stable_group_id: &str, authority: AgentId) -> bool {
     let now = std::time::Instant::now();
     let mut pending = state
         .pending_open_joins
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     pending.retain(|_, ts| now.saturating_duration_since(*ts) < PENDING_OPEN_JOIN_TTL);
-    if pending.len() >= MAX_PENDING_OPEN_JOINS {
-        if let Some(oldest_key) = pending
-            .iter()
-            .min_by_key(|(_, ts)| *ts)
-            .map(|(k, _)| k.clone())
-        {
-            pending.remove(&oldest_key);
-        }
+    let key = (stable_group_id.to_string(), authority);
+    if !pending.contains_key(&key) && pending.len() >= MAX_PENDING_OPEN_JOINS {
+        return false;
     }
-    pending.insert((stable_group_id.to_string(), authority), now);
+    pending.insert(key, now);
+    true
+}
+
+fn resolve_card_authority(card: &x0x::groups::GroupCard) -> Option<AgentId> {
+    let raw = if !card.authority_agent_id.is_empty() {
+        card.authority_agent_id.as_str()
+    } else {
+        card.owner_agent_id.as_str()
+    };
+    parse_agent_id_hex(raw).ok()
 }
 
 /// `POST /groups/:id/open-join` — request authority-committed membership in a
 /// discovered `OpenJoin` + `SignedPublic` group (`public_open` /
 /// `public_announce`). A directory card alone grants neither membership nor
 /// write permission (A08); this route sends a verified `OpenJoinRequest` DM to
-/// the card's authority so the authority commits a standard `MemberAdded` and
-/// returns the signed-public bootstrap snapshot.
+/// the group's current authority so the authority commits a standard
+/// `MemberAdded` and returns the signed-public bootstrap snapshot.
 pub(in crate::server) async fn open_join_named_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -27683,7 +27723,22 @@ pub(in crate::server) async fn open_join_named_group(
         Err(resp) => return resp,
     };
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let mut resolved: Option<(String, AgentId, x0x::groups::GroupPolicy, bool)> = None;
+    let cached_card = {
+        let mut card = {
+            let cache = state.group_card_cache.read().await;
+            cache
+                .get(&id)
+                .cloned()
+                .or_else(|| cache.values().find(|c| c.group_id == id).cloned())
+        };
+        if card.is_none() {
+            let dir_cache = state.directory_cache.read().await;
+            card = dir_cache.iter_all().find(|c| c.group_id == id).cloned();
+        }
+        card
+    };
+
+    let mut resolved: Option<(String, AgentId, x0x::groups::GroupPolicy)> = None;
     {
         let groups = state.named_groups.read().await;
         if let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, &id) {
@@ -27706,37 +27761,55 @@ pub(in crate::server) async fn open_join_named_group(
                     })),
                 );
             }
+            // Prefer a verified cached card's active-admin signer, then any
+            // active admin on the local roster; fall back to `creator` only if
+            // the stub has no active admin rows yet.
+            let card_authority = cached_card
+                .as_ref()
+                .filter(|c| c.verify_signature().is_ok())
+                .and_then(resolve_card_authority);
+            let authority = card_authority
+                .filter(|aid| {
+                    let h = hex::encode(aid.as_bytes());
+                    info.caller_role(&h)
+                        .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                })
+                .or_else(|| {
+                    info.members_v2
+                        .iter()
+                        .find(|(_, m)| {
+                            m.state == x0x::groups::GroupMemberState::Active
+                                && m.role.at_least(x0x::groups::GroupRole::Admin)
+                        })
+                        .and_then(|(hex_id, _)| parse_agent_id_hex(hex_id).ok())
+                })
+                .or(card_authority)
+                .unwrap_or(info.creator);
             resolved = Some((
                 info.stable_group_id().to_string(),
-                info.creator,
+                authority,
                 info.policy.clone(),
-                false,
             ));
         }
     }
     if resolved.is_none() {
-        let mut card = {
-            let cache = state.group_card_cache.read().await;
-            cache
-                .get(&id)
-                .cloned()
-                .or_else(|| cache.values().find(|c| c.group_id == id).cloned())
-        };
-        if card.is_none() {
-            let dir_cache = state.directory_cache.read().await;
-            card = dir_cache.iter_all().find(|c| c.group_id == id).cloned();
-        }
-        if let Some(card) = card {
+        if let Some(card) = cached_card {
             if card.withdrawn {
                 return api_error(StatusCode::CONFLICT, "group is withdrawn");
             }
-            if let Ok(authority) = parse_agent_id_hex(&card.owner_agent_id) {
+            if card.verify_signature().is_err() {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "cached group card failed signature verification",
+                );
+            }
+            if let Some(authority) = resolve_card_authority(&card) {
                 let policy = x0x::groups::GroupPolicy::from(&card.policy_summary);
-                resolved = Some((card.group_id, authority, policy, true));
+                resolved = Some((card.group_id, authority, policy));
             }
         }
     }
-    let Some((stable_group_id, authority, policy, _from_card)) = resolved else {
+    let Some((stable_group_id, authority, policy)) = resolved else {
         return not_found("group not found in local groups or discovery cache");
     };
     if policy.admission != x0x::groups::GroupAdmission::OpenJoin {
@@ -27745,17 +27818,21 @@ pub(in crate::server) async fn open_join_named_group(
     if policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
         return forbidden("open_join is only supported for SignedPublic groups");
     }
-    let display_name = req
-        .display_name
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    record_pending_open_join(&state, &stable_group_id, authority);
+    let display_name = sanitize_open_join_display_name(req.display_name);
+    if !record_pending_open_join(&state, &stable_group_id, authority) {
+        return api_error_with_reason(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many pending open-join requests; retry once existing requests complete or expire",
+            "pending_open_join_cap",
+        );
+    }
     let dm = JoinResultMessage::OpenJoinRequest {
         group_id: stable_group_id.clone(),
         member_agent_id: local_hex,
         display_name,
     };
     let Ok(payload) = serde_json::to_vec(&dm) else {
+        clear_pending_open_join(&state, &stable_group_id, authority);
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to serialize open-join request",
@@ -27766,6 +27843,7 @@ pub(in crate::server) async fn open_join_named_group(
         .send_direct_with_config(&authority, payload, direct_message_send_config())
         .await
     {
+        clear_pending_open_join(&state, &stable_group_id, authority);
         if !state.agent.holds_gossip_usable_dm_binding(&authority) {
             let agent = Arc::clone(&state.agent);
             tokio::spawn(async move {
@@ -27781,13 +27859,15 @@ pub(in crate::server) async fn open_join_named_group(
             })),
         );
     }
+    let authority_hex = hex::encode(authority.as_bytes());
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
             "ok": true,
             "status": "requested",
             "group_id": stable_group_id,
-            "authority": hex::encode(authority.as_bytes()),
+            "authority_agent_id": authority_hex,
+            "authority": authority_hex,
         })),
     )
 }
@@ -27818,6 +27898,7 @@ async fn handle_open_join_request(
     let actor_hex = hex::encode(local_agent.as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    let display_name = sanitize_open_join_display_name(display_name);
 
     let resolved_key = {
         let groups = state.named_groups.read().await;
@@ -27829,110 +27910,115 @@ async fn handle_open_join_request(
     let membership_lock = group_membership_lock(&state, &group_key).await;
     let _membership_guard = membership_lock.lock().await;
 
-    let (metadata_topic, event, bootstrap_group) = {
+    // Clone and drop the `named_groups` read guard BEFORE any `.await` so we
+    // never hold the global RwLock across async sealing or persistence.
+    let current_info = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&group_key) else {
-            return;
-        };
-        if info.withdrawn
-            || info.home.is_some()
-            || info.is_fork_quarantined()
-            || info.policy.admission != x0x::groups::GroupAdmission::OpenJoin
-            || info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
-        {
-            return;
-        }
-        if !info
-            .caller_role(&actor_hex)
-            .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
-        {
-            return;
-        }
-        if info.is_banned(&sender_hex) {
-            return;
-        }
-        if info.has_active_member(&sender_hex) {
-            // Idempotent retry: re-trigger bootstrap delivery for already-seated member.
-            if let Ok(Some(obligation)) = public_group_bootstrap_obligation_for_add(sender, info) {
-                let next = info.clone();
-                drop(groups);
-                if matches!(
-                    persist_named_group_info_with_bootstrap_obligation(
-                        &state, &group_key, next, obligation
-                    )
-                    .await,
-                    Ok(AtomicWriteOutcome::Durable)
-                ) {
-                    spawn_public_group_bootstrap_delivery(&state);
-                }
-            }
-            return;
-        }
-        let entries =
-            x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2).len();
-        if entries >= x0x::groups::invite::MAX_CHUNKED_BASE_ROSTER_ENTRIES {
-            tracing::warn!(
-                group_id = %LogHexId::group(&group_key),
-                entries,
-                "open-join refused: group roster cap reached"
-            );
-            return;
-        }
-        let mut next = info.clone();
-        next.add_member(
-            sender_hex.clone(),
-            x0x::groups::GroupRole::Member,
-            Some(actor_hex.clone()),
-            display_name.clone(),
-        );
-        next.roster_revision = next.roster_revision.saturating_add(1);
-        next.updated_at = now_ms;
-        let revision = next.roster_revision;
-        let Ok(commit) = seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
-        else {
-            return;
-        };
-        let Ok(bootstrap_obligation) = public_group_bootstrap_obligation_for_add(sender, &next)
-        else {
-            return;
-        };
-        let metadata_topic = next.metadata_topic.clone();
-        let event_group_id = next.stable_group_id().to_string();
-        let bootstrap_group = next.clone();
-        drop(groups);
-        let persist_outcome = match bootstrap_obligation {
-            Some(obligation) => {
-                persist_named_group_info_with_bootstrap_obligation(
-                    &state, &group_key, next, obligation,
-                )
+        groups.get(&group_key).cloned()
+    };
+    let Some(info) = current_info else {
+        return;
+    };
+    if info.withdrawn
+        || info.home.is_some()
+        || info.is_fork_quarantined()
+        || info.policy.admission != x0x::groups::GroupAdmission::OpenJoin
+        || info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+    {
+        return;
+    }
+    if !info
+        .caller_role(&actor_hex)
+        .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+    {
+        return;
+    }
+    if info.is_banned(&sender_hex) {
+        return;
+    }
+    if info.has_active_member(&sender_hex) {
+        // Idempotent retry: kick delivery without re-persisting if an
+        // obligation for this exact recipient and frontier is already queued.
+        if let Ok(Some(obligation)) = public_group_bootstrap_obligation_for_add(sender, &info) {
+            let already_queued = state
+                .public_group_bootstrap_outbox
+                .read()
                 .await
+                .contains_key(&obligation.key);
+            if already_queued {
+                spawn_public_group_bootstrap_delivery(&state);
+                return;
             }
-            None => persist_named_group_info(&state, &group_key, next).await,
-        };
-        if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
-            return;
+            if matches!(
+                persist_named_group_info_with_bootstrap_obligation(
+                    &state, &group_key, info, obligation
+                )
+                .await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
+                spawn_public_group_bootstrap_delivery(&state);
+            }
         }
-        refresh_group_rosters_for_gossip(&state).await;
-        let event = NamedGroupMetadataEvent::MemberAdded {
-            roster_certificates_b64: Vec::new(),
-            group_id: event_group_id,
-            revision,
-            actor: actor_hex,
-            agent_id: sender_hex,
-            display_name,
-            treekem_commit_b64: None,
-            treekem_welcome_b64: None,
-            welcome_ref: None,
-            treekem_epoch: None,
-            treekem_key_package_hash: None,
-            member_joined_recovery: None,
-            member_recovery_history: Vec::new(),
-            certificate_b64: None,
-            owner_mandate: None,
-            commit: Some(commit),
-            reseat_mandate: None,
-        };
-        (metadata_topic, event, bootstrap_group)
+        return;
+    }
+    let entries = x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2).len();
+    if entries >= x0x::groups::invite::MAX_CHUNKED_BASE_ROSTER_ENTRIES {
+        tracing::warn!(
+            group_id = %LogHexId::group(&group_key),
+            entries,
+            "open-join refused: group roster cap reached"
+        );
+        return;
+    }
+    let mut next = info;
+    next.add_member(
+        sender_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(actor_hex.clone()),
+        display_name.clone(),
+    );
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    next.updated_at = now_ms;
+    let revision = next.roster_revision;
+    let Ok(commit) = seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
+    else {
+        return;
+    };
+    let Ok(bootstrap_obligation) = public_group_bootstrap_obligation_for_add(sender, &next) else {
+        return;
+    };
+    let metadata_topic = next.metadata_topic.clone();
+    let event_group_id = next.stable_group_id().to_string();
+    let bootstrap_group = next.clone();
+    let persist_outcome = match bootstrap_obligation {
+        Some(obligation) => {
+            persist_named_group_info_with_bootstrap_obligation(&state, &group_key, next, obligation)
+                .await
+        }
+        None => persist_named_group_info(&state, &group_key, next).await,
+    };
+    if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
+        return;
+    }
+    refresh_group_rosters_for_gossip(&state).await;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
+        group_id: event_group_id,
+        revision,
+        actor: actor_hex,
+        agent_id: sender_hex,
+        display_name,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: None,
+        owner_mandate: None,
+        commit: Some(commit),
+        reseat_mandate: None,
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -53829,11 +53915,50 @@ pub(in crate::server) async fn dispatch_join_result_message(
                 );
                 return true;
             }
+            // Pre-check group eligibility without cloning so unauthorized
+            // senders never consume an admission ticket.
+            let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let eligible_stable = {
+                let groups = state.named_groups.read().await;
+                crate::server::resolve_group_entry_locked(&groups, group_id)
+                    .filter(|(_, info)| {
+                        !info.withdrawn
+                            && info.home.is_none()
+                            && !info.is_fork_quarantined()
+                            && info.policy.admission == x0x::groups::GroupAdmission::OpenJoin
+                            && info.policy.confidentiality
+                                == x0x::groups::GroupConfidentiality::SignedPublic
+                            && !info.is_banned(&sender_hex)
+                            && info
+                                .caller_role(&actor_hex)
+                                .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                    })
+                    .map(|(_, info)| info.stable_group_id().to_string())
+            };
+            let Some(stable_group) = eligible_stable else {
+                return true;
+            };
+            let ticket = match state.base_roster_serve_admission.try_admit(
+                &format!("open-join|{stable_group}|{sender_hex}"),
+                &stable_group,
+            ) {
+                Ok(ticket) => ticket,
+                Err(refusal) => {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(group_id),
+                        member = %LogHexId::agent(member_agent_id),
+                        ?refusal,
+                        "open-join request not admitted; requester may retry"
+                    );
+                    return true;
+                }
+            };
             let task_state = Arc::clone(state);
             let requester = *sender;
-            let gid = group_id.clone();
+            let gid = stable_group;
             let dn = display_name.clone();
             state.spawn_detached(async move {
+                let _ticket = ticket;
                 handle_open_join_request(task_state, requester, gid, dn).await;
             });
             return true;
