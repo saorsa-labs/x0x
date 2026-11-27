@@ -5376,7 +5376,7 @@ dependencies = [
 
 [[package]]
 name = "x0x"
-version = "0.50.1"
+version = "0.51.0"
 dependencies = [
  "ant-quic 0.29.0",
  "anyhow",

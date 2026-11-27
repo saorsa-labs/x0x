@@ -4,6 +4,69 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-11-27
+
+### Added
+
+- **Community-scale named groups and Spaces hardening (#2238, A08 amendment of 27 Nov 2026).**
+  - **Chunked v6 base-roster fetch up to 1,024 Active+Banned members:** Raises
+    the v6 content-addressed base-roster cap from 128 to 1,024 entries
+    (`MAX_BASE_ROSTER_CHUNKS = 8`, `128` entries/chunk) via
+    `JoinResultMessage::BaseRosterChunk` and `accepts_chunks: bool` on
+    `BaseRosterFetch`, preserving single-DM `BaseRoster` replies for
+    projections `<= 128` and checking `roster_root_of_projection` over the
+    reassembled entries. **Mixed-version note:** a `0.50.x` joiner without
+    `accepts_chunks` that redeems a v6 invite for a roster above 128 receives
+    a terminal `BaseRosterUnavailable` (`409 base_roster_pruned`); upgrade the
+    joiner to `0.51.0` to join communities above 128 members.
+  - **Higher live invite capacity:** Raises `MAX_LIVE_ISSUED_INVITES_PER_GROUP`
+    from `64` to `256` unexpired, unconsumed single-use invites per group.
+  - **Authority-committed `POST /groups/:id/open-join` (`x0x group open-join`):**
+    Completes `OpenJoin` membership for discoverable `SignedPublic`, non-Home
+    groups via `JoinResultMessage::OpenJoinRequest`. The joiner verifies the
+    `GroupCard` signature, records bounded local consent (5-min TTL, max 64
+    pending; `429 pending_open_join_cap`), and upgrades only true card-import
+    stubs (`409 open_join_prior_seat_present` if a local Removed/Left seat
+    exists). The authority verifies non-banned/non-revoked status, commits a
+    standard `MemberAdded`, and enqueues durable `PublicGroupBootstrap`
+    delivery. **Mixed-version note:** an `open-join` request sent to a
+    `0.50.x` authority is ignored until the authority upgrades to `0.51.0`.
+  - **Discovery tags at creation and message pagination:** `POST /groups`
+    (`x0x group create --tag`) accepts up to 16 normalized lowercase
+    `[a-z0-9_-]` discovery tags (returned on `GET /groups/:id`), and
+    `GET /groups/:id/messages` (`x0x group messages --limit --before`) supports
+    authored-timestamp backward pagination (`has_more`, `next_before`) backed
+    by `Store::query_scope_by_sent_at` so delayed or caught-up messages are
+    never skipped across pages.
+
+### Fixed
+
+- **Embedded GUI Spaces security, chat, apps, Discover, and Manage (#2238, `src/gui/x0x-gui.html`).**
+  - Escaped Space descriptions, DM labels, and remote reaction emojis; hardened
+    `escJs` against double-quoted `onclick` attribute breakout; tightened Web
+    preview iframe to `sandbox=""`; required `confirm()` before destructive
+    withdraw/remove/ban actions; and URL-encoded REST path segments with
+    `encSeg()`.
+  - Removed single-use invite caching (`savedInvites`) so every Invite click
+    mints a fresh link, and added **Copy Group Card** for discoverable spaces.
+  - Wired `POST /groups/:id/secure/{encrypt,decrypt}` fail-closed across
+    `MlsEncrypted` channel chat, threads, reactions, edits, deletes, pins,
+    typing, and per-space Swarm, enforcing sender ownership on remote edits
+    and deletes.
+  - Pinned `SignedPublic` chat to `#general`, gated Thread actions on canonical
+    64-hex `msg_id` with live WS backfill and in-place ID upgrade, added
+    backward **Load older messages** pagination preserving both older pages and
+    the live tail/localStorage cache, wired real `thread_root` replies, and
+    gated the composer on `admin_only` / guest views.
+  - Backed Space **Feed** with the group store, scoped **Files** recipients and
+    **Swarm** per Space, added preview/delete to **Wiki** and **Web**, and
+    added Tags, Discover mesh search + OpenJoin, policy badges, and searchable
+    paginated roster management.
+- **Documentation & CI stability (#2233, #2212, #2227).** Recorded A08
+  amendment for `#2197` option D (`#2233`), added swap for cold `ci-full` lib
+  builds and classified dead W3-H shards as infra (`#2212`), and stabilized
+  `H-S3-d3` W3-H link setup (`#2227`).
+
 ## [0.50.1] - 2026-11-26
 
 ### Changed
