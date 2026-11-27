@@ -27914,7 +27914,7 @@ async fn handle_open_join_request(
     // never hold the global RwLock across async sealing or persistence.
     let current_info = {
         let groups = state.named_groups.read().await;
-        groups.get(&group_key).cloned()
+        crate::server::resolve_group_entry_locked(&groups, &group_id).map(|(_, g)| g.clone())
     };
     let Some(info) = current_info else {
         return;

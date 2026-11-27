@@ -619,6 +619,7 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ("DELETE /groups/:id/ban/:agent_id", RouteClass::ControlPlane),
     ("POST /groups/:id/invite", RouteClass::ControlPlane),
     ("POST /groups/join", RouteClass::ControlPlane),
+    ("POST /groups/:id/open-join", RouteClass::ControlPlane),
     ("GET /groups/:id/join-status", RouteClass::ControlPlane),
     ("PUT /groups/:id/display-name", RouteClass::ControlPlane),
     ("GET /groups/:id/state", RouteClass::ControlPlane),
