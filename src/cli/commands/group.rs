@@ -27,6 +27,7 @@ pub async fn create(
     display_name: Option<&str>,
     preset: Option<&str>,
     policy_json: Option<&str>,
+    tags: &[String],
 ) -> Result<()> {
     client.ensure_running().await?;
     let mut body = json!({ "name": name });
@@ -43,6 +44,9 @@ pub async fn create(
         let parsed: Value = serde_json::from_str(p)
             .map_err(|e| anyhow::anyhow!("--policy must be a JSON GroupPolicy object: {e}"))?;
         body["policy"] = parsed;
+    }
+    if !tags.is_empty() {
+        body["tags"] = json!(tags);
     }
     let resp = client.post("/groups", &body).await?;
     // ADR-0038 round-2 fix 4: when an EXPLICIT policy was sent, the daemon
@@ -616,26 +620,51 @@ pub async fn delegations(client: &DaemonClient, group_id: &str) -> Result<()> {
         .await
 }
 
+/// `x0x group open-join` — POST /groups/:id/open-join.
+pub async fn open_join(
+    client: &DaemonClient,
+    group_id: &str,
+    display_name: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let mut body = json!({});
+    if let Some(dn) = display_name {
+        body["display_name"] = Value::String(dn.to_string());
+    }
+    let resp = client
+        .post(&format!("/groups/{group_id}/open-join"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x group messages` — GET /groups/:id/messages.
 pub async fn messages(
     client: &DaemonClient,
     group_id: &str,
     thread_root: Option<&str>,
+    limit: Option<usize>,
+    before: Option<u64>,
 ) -> Result<()> {
-    match thread_root {
-        Some(root) => {
-            client
-                .run_get_query(
-                    &format!("/groups/{group_id}/messages"),
-                    &[("thread_root", root)],
-                )
-                .await
-        }
-        None => {
-            client
-                .run_get(&format!("/groups/{group_id}/messages"))
-                .await
-        }
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(root) = thread_root {
+        query.push(("thread_root", root.to_string()));
+    }
+    if let Some(limit) = limit {
+        query.push(("limit", limit.to_string()));
+    }
+    if let Some(before) = before {
+        query.push(("before", before.to_string()));
+    }
+    if query.is_empty() {
+        client
+            .run_get(&format!("/groups/{group_id}/messages"))
+            .await
+    } else {
+        let refs: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        client
+            .run_get_query(&format!("/groups/{group_id}/messages"), &refs)
+            .await
     }
 }
 
@@ -1017,7 +1046,7 @@ mod tests {
         let mock_resp = serde_json::json!([{"id": "msg-1", "text": "hello"}]);
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = messages(&client, "group-123", None).await;
+        let result = messages(&client, "group-123", None, None, None).await;
         assert!(result.is_ok(), "messages should succeed: {:?}", result);
     }
 
@@ -1115,7 +1144,7 @@ mod tests {
         let mock_resp = serde_json::json!({"id": "new-group", "name": "test"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = create(&client, "test-group", None, None, None, None).await;
+        let result = create(&client, "test-group", None, None, None, None, &[]).await;
         assert!(result.is_ok(), "create should succeed: {:?}", result);
     }
 

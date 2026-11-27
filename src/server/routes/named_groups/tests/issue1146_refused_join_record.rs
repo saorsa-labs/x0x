@@ -170,6 +170,7 @@ async fn refused_join_retained_record_accepts_fresh_addressed_invite() -> Result
             display_name: None,
             preset: Some("private_secure".to_string()),
             policy: None,
+            tags: Vec::new(),
         }),
     )
     .await

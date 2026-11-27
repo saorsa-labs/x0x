@@ -435,6 +435,11 @@ const COVERED: &[CoveredEndpoint] = &[
         "/groups/join",
         d4_stateful_events_converge_via_signed_commits
     ),
+    covered!(
+        Post,
+        "/groups/:id/open-join",
+        "open_join_authority_commits_member_added_and_rejects_banned"
+    ),
     // #477: the join-status route is covered by the wp_b_477 T-matrix
     // (T7 drives the live terminal path; T10 the refused outcome shape).
     covered!(
@@ -730,6 +735,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/report_tests.rs",
         include_str!("../src/server/report_tests.rs"),
+    ),
+    // Open-join authority admission + pagination + tag tests live in
+    // named_groups/tests/issue646_base_roster_fetch.rs.
+    (
+        "src/server/routes/named_groups/tests/issue646_base_roster_fetch.rs",
+        include_str!("../src/server/routes/named_groups/tests/issue646_base_roster_fetch.rs"),
     ),
     // #1109: the queued-send cancel route's coverage lives in the direct
     // route lib tests.

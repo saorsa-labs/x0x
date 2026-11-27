@@ -911,6 +911,42 @@ impl Store {
         collect_rows(&guard, &sql, params)
     }
 
+    /// Query rows in one scope ordered newest-first by authored `sent_at_ms`
+    /// with an optional exclusive `before_sent_ms` upper bound.
+    ///
+    /// Used by `GET /groups/:id/messages` so backward pagination filters and
+    /// orders on the same clock (`sent_at_ms`) as the returned `next_before`
+    /// cursor, even when delayed delivery or catch-up gives an older message a
+    /// newer `seen_at_ms` / rowid.
+    pub fn query_scope_by_sent_at(
+        &self,
+        scope: &Scope,
+        before_sent_ms: Option<i64>,
+        limit: usize,
+    ) -> HistoryResult<Vec<StoredRecord>> {
+        let limit = effective_limit(limit);
+        let mut sql = String::from(
+            "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
+             author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
+             signed_artifact, signature, sig_context, provenance, replace_key, \
+             thread_root, thread_parent, ingress_sender_agent, logical_request_id \
+             FROM history WHERE scope_kind = ? AND scope_id = ?",
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::from(scope.kind()),
+            rusqlite::types::Value::from(scope.id().to_string()),
+        ];
+        if let Some(before) = before_sent_ms {
+            sql.push_str(" AND sent_at_ms < ?");
+            params.push(rusqlite::types::Value::from(before));
+        }
+        sql.push_str(" ORDER BY sent_at_ms DESC, id DESC LIMIT ?");
+        params.push(rusqlite::types::Value::from(limit as i64));
+
+        let guard = lock_conn(&self.conn)?;
+        collect_rows(&guard, &sql, params)
+    }
+
     /// Point lookup of a single row by canonical `msg_id` (issue #319,
     /// ADR-0023 completeness). `msg_id` is the store dedupe key, so at most
     /// one row matches; newest wins defensively if that invariant ever bends.

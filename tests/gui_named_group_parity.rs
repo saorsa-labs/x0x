@@ -31,15 +31,6 @@ const GUI_HTML: &str = include_str!("../src/gui/x0x-gui.html");
 /// Adding an entry here is a downgrade that must show up in
 /// `docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`.
 const DEFERRED: &[(Method, &str, &str)] = &[
-    // #477: the pending-join status (with the typed terminal refusal
-    // outcome) is a CLI/REST-first surface — `x0x group join-status` and
-    // `x0x group join --wait`. GUI wiring (a join-progress panel) is
-    // deferred with the other #477 follow-ups (issue #481).
-    (
-        Method::Get,
-        "/groups/:id/join-status",
-        "CLI/REST-first join-status surface; GUI join-progress panel deferred (#481)",
-    ),
     // issue #111: retained state-commit history is a verification / governance
     // read surface (audit, dispute evidence), not a routine browser action.
     // Exposed via the CLI (`x0x group state-commits`) and the REST API; a GUI
@@ -72,36 +63,10 @@ const DEFERRED: &[(Method, &str, &str)] = &[
         "/groups/secure/open-envelope",
         "adversarial test endpoint, not a user-facing action",
     ),
-    // Secure-plane encrypt/decrypt/reseal are consumed via MLS group
-    // chat, not a direct user action in the embedded GUI. The CLI and
-    // both clients expose them.
-    (
-        Method::Post,
-        "/groups/:id/secure/encrypt",
-        "secure-plane primitive; consumed implicitly by encrypted chat",
-    ),
-    (
-        Method::Post,
-        "/groups/:id/secure/decrypt",
-        "secure-plane primitive; consumed implicitly by encrypted chat",
-    ),
     (
         Method::Post,
         "/groups/:id/secure/reseal",
         "secure-plane primitive; server-side rekey on approve/ban",
-    ),
-    // Explicit add-member by agent hex is an admin flow covered by the
-    // invite path in the GUI. Deferred until the GUI gains an
-    // agent-picker; the CLI and both clients expose it.
-    (
-        Method::Post,
-        "/groups/:id/members",
-        "admin flow; GUI currently uses invite links instead of direct add-by-agent",
-    ),
-    (
-        Method::Delete,
-        "/groups/:id/members/:agent_id",
-        "admin flow; GUI currently uses ban rather than direct remove-by-agent",
     ),
     // ADR 0110 §4a: the agent's certificate self-rebind is an agent
     // renewal surface driven by the agent or its harness (CLI + REST).
@@ -110,23 +75,11 @@ const DEFERRED: &[(Method, &str, &str)] = &[
         "/groups/:id/members/:agent_id/certificate/rebind",
         "agent certificate renewal surface (ADR 0110 §4a); exposed via CLI + REST, GUI deferred",
     ),
-    // GET /groups/cards/:id — card inspection UI still deferred. The
-    // card-import action below is now wired; inspection-by-id will
-    // come with a richer "discovered groups" detail panel.
-    (
-        Method::Get,
-        "/groups/cards/:id",
-        "GUI gap: card inspection-by-id UI not yet wired (import action is)",
-    ),
-    // Shard subscriptions are a power-user surface; CLI covers it.
+    // Listing/unsubscribing individual raw directory shards stays a
+    // power-user CLI surface; the GUI wires tag/name search subscription.
     (
         Method::Get,
         "/groups/discover/subscriptions",
-        "power-user surface; CLI covers it",
-    ),
-    (
-        Method::Post,
-        "/groups/discover/subscribe",
         "power-user surface; CLI covers it",
     ),
     (
@@ -629,9 +582,9 @@ fn gui_named_group_parity_against_manifest() {
 fn deferred_entries_remain_deferred_when_a_gui_call_matches() {
     let deferred = deferred_paths();
     let method = Method::Post;
-    let path = "/groups/:id/members";
+    let path = "/groups/:id/delegate";
     let calls = [ApiCall {
-        expr: "'/groups/' + groupId + '/members'".to_string(),
+        expr: "'/groups/' + groupId + '/delegate'".to_string(),
         method: Some("POST".to_string()),
         options: String::new(),
         at: 0,
@@ -1815,6 +1768,37 @@ fn response_fields(method: Method, path: &str) -> &'static [&'static str] {
                 "creator",
                 "members",
                 "membership_state",
+                "tags",
+                "withdrawn",
+                "fork_quarantine",
+                "recovery",
+                "own_join_request",
+            ],
+        ),
+        (
+            Method::Get,
+            "/groups/:id/join-status",
+            &["join_state", "pending_cause", "last_join_outcome"],
+        ),
+        (
+            Method::Post,
+            "/groups/:id/open-join",
+            &["group_id", "authority_agent_id", "status"],
+        ),
+        (
+            Method::Get,
+            "/groups/cards/:id",
+            &[
+                "group_id",
+                "name",
+                "description",
+                "tags",
+                "revision",
+                "member_count",
+                "policy_summary",
+                "authority_agent_id",
+                "signature",
+                "withdrawn",
             ],
         ),
         (Method::Get, "/groups/:id/state", &["group_id"]),
@@ -1824,7 +1808,11 @@ fn response_fields(method: Method, path: &str) -> &'static [&'static str] {
         (Method::Post, "/groups", &["group_id", "policy"]),
         (Method::Post, "/groups/join", &["group_id", "group_name"]),
         (Method::Post, "/groups/cards/import", &["group_id"]),
-        (Method::Post, "/groups/:id/invite", &["invite_link"]),
+        (
+            Method::Post,
+            "/groups/:id/invite",
+            &["invite_link", "expires_at"],
+        ),
         (Method::Delete, "/groups/:id", &["deleted"]),
         (Method::Get, "/groups/discover", &["groups"]),
         (Method::Get, "/groups/discover/nearby", &["groups"]),
@@ -1863,7 +1851,11 @@ fn response_fields(method: Method, path: &str) -> &'static [&'static str] {
             &["display_name", "agent_id", "trust_level"],
         ),
         (Method::Post, "/groups/:id/send", &[]),
-        (Method::Get, "/groups/:id/messages", &["messages"]),
+        (
+            Method::Get,
+            "/groups/:id/messages",
+            &["messages", "has_more", "next_before"],
+        ),
         (Method::Get, "/task-lists", &["task_lists"]),
         (
             Method::Get,

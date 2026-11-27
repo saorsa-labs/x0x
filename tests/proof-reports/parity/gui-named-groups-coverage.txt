@@ -1,10 +1,10 @@
-# GUI named-groups parity report — 44 endpoints total
+# GUI named-groups parity report — 45 endpoints total
   WIRED     POST /groups
   WIRED     GET /groups
   WIRED     GET /groups/:id
   WIRED     GET /groups/:id/members
-  DEFERRED  POST /groups/:id/members  // admin flow; GUI currently uses invite links instead of direct add-by-agent
-  DEFERRED  DELETE /groups/:id/members/:agent_id  // admin flow; GUI currently uses ban rather than direct remove-by-agent
+  WIRED     POST /groups/:id/members
+  WIRED     DELETE /groups/:id/members/:agent_id
   WIRED     POST /groups/:id/send
   WIRED     GET /groups/:id/messages
   DEFERRED  POST /groups/:id/delegate  // agent-to-agent authority surface; exposed via CLI + REST, GUI manager deferred
@@ -12,7 +12,8 @@
   WIRED     POST /groups/:id/invite
   DEFERRED  POST /groups/:id/quarantine/clear  // operator/ops endpoint; exposed via CLI + REST, GUI ops panel deferred (ADR-0064)
   WIRED     POST /groups/join
-  DEFERRED  GET /groups/:id/join-status  // CLI/REST-first join-status surface; GUI join-progress panel deferred (#481)
+  WIRED     POST /groups/:id/open-join
+  WIRED     GET /groups/:id/join-status
   WIRED     PUT /groups/:id/display-name
   WIRED     DELETE /groups/:id
   WIRED     GET /groups/:id/state
@@ -35,13 +36,13 @@
   WIRED     GET /groups/discover
   WIRED     GET /groups/discover/nearby
   DEFERRED  GET /groups/discover/subscriptions  // power-user surface; CLI covers it
-  DEFERRED  POST /groups/discover/subscribe  // power-user surface; CLI covers it
+  WIRED     POST /groups/discover/subscribe
   DEFERRED  DELETE /groups/discover/subscribe/:kind/:shard  // power-user surface; CLI covers it
-  DEFERRED  GET /groups/cards/:id  // GUI gap: card inspection-by-id UI not yet wired (import action is)
+  WIRED     GET /groups/cards/:id
   WIRED     POST /groups/cards/import
-  DEFERRED  POST /groups/:id/secure/encrypt  // secure-plane primitive; consumed implicitly by encrypted chat
-  DEFERRED  POST /groups/:id/secure/decrypt  // secure-plane primitive; consumed implicitly by encrypted chat
+  WIRED     POST /groups/:id/secure/encrypt
+  WIRED     POST /groups/:id/secure/decrypt
   DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
   DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 25/44 wired; 19 deferred; 0 missing
+Coverage: 33/45 wired; 12 deferred; 0 missing

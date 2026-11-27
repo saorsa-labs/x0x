@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 232,
+  "endpoint_count": 233,
   "endpoints": [
     {
       "category": "status",
@@ -2240,6 +2240,12 @@
             "in": "body",
             "name": "policy",
             "required": false
+          },
+          {
+            "cli": "--tag",
+            "in": "body",
+            "name": "tags",
+            "required": false
           }
         ],
         "kind": "fields"
@@ -2376,6 +2382,18 @@
             "in": "query",
             "name": "thread_root",
             "required": false
+          },
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "limit",
+            "required": false
+          },
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "before",
+            "required": false
           }
         ],
         "kind": "fields"
@@ -2511,6 +2529,24 @@
             "cli": "derived",
             "in": "body",
             "name": "expected_owner_user_id",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group open-join",
+      "description": "Request authority-committed membership in a discovered OpenJoin SignedPublic group",
+      "method": "POST",
+      "path": "/groups/:id/open-join",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "display_name",
             "required": false
           }
         ],

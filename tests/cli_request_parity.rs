@@ -1100,6 +1100,8 @@ const PINNED_MANUAL_BODY_ENDPOINTS: &[(&str, &str, &[&str])] = &[
     ),
     // parse_optional_json over raw Bytes (create_group_invite)
     ("POST", "/groups/:id/invite", &["expiry_secs"]),
+    // parse_optional_json over raw Bytes (open_join_named_group)
+    ("POST", "/groups/:id/open-join", &["display_name"]),
     // raw Bytes -> serde GroupCard passthrough (import_group_card)
     ("POST", "/groups/cards/import", &[]),
     // #1350: raw Bytes, an empty body takes the defaults, any other body

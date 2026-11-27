@@ -1785,6 +1785,9 @@ enum GroupSub {
         /// echo (older daemon silently ignoring the field) fails loudly.
         #[arg(long)]
         policy: Option<String>,
+        /// Discovery tags for public directory sharding (repeatable, max 16).
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
     /// Get group details.
     Info {
@@ -2097,6 +2100,20 @@ enum GroupSub {
         /// (64 lowercase hex, ADR-0029).
         #[arg(long)]
         thread_root: Option<String>,
+        /// Maximum number of messages to return (1..=500).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Return messages strictly older than this unix-ms timestamp.
+        #[arg(long)]
+        before: Option<u64>,
+    },
+    /// Request authority-committed membership in a discovered OpenJoin SignedPublic group.
+    OpenJoin {
+        /// Group ID.
+        group_id: String,
+        /// Optional display name in this group.
+        #[arg(long)]
+        display_name: Option<String>,
     },
     /// Inspect the state-commit chain for a group.
     State {
@@ -3210,6 +3227,7 @@ async fn run(
                 display_name,
                 preset,
                 policy,
+                tags,
             }) => {
                 commands::group::create(
                     &client,
@@ -3218,6 +3236,7 @@ async fn run(
                     display_name.as_deref(),
                     preset.as_deref(),
                     policy.as_deref(),
+                    &tags,
                 )
                 .await
             }
@@ -3423,7 +3442,16 @@ async fn run(
             Some(GroupSub::Messages {
                 group_id,
                 thread_root,
-            }) => commands::group::messages(&client, &group_id, thread_root.as_deref()).await,
+                limit,
+                before,
+            }) => {
+                commands::group::messages(&client, &group_id, thread_root.as_deref(), limit, before)
+                    .await
+            }
+            Some(GroupSub::OpenJoin {
+                group_id,
+                display_name,
+            }) => commands::group::open_join(&client, &group_id, display_name.as_deref()).await,
             Some(GroupSub::Store {
                 sub: GroupStoreSub::Create { group_id, name },
             }) => commands::group::group_store_create(&client, &group_id, &name).await,
