@@ -420,7 +420,9 @@ impl Drop for WaiterGuard<'_> {
                 slots.remove(self.key);
             }
         }
-        drop(slots);
+        // Hold `base_roster_fetch_slots` while clearing `base_roster_chunk_buffers`
+        // (same lock order as registration and delivery) so a concurrent re-parked
+        // waiter cannot have its fresh chunk buffer removed.
         if !still_has_inviter {
             self.state
                 .base_roster_chunk_buffers
@@ -428,6 +430,7 @@ impl Drop for WaiterGuard<'_> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&(self.key.to_string(), self.inviter));
         }
+        drop(slots);
     }
 }
 
@@ -795,5 +798,93 @@ pub(in crate::server) async fn send_base_roster_unavailable(
         .await
     {
         tracing::debug!("base-roster-unavailable send failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod waiter_guard_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn waiter_guard_drop_preserves_buffer_while_sibling_waiter_lives() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_peer_cache_disabled()
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .build()
+                .await?,
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            agent,
+        )
+        .await?;
+        let inviter = AgentId([42u8; 32]);
+        let key = "group-race|root-race".to_string();
+        let id1 = NEXT_WAITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id2 = NEXT_WAITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        {
+            let mut slots = state.base_roster_fetch_slots.lock().expect("slots lock");
+            let entry = slots.entry(key.clone()).or_default();
+            entry.push(BaseRosterWaiter {
+                id: id1,
+                inviter,
+                sender: tx1,
+            });
+            entry.push(BaseRosterWaiter {
+                id: id2,
+                inviter,
+                sender: tx2,
+            });
+            state
+                .base_roster_chunk_buffers
+                .lock()
+                .expect("buf lock")
+                .insert(
+                    (key.clone(), inviter),
+                    BaseRosterChunkAssembly {
+                        total_chunks: 2,
+                        received_chunks: std::collections::BTreeSet::from([0u16]),
+                        entries: BaseRosterProjection::new(),
+                    },
+                );
+        }
+
+        let guard1 = WaiterGuard {
+            state: &state,
+            key: &key,
+            inviter,
+            id: id1,
+        };
+        let guard2 = WaiterGuard {
+            state: &state,
+            key: &key,
+            inviter,
+            id: id2,
+        };
+        drop(guard1);
+        assert!(
+            state
+                .base_roster_chunk_buffers
+                .lock()
+                .expect("buf lock")
+                .contains_key(&(key.clone(), inviter)),
+            "dropping first waiter must keep chunk buffer while second waiter is parked"
+        );
+        drop(guard2);
+        assert!(
+            !state
+                .base_roster_chunk_buffers
+                .lock()
+                .expect("buf lock")
+                .contains_key(&(key.clone(), inviter)),
+            "dropping last waiter must clear chunk buffer atomically under slots lock"
+        );
+        Ok(())
     }
 }

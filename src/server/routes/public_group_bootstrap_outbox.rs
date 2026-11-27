@@ -1252,6 +1252,28 @@ pub(in crate::server) fn spawn_public_group_bootstrap_delivery(state: &Arc<AppSt
 // Receiving side
 // ---------------------------------------------------------------------------
 
+/// Single predicate shared by admission preflight and the persistence closure
+/// so an explicit local open-join only upgrades a true card-import stub (never
+/// overwriting Active, Removed, Left, Banned, withdrawn, or mismatched-genesis
+/// local group records).
+fn is_replaceable_open_join_stub(
+    existing: &x0x::groups::GroupInfo,
+    incoming: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+    open_join_consent: bool,
+) -> bool {
+    open_join_consent
+        && !existing.withdrawn
+        && !existing.members_v2.contains_key(local_agent_hex)
+        && existing.invite_lineage.is_none()
+        && existing.policy.admission == x0x::groups::GroupAdmission::OpenJoin
+        && existing.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic
+        && existing
+            .genesis
+            .as_ref()
+            .is_none_or(|g| incoming.genesis.as_ref() == Some(g))
+}
+
 /// D272: catch-up consent from the local roster, not from the snapshot.
 ///
 /// The sender is an active admin on the installed group, and that sender
@@ -1430,19 +1452,12 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         // reads "new group" and the install proceeds against the wrong record.
         match crate::server::resolve_group_entry_locked(&groups, &group_id).map(|(_, info)| info) {
             Some(installed) => {
-                // An explicit local open-join may upgrade a non-member
-                // OpenJoin card stub directly to the authority-committed
-                // member snapshot (never replacing an active, banned, or
-                // withdrawn local record).
-                let replaceable_open_join_stub = open_join_consent
-                    && !installed.withdrawn
-                    && !installed.has_active_member(&local_agent_hex)
-                    && !installed.is_banned(&local_agent_hex)
-                    && installed.invite_lineage.is_none()
-                    && installed.policy.admission == x0x::groups::GroupAdmission::OpenJoin
-                    && installed.policy.confidentiality
-                        == x0x::groups::GroupConfidentiality::SignedPublic;
-                if replaceable_open_join_stub {
+                if is_replaceable_open_join_stub(
+                    installed,
+                    &group,
+                    &local_agent_hex,
+                    open_join_consent,
+                ) {
                     None
                 } else {
                     Some((
@@ -1572,16 +1587,8 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
             crate::server::resolve_group_entry_locked(groups, &group_id)
                 .map(|(k, info)| (k.to_string(), info))
         {
-            // Only replace a true card-import stub with no membership entry
-            // for this agent (never overwrite Removed/Left/Banned/Active rows).
-            let replaceable_open_join_stub = open_join_consent
-                && !existing.withdrawn
-                && !existing.members_v2.contains_key(&local_agent_hex)
-                && existing.invite_lineage.is_none()
-                && existing.policy.admission == x0x::groups::GroupAdmission::OpenJoin
-                && existing.policy.confidentiality
-                    == x0x::groups::GroupConfidentiality::SignedPublic;
-            if !replaceable_open_join_stub {
+            if !is_replaceable_open_join_stub(existing, &group, &local_agent_hex, open_join_consent)
+            {
                 return false;
             }
             if existing_key != group_id {

@@ -626,4 +626,174 @@ fn gui_spaces_community_hardening_invariants() {
         html.contains("function nagBindRosterHandlers(panel,gid)"),
         "Roster re-renders must bind only the replaced roster panel, never host-wide admin buttons"
     );
+    assert!(
+        html.contains("function isCanonicalMsgId(id)")
+            && html.contains("function upgradeSignedPublicMsgId(")
+            && html.contains("function scheduleSignedPublicBackfill("),
+        "SignedPublic live messages must gate Thread on canonical 64-hex msg_id and upgrade via REST backfill"
+    );
+    assert!(
+        html.contains("chatHistory[chatKey]._pagedOlder=true"),
+        "Backward pagination past 1,000 messages must preserve both older pages and the live tail"
+    );
+    assert!(
+        html.contains("api('/groups/'+encSeg(data.groupId)+'/join-status')"),
+        "Space detail join-status path must encode groupId"
+    );
+}
+
+/// Offline Node behavior test for SignedPublic live msg_id upgrade, backward
+/// pagination past 1,000 entries, and exhausted-history cursor preservation.
+#[test]
+fn gui_signed_public_live_msg_id_upgrade_and_backward_pagination_behavior() {
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(r#"const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const html=fs.readFileSync(process.env.X0X_GUI_HTML_PATH,'utf8');
+const start=html.indexOf('let signedPublicPollTimer=null;');
+const end=html.indexOf('// --- Space: Board ---',start);
+assert(start>=0&&end>start,'SignedPublic chat section exists');
+const source=html.slice(start,end);
+
+function makeElem(tag){
+  const el={
+    tagName:tag.toUpperCase(),
+    id:'',
+    className:'',
+    innerHTML:'',
+    children:[],
+    parentNode:null,
+    scrollHeight:100,
+    scrollTop:0,
+    appendChild(child){child.parentNode=this;this.children.push(child);return child},
+    replaceWith(next){
+      if(!this.parentNode)return;
+      const idx=this.parentNode.children.indexOf(this);
+      if(idx>=0){next.parentNode=this.parentNode;this.parentNode.children[idx]=next}
+    },
+    get firstChild(){return this.children[0]||null},
+  };
+  return el;
+}
+
+(async()=>{
+  const stateMap=new Map([['agentId','aa'.repeat(32)],['view','space'],['spaceId','g1'],['spaceApp','chat']]);
+  const chatMsgsEl=makeElem('div');
+  chatMsgsEl.id='chat-msgs';
+  const lsStore=new Map();
+  let apiQueue=[];
+  const ctx=vm.createContext({
+    S:{get:k=>stateMap.get(k),set:(k,v)=>stateMap.set(k,v)},
+    LS:{get:(k,d)=>lsStore.has(k)?lsStore.get(k):d,set:(k,v)=>lsStore.set(k,v)},
+    currentSpaceConfidentiality:'signed_public',
+    signedPublicPagination:{},
+    chatHistory:{},
+    msgCache:{},
+    threadReplies:{},
+    threadCache:{},
+    deletedMsgs:{},
+    editedMsgs:{},
+    EMOJI_QUICK:['👍'],
+    encSeg:s=>encodeURIComponent(String(s)),
+    esc:s=>String(s),
+    escJs:s=>String(s),
+    renderMd:s=>String(s),
+    fmtTime:()=>'12:00',
+    short:s=>String(s).slice(0,8),
+    getContactTrust:()=>'',
+    getReactions:()=>({}),
+    isSafeReactionEmoji:()=>true,
+    resolveSpaceSenderName:(_sid,aid)=>aid.slice(0,8),
+    getChatKeyFromContext:()=>'g1_general',
+    cacheMsg(m){if(m&&m.id)ctx.msgCache[m.id]=m},
+    updateLoadOlderBar(){},
+    renderSidebar(){},
+    toast(msg){throw new Error('unexpected toast: '+msg)},
+    apiError:r=>(r&&r.error)||'err',
+    setTimeout,clearTimeout,
+    document:{
+      createElement:makeElem,
+      getElementById(id){
+        if(id==='chat-msgs')return chatMsgsEl;
+        return chatMsgsEl.children.find(c=>c.id===id)||null;
+      },
+    },
+    async api(path){
+      assert(apiQueue.length>0,'unexpected api call: '+path);
+      return apiQueue.shift()(path);
+    },
+  });
+  vm.runInContext(source,ctx);
+  const {signedPublicSeen,signedPublicIdByKey}=vm.runInContext('({signedPublicSeen,signedPublicIdByKey})',ctx);
+
+  // 1. WS message arrives without msg_id: gets temporary colon id and NO Thread button.
+  const rawWs={author_agent_id:'bb'.repeat(32),timestamp:5000,signature:'abcdef1234567890',body:'hello live'};
+  const normWs=ctx.normalizeSignedPublicMsg('g1',rawWs);
+  assert(!ctx.isCanonicalMsgId(normWs.msg.id),'WS fallback id is not 64-hex');
+  signedPublicSeen.add(normWs.dedupKey);
+  signedPublicIdByKey.set(normWs.dedupKey,normWs.msg.id);
+  ctx.addChatMsg('g1_general',normWs.msg);
+  assert.equal(chatMsgsEl.children.length,1);
+  assert(!chatMsgsEl.children[0].innerHTML.includes('openThreadById'),'Thread button hidden before canonical msg_id');
+
+  // 2. REST poll returns the same message with canonical 64-hex msg_id: upgrades in place.
+  const canonicalId='0123456789abcdef'.repeat(4);
+  apiQueue.push(()=>({ok:true,messages:[{...rawWs,msg_id:canonicalId}],has_more:false,next_before:null}));
+  await ctx.signedPublicPoll('g1',true);
+  assert.equal(ctx.chatHistory['g1_general'][0].id,canonicalId,'chatHistory id upgraded');
+  assert.equal(ctx.msgCache[canonicalId].text,'hello live','msgCache upgraded');
+  assert.equal(chatMsgsEl.children[0].id,'msg-'+canonicalId,'DOM id upgraded');
+  assert(chatMsgsEl.children[0].innerHTML.includes("openThreadById('g1','"+canonicalId+"')"),'Thread button enabled with canonical 64-hex id');
+
+  // 3. Backward pagination past 1,000 entries preserves both the newly loaded older page AND the live tail + LS cache.
+  ctx.chatHistory['g1_general']=Array.from({length:1000},(_,i)=>({
+    id:String(i+1000).padStart(64,'0'),
+    text:'recent-'+i,
+    sender_id:'bb'.repeat(32),
+    sender_name:'bob',
+    timestamp:20000+i,
+    signed_public:true,
+  }));
+  ctx.signedPublicPagination['g1']={hasMore:true,nextBefore:20000,loading:false,exhausted:false};
+  const olderId='fedcba9876543210'.repeat(4);
+  apiQueue.push(path=>{
+    assert(path.includes('before=20000'),'requests cursor 20000');
+    return {ok:true,messages:[{author_agent_id:'cc'.repeat(32),timestamp:1000,signature:'oldsig123456',body:'very-old',msg_id:olderId}],has_more:false,next_before:null};
+  });
+  await ctx.loadOlderSignedPublicMessages('g1');
+  assert.equal(ctx.chatHistory['g1_general'].length,1001,'grows past 1000 without dropping live tail');
+  assert.equal(ctx.chatHistory['g1_general'][0].id,olderId,'older page kept at index 0');
+  assert.equal(ctx.chatHistory['g1_general'][1000].text,'recent-999','live tail preserved');
+  assert.equal(lsStore.get('chat_g1_general').length,200,'LS keeps 200 newest');
+  assert.equal(lsStore.get('chat_g1_general')[199].text,'recent-999','LS tail stays newest message');
+  assert.equal(ctx.signedPublicPagination['g1'].hasMore,false,'hasMore cleared');
+  assert.equal(ctx.signedPublicPagination['g1'].exhausted,true,'marked exhausted');
+
+  // 4. Live message arriving after backward pagination appends without evicting older page or corrupting LS.
+  const liveAfterId='abcdef0123456789'.repeat(4);
+  ctx.addChatMsg('g1_general',{id:liveAfterId,text:'brand-new',sender_id:'dd'.repeat(32),sender_name:'dave',timestamp:99999,signed_public:true});
+  assert.equal(ctx.chatHistory['g1_general'].length,1002,'live message appended');
+  assert.equal(ctx.chatHistory['g1_general'][0].id,olderId,'older page still present after live message');
+  assert.equal(ctx.chatHistory['g1_general'][1001].id,liveAfterId,'live message at tail');
+  assert.equal(lsStore.get('chat_g1_general')[199].id,liveAfterId,'LS tail updated to newest live message');
+
+  // 5. Subsequent poll must NOT resurrect hasMore after history is exhausted.
+  apiQueue.push(()=>({ok:true,messages:[],has_more:true,next_before:15000}));
+  await ctx.signedPublicPoll('g1',false);
+  assert.equal(ctx.signedPublicPagination['g1'].hasMore,false,'exhausted stays false across polls');
+  console.log('ALL SIGNED PUBLIC GUI CHECKS PASSED');
+})();
+"#)
+        .env(
+            "X0X_GUI_HTML_PATH",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/gui/x0x-gui.html"),
+        )
+        .output()
+        .expect("Node is required for the offline GUI behavior check");
+    assert!(
+        output.status.success(),
+        "SignedPublic GUI behavior check failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }

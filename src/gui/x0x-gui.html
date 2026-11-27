@@ -1527,8 +1527,12 @@ async function loadSignedPublicThreadReplies(spaceId,threadRoot){
   if(!r||!r.ok||!Array.isArray(r.messages))return;
   for(const m of r.messages){
     const {dedupKey,msg}=normalizeSignedPublicMsg(spaceId,m);
-    if(signedPublicSeen.has(dedupKey))continue;
+    if(signedPublicSeen.has(dedupKey)){
+      upgradeSignedPublicMsgId(spaceId,spaceId+'_general',dedupKey,msg);
+      continue;
+    }
     signedPublicSeen.add(dedupKey);
+    signedPublicIdByKey.set(dedupKey,msg.id);
     if(msg.id===threadRoot&&!msg.thread_root)continue;
     addThreadReply(threadRoot,{...msg,thread_root:threadRoot});
   }
@@ -2665,10 +2669,12 @@ async function mountSpace(){
   }
   renderSidebar();
   if(signedPublicPollTimer){clearInterval(signedPublicPollTimer);signedPublicPollTimer=null}
+  if(signedPublicBackfillTimer){clearTimeout(signedPublicBackfillTimer);signedPublicBackfillTimer=null}
   if(signedPublicTopic){wsUnsub(signedPublicTopic);signedPublicTopic=''}
   signedPublicSeen.clear();
+  signedPublicIdByKey.clear();
   if(currentSpaceConfidentiality==='signed_public'){
-    const st=await api('/groups/'+sid+'/state');
+    const st=await api('/groups/'+encSeg(sid)+'/state');
     if(stale())return;
     if(st&&st.ok&&st.group_id){
       signedPublicTopic='x0x.groups.public.'+st.group_id;
@@ -2847,10 +2853,63 @@ async function sendSpaceChatSignedPublic(sid,text,inp){
 }
 
 let signedPublicPollTimer=null;
+let signedPublicBackfillTimer=null;
 let signedPublicTopic='';
 let spaceMountGen=0;
 let signedPublicSpaceId='';
 const signedPublicSeen=new Set();
+const signedPublicIdByKey=new Map();
+
+function isCanonicalMsgId(id){
+  return typeof id==='string'&&/^[0-9a-f]{64}$/.test(id);
+}
+
+function scheduleSignedPublicBackfill(sid){
+  if(!sid||signedPublicBackfillTimer)return;
+  signedPublicBackfillTimer=setTimeout(()=>{
+    signedPublicBackfillTimer=null;
+    if(S.get('view')==='space'&&S.get('spaceId')===sid&&currentSpaceConfidentiality==='signed_public'){
+      signedPublicPoll(sid,true);
+    }
+  },250);
+}
+
+function upgradeSignedPublicMsgId(sid,chatKey,dedupKey,canonicalMsg){
+  if(!canonicalMsg||!isCanonicalMsgId(canonicalMsg.id))return false;
+  const prevId=signedPublicIdByKey.get(dedupKey);
+  if(!prevId||prevId===canonicalMsg.id)return false;
+  signedPublicIdByKey.set(dedupKey,canonicalMsg.id);
+  const existing=msgCache[prevId];
+  delete msgCache[prevId];
+  const updated=existing?Object.assign(existing,{id:canonicalMsg.id}):canonicalMsg;
+  cacheMsg(updated);
+  const hist=chatHistory[chatKey];
+  if(Array.isArray(hist)){
+    for(let i=0;i<hist.length;i++){
+      if(hist[i]&&hist[i].id===prevId){
+        hist[i].id=canonicalMsg.id;
+        cacheMsg(hist[i]);
+      }
+    }
+    LS.set('chat_'+chatKey,hist.slice(-200));
+  }
+  if(canonicalMsg.thread_root&&Array.isArray(threadReplies[canonicalMsg.thread_root])){
+    const reps=threadReplies[canonicalMsg.thread_root];
+    for(let i=0;i<reps.length;i++){
+      if(reps[i]&&reps[i].id===prevId)reps[i].id=canonicalMsg.id;
+    }
+  }
+  if(S.get('detailType')==='thread'&&S.get('threadId')===prevId){
+    S.set('threadId',canonicalMsg.id);
+  }
+  const oldEl=document.getElementById('msg-'+prevId);
+  if(oldEl&&oldEl.parentNode){
+    const tmp=document.createElement('div');
+    appendChatMsg(tmp,updated,sid);
+    if(tmp.firstChild)oldEl.replaceWith(tmp.firstChild);
+  }
+  return true;
+}
 
 function normalizeSignedPublicMsg(sid,m){
   const myAid=S.get('agentId')||'';
@@ -2880,9 +2939,9 @@ async function signedPublicPoll(sid,force){
   const chatKey=sid+'_general';
   const prevPg=signedPublicPagination[sid];
   if(!prevPg){
-    signedPublicPagination[sid]={hasMore:!!r.has_more,nextBefore:r.next_before||null,loading:false};
-  }else{
-    // Preserve an already-walked older cursor; only extend earlier or reflect hasMore when still at page 1.
+    signedPublicPagination[sid]={hasMore:!!r.has_more,nextBefore:r.next_before||null,loading:false,exhausted:!r.has_more};
+  }else if(!prevPg.exhausted){
+    // Preserve an already-walked older cursor; never resurrect Load Older once exhausted.
     if(r.next_before&&(prevPg.nextBefore===null||r.next_before<prevPg.nextBefore)){
       prevPg.nextBefore=r.next_before;
     }
@@ -2891,8 +2950,12 @@ async function signedPublicPoll(sid,force){
   let appended=false;
   for(const m of r.messages){
     const {dedupKey,msg}=normalizeSignedPublicMsg(sid,m);
-    if(signedPublicSeen.has(dedupKey))continue;
+    if(signedPublicSeen.has(dedupKey)){
+      upgradeSignedPublicMsgId(sid,chatKey,dedupKey,msg);
+      continue;
+    }
     signedPublicSeen.add(dedupKey);
+    signedPublicIdByKey.set(dedupKey,msg.id);
     if(msg.thread_root){
       addThreadReply(msg.thread_root,msg);
     }else{
@@ -2903,7 +2966,11 @@ async function signedPublicPoll(sid,force){
   updateLoadOlderBar(sid);
   if(signedPublicSeen.size>5000){
     const it=signedPublicSeen.values();
-    for(let i=0;i<1000;i++)signedPublicSeen.delete(it.next().value);
+    for(let i=0;i<1000;i++){
+      const k=it.next().value;
+      signedPublicSeen.delete(k);
+      signedPublicIdByKey.delete(k);
+    }
   }
   return appended;
 }
@@ -2921,13 +2988,18 @@ async function loadOlderSignedPublicMessages(sid){
     }
     pg.hasMore=!!r.has_more;
     pg.nextBefore=r.next_before||null;
+    if(!pg.hasMore)pg.exhausted=true;
     const chatKey=sid+'_general';
     if(!chatHistory[chatKey])chatHistory[chatKey]=[];
     const older=[];
     for(const m of r.messages){
       const {dedupKey,msg}=normalizeSignedPublicMsg(sid,m);
-      if(signedPublicSeen.has(dedupKey))continue;
+      if(signedPublicSeen.has(dedupKey)){
+        upgradeSignedPublicMsgId(sid,chatKey,dedupKey,msg);
+        continue;
+      }
       signedPublicSeen.add(dedupKey);
+      signedPublicIdByKey.set(dedupKey,msg.id);
       cacheMsg(msg);
       if(msg.thread_root){
         addThreadReply(msg.thread_root,msg);
@@ -2939,7 +3011,7 @@ async function loadOlderSignedPublicMessages(sid){
     older.sort((a,b)=>(a.timestamp||0)-(b.timestamp||0));
     if(older.length){
       chatHistory[chatKey]=older.concat(chatHistory[chatKey]);
-      if(chatHistory[chatKey].length>1000)chatHistory[chatKey]=chatHistory[chatKey].slice(-1000);
+      chatHistory[chatKey]._pagedOlder=true;
       LS.set('chat_'+chatKey,chatHistory[chatKey].slice(-200));
       const msgsEl=document.getElementById('chat-msgs');
       if(msgsEl&&S.get('view')==='space'&&S.get('spaceId')===sid&&S.get('spaceApp')==='chat'){
@@ -2968,7 +3040,8 @@ function addChatMsg(chatKey,msg){
   if(msg.thread_root&&!msg.broadcast)return;
   if(!chatHistory[chatKey])chatHistory[chatKey]=[];
   chatHistory[chatKey].push(msg);
-  if(chatHistory[chatKey].length>1000)chatHistory[chatKey].splice(0,chatHistory[chatKey].length-1000);
+  const maxHist=chatHistory[chatKey]._pagedOlder?10000:1000;
+  if(chatHistory[chatKey].length>maxHist)chatHistory[chatKey].splice(0,chatHistory[chatKey].length-maxHist);
   LS.set('chat_'+chatKey,chatHistory[chatKey].slice(-200));
   const sid=S.get('spaceId');
   const chan=currentSpaceConfidentiality==='signed_public'?'general':(S.get('channel')||'general');
@@ -3025,9 +3098,9 @@ function appendChatMsg(container,m,spaceId){
   const isEdited=!isSignedPub&&editedMsgs[chatKey]&&editedMsgs[chatKey][msgId];
   const bodyText=isDeleted?'<em>This message was deleted</em>':renderMd(m.text||'')+(isEdited?'<span class="edited-tag">(edited)</span>':'');
   const quoteHtml=m.quote_id&&m.quote_text?'<div class="msg-quote" onclick="scrollToMsg(\''+escJs(m.quote_id)+'\')"><div class="q-who">'+esc(m.quote_name||'')+'</div>'+esc(m.quote_text)+'</div>':'';
-  // SignedPublic messages are immutable authority-verified records: expose Thread only (no unsigned reactions/edit/delete/pin).
+  // SignedPublic messages are immutable authority-verified records: expose Thread only once the canonical 64-hex msg_id is known (no unsigned reactions/edit/delete/pin).
   const actionsHtml=msgId&&!isDeleted?(isSignedPub
-    ?(spaceId&&!m.thread_root?'<div class="msg-actions"><button title="Thread" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">💬</button></div>':'')
+    ?(spaceId&&!m.thread_root&&isCanonicalMsgId(msgId)?'<div class="msg-actions"><button title="Thread" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">💬</button></div>':'')
     :`<div class="msg-actions"><div class="quick-react">${EMOJI_QUICK.map(e=>'<button title="'+e+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(e)+'\')">'+e+'</button>').join('')}<button title="More emoji" onclick="showEmojiPickerForMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">+</button></div>`
       +(msgId&&spaceId?'<button title="Quote" onclick="setQuote(\''+escJs(msgId)+'\')">↩</button>':'')
       +(msgId&&spaceId?'<button title="Thread" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">💬</button>':'')
@@ -5979,6 +6052,10 @@ async function sendThreadReply(){
   const chan=isSignedPub?'general':(S.get('channel')||'general');
   if(!threadId||!spaceId)return;
   if(isSignedPub){
+    if(!isCanonicalMsgId(threadId)){
+      toast('Message ID is still syncing — retry in a moment','warn');
+      return;
+    }
     const r=await api('/groups/'+encSeg(spaceId)+'/send',{
       method:'POST',
       body:JSON.stringify({body:t,kind:'chat',thread_root:threadId})
@@ -6898,10 +6975,10 @@ function spaceOwnDisplayName(g,agentId){
 }
 
 async function renderSpaceDetail(el,data){
-  const g=await api('/groups/'+data.groupId);
+  const g=await api('/groups/'+encSeg(data.groupId));
   if(!g||!g.ok){el.innerHTML='<div class="detail-body" style="color:var(--tx3)">Space not found</div>';return}
   if(g.membership_state==='pending_authority_commit'){
-    const js=await api('/groups/'+data.groupId+'/join-status').catch(()=>null);
+    const js=await api('/groups/'+encSeg(data.groupId)+'/join-status').catch(()=>null);
     const cause=js&&js.pending_cause&&js.pending_cause.cause?('Cause: '+esc(js.pending_cause.cause)+(js.pending_cause.detail?' — '+esc(js.pending_cause.detail):'')):'';
     const outcome=js&&js.last_join_outcome&&js.last_join_outcome.outcome?('Last outcome: '+esc(js.last_join_outcome.outcome)+(js.last_join_outcome.reason?' ('+esc(js.last_join_outcome.reason)+')':'')):'';
     el.innerHTML=`<div class="detail-header"><h3>Waiting to join</h3><button class="detail-close" onclick="hideDetail()">&#10005;</button></div>
@@ -7271,10 +7348,14 @@ async function onGossipMessage(topic,origin,data){
     const {dedupKey,msg}=normalizeSignedPublicMsg(targetSid,data);
     if(!signedPublicSeen.has(dedupKey)){
       signedPublicSeen.add(dedupKey);
+      signedPublicIdByKey.set(dedupKey,msg.id);
       if(msg.thread_root){
         addThreadReply(msg.thread_root,msg);
       }else{
         addChatMsg(targetSid+'_general',msg);
+      }
+      if(!isCanonicalMsgId(msg.id)){
+        scheduleSignedPublicBackfill(targetSid);
       }
     }
     return;

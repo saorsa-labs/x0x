@@ -24868,9 +24868,7 @@ pub(in crate::server) async fn get_group_public_messages(
     } else {
         page_limit.saturating_add(1).min(500)
     };
-    let until_ms = query
-        .before
-        .and_then(|b| i64::try_from(b.saturating_sub(1)).ok());
+    let before_sent_ms = query.before.and_then(|b| i64::try_from(b).ok());
 
     // ADR-0023 §7: the durable store is the source of truth beyond the
     // in-memory hot tail — history survives a daemon restart. Store rows
@@ -24881,13 +24879,11 @@ pub(in crate::server) async fn get_group_public_messages(
             let store = std::sync::Arc::clone(history.store());
             let stable = stable_id.clone();
             let stored = tokio::task::spawn_blocking(move || {
-                let q = x0x::history::HistoryQuery {
-                    scope: Some(x0x::history::Scope::Group(stable)),
-                    until_ms,
-                    limit: store_query_limit,
-                    ..Default::default()
-                };
-                store.query(&q)
+                store.query_scope_by_sent_at(
+                    &x0x::history::Scope::Group(stable),
+                    before_sent_ms,
+                    store_query_limit,
+                )
             })
             .await;
             match stored {
@@ -24961,7 +24957,7 @@ pub(in crate::server) async fn get_group_public_messages(
         let keep_from = msgs.len() - page_limit;
         msgs.drain(..keep_from);
     }
-    let has_more = truncated || store_hit_cap;
+    let has_more = !msgs.is_empty() && (truncated || store_hit_cap);
     let next_before = if has_more {
         msgs.first().map(|m| m.timestamp)
     } else {
@@ -27759,6 +27755,13 @@ pub(in crate::server) async fn open_join_named_group(
                         "status": "already_member",
                         "group_id": info.stable_group_id(),
                     })),
+                );
+            }
+            if info.members_v2.contains_key(&local_hex) {
+                return api_error_with_reason(
+                    StatusCode::CONFLICT,
+                    "local group record holds a prior membership seat (removed/left); remove the local record before requesting open-join again",
+                    "open_join_prior_seat_present",
                 );
             }
             // Prefer a verified cached card's active-admin signer, then any
