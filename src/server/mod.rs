@@ -47,6 +47,9 @@ pub use update_check::run_update_check_and_report;
 mod w3h;
 #[cfg(all(test, tokio_unstable))]
 pub(crate) use w3h::counted_spawn_blocking;
+mod webhook;
+use webhook::webhooks_diagnostics;
+pub use webhook::{NotifyConfig, WebhookBodyMode, WebhookConfig};
 mod ws;
 
 #[cfg(test)]
@@ -57,6 +60,8 @@ mod issue1229_delivery;
 mod issue1288_ws_shutdown;
 #[cfg(test)]
 mod shutdown_regression;
+#[cfg(test)]
+mod webhook_tests;
 
 pub use config::{diagnose_section_placement, warn_section_misplacements, SectionMisplacement};
 use routes::named_groups::CAUSAL_APPROVAL_RETENTION_MS;
@@ -1433,6 +1438,7 @@ async fn serve_with_options_inner(
         connect_diagnostics,
         forward_service,
         socks_service,
+        webhook_service: webhook::WebhookService::new(&config.notify, &config.data_dir),
         owner_sync,
         names: Arc::new(
             x0x::names::NameStore::load(x0x::names::NameStore::path_in(&config.data_dir)).await,
@@ -2991,6 +2997,10 @@ async fn serve_with_options_inner(
         }));
     }
 
+    if let Some(ref webhooks) = state.webhook_service {
+        webhooks.start(Arc::clone(&state)).await;
+    }
+
     let app = build_api_router(&state);
 
     // Lifecycle: a CancellationToken drives library-initiated shutdown
@@ -3087,6 +3097,9 @@ async fn serve_with_options_inner(
         }
         if let Some(socks) = &state.socks_service {
             socks.shutdown_and_wait().await;
+        }
+        if let Some(webhooks) = &state.webhook_service {
+            webhooks.shutdown_and_wait().await;
         }
         // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
         //    Agent's shutdown token and close its tracked-task registry NOW,
@@ -3462,6 +3475,7 @@ fn build_api_router(state: &Arc<AppState>) -> Router {
             "/diagnostics/sidecar-quarantine",
             get(sidecar_quarantine_diagnostics),
         )
+        .route("/diagnostics/webhooks", get(webhooks_diagnostics))
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
         .route("/exec/sessions", get(exec_sessions))

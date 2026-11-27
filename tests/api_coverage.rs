@@ -232,6 +232,11 @@ const COVERED: &[CoveredEndpoint] = &[
         sidecar_quarantine_diagnostics_lists_each_copy_with_its_size
     ),
     covered!(
+        Get,
+        "/diagnostics/webhooks",
+        webhook_diagnostics_enforces_owner_auth_and_redacts_secrets
+    ),
+    covered!(
         Post,
         "/peers/:peer_id/probe",
         peer_probe_returns_finite_rtt_against_live_peer
@@ -762,6 +767,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/sidecar_quarantine.rs",
         include_str!("../src/server/routes/sidecar_quarantine.rs"),
+    ),
+    (
+        "src/server/webhook_tests.rs",
+        include_str!("../src/server/webhook_tests.rs"),
     ),
     (
         "tests/daemon_api_integration.rs",

@@ -25985,6 +25985,7 @@ async fn route_delegation_and_mentions(
             reason: reason.to_string(),
             mentions: msg.mentions.clone(),
             timestamp: msg.timestamp,
+            body: Some(msg.body.clone()),
         };
         crate::server::ws::emit_mention_event(state, frame).await;
     }
@@ -57807,6 +57808,7 @@ pub(in crate::server) mod tests {
             )),
             forward_service: None,
             socks_service: None,
+            webhook_service: None,
             owner_sync,
             names: Arc::new(
                 x0x::names::NameStore::load(x0x::names::NameStore::path_in(data_dir)).await,

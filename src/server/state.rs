@@ -546,6 +546,10 @@ pub struct DaemonConfig {
     /// and `X0X_GUI_IDLE_TIMEOUT_MINUTES`.
     #[serde(default = "default_gui_idle_timeout_minutes")]
     pub gui_idle_timeout_minutes: u64,
+
+    /// Opt-in outbound notification sinks (`[[notify.webhook]]`).
+    #[serde(default)]
+    pub notify: super::webhook::NotifyConfig,
 }
 
 /// WebSocket session tuning (`[ws]` in the daemon TOML).
@@ -866,6 +870,7 @@ impl Default for DaemonConfig {
             api_watchdog: super::ApiWatchdogConfig::default(),
             gui_show: x0x::gui::GuiShowConfig::default(),
             gui_idle_timeout_minutes: default_gui_idle_timeout_minutes(),
+            notify: super::webhook::NotifyConfig::default(),
         }
     }
 }
@@ -1520,6 +1525,8 @@ pub(super) struct AppState {
     /// ADR-0074 §3 SOCKS5 listener. `None` when `[socks] listen` is unset
     /// or connect/forward is disabled (SOCKS needs ForwardV2).
     pub(super) socks_service: Option<x0x::socks::SocksService>,
+    /// Opt-in outbound webhook push service (`[[notify.webhook]]`).
+    pub(super) webhook_service: Option<Arc<super::webhook::WebhookService>>,
     /// ADR-0041 Tier-1 owner-state sync service: owns the `SyncV1` stream
     /// acceptor, the owner device set, and the winning versioned records.
     /// `None` when the install has no owner key (ownerless installs sync

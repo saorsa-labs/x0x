@@ -862,6 +862,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/webhooks",
+        cli_name: "diagnostics webhooks",
+        description: "Outbound webhook push status, secret presence flags, and delivery counters (durable owner only)",
+        category: "network",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/peers/:peer_id/probe",
         cli_name: "peer probe",

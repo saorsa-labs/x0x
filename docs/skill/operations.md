@@ -39,7 +39,7 @@ The daemon REST surface owns installation and restart (governed by daemon config
 ### 7.3 Diagnostics
 
 ```bash
-x0x diagnostics <area>              # connectivity|ack|gossip|transport|relay|dm|groups|history|connect|ws|sidecar-quarantine|exec
+x0x diagnostics <area>              # connectivity|ack|gossip|transport|relay|dm|groups|history|connect|ws|sidecar-quarantine|exec|webhooks
 x0x peer probe|health|events        # per-peer liveness, health snapshot, SSE lifecycle
 x0x network status                  # NAT type, external addrs, direct capability
 ```
@@ -115,23 +115,12 @@ identity_ttl_secs = 900               # expire stale discoveries
 rendezvous_enabled = true             # global findability
 network_id = "x0x.prod"               # gossip plane isolation ("" = open)
 port_mapping_enabled = true           # UPnP IGD mapping
-mdns_enabled = true                   # ant-quic LAN discovery + auto-connect.
-                                      # false = hermetic (no LAN advertise/browse);
-                                      # network_id only NAMESPACES mDNS, it does not
-                                      # disable it. Test fixtures set false.
+mdns_enabled = true                   # LAN discovery (false = hermetic; test fixtures set false)
 observed_prefix_enabled = false       # masked origin prefix on DM surfaces
-# relay_service_enabled = false       # serve MASQUE relay sessions; unset = on for
-#                                     # Full (seed, UDP/443, managed, --relay or
-#                                     # gossip.relay = true), off for Leaf
-# identity_dir = "/srv/x0x/identity"  # keep ALL identity material (machine.key, agent.key, agent.cert,
-#                                     # and the opt-in user.key lookup) out of ~/.x0x — with this set the
-#                                     # daemon never falls back to ~/.x0x (the embedding storage boundary)
-# user_key_path = "/srv/x0x/user.key" # explicit owner key file (opt-in; never auto-generated).
-#                                     # Overrides <identity_dir>/user.key when both are set
-# zero_peer_restart_secs = 600        # TOP-LEVEL KEY (keep it ABOVE the first [section] or it
-#                                     # lands in the wrong table!). SUPERVISOR-ONLY (systemd
-#                                     # Restart=always): exit at zero peers so the supervisor
-#                                     # restarts us. Default OFF; unsupervised, it just dies.
+# relay_service_enabled = false       # MASQUE relay; unset = on for Full, off for Leaf
+# identity_dir = "/srv/x0x/identity"  # relocate all identity material (no ~/.x0x fallback)
+# user_key_path = "/srv/x0x/user.key" # explicit owner key path (overrides identity_dir)
+# zero_peer_restart_secs = 600        # top-level only; supervisor-only exit at zero peers (off)
 
 [update]                              # daemon self-update (the CLI updater is separate — §7.2)
 enabled = true
@@ -149,10 +138,19 @@ candidates = []                       # relay-candidate hex agent ids
 ceremony_enabled = false
 
 [groups]                              # ADR-0064 owner-mandate enforcement
-mandate_grace_days = 60               # grace before a recorded-capable authority's mandate-less
-                                      # MemberAdded is refused (owner_mandate_missing). Default 60
-                                      # (one release cycle); validated >= 1 — x0xd refuses to start on 0.
+mandate_grace_days = 60               # >= 1 (0 refuses startup)
 
+# [[notify.webhook]]                  # opt-in signed HTTPS push (off when omitted)
+# name = "alerts"                     # unique sink name
+# url = "https://example.com/hook"    # https only; redirects off; SSRF IP-checked
+# allowed_hosts = ["example.com"]     # optional host allowlist
+# bearer_token_file = "/path/0600"    # optional 0600 Authorization: Bearer file
+# signing_secret_file = "/path/0600"  # optional 0600 X-X0x-Signature HMAC file
+# events = ["dm", "mention", "group:<gid>", "topic:<t>"]
+# dm_allowlist = ["<64-hex>"]         # empty = all verified DMs in fast lane
+# fast_window_ms = 5000               # batch_window_ms = 60000
+# max_per_hour = 6                    # max_per_day = 60
+# body_mode = "full"                  # or "metadata"; max_text_chars = 2000
 ```
 
 ```

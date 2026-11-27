@@ -802,6 +802,7 @@ const SERVER_SOURCES: &[&str] = &[
     // ADR 0083: handler lives here; `GuiShowRequest` lives in src/gui/show.rs.
     "src/server/routes/gui_show.rs",
     "src/gui/show.rs",
+    "src/server/webhook.rs",
 ];
 
 /// How a handler consumes request data, from its extractor signature.

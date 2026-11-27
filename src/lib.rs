@@ -8997,6 +8997,11 @@ impl Agent {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn direct_messaging_for_test(&self) -> &std::sync::Arc<direct::DirectMessaging> {
+        &self.direct_messaging
+    }
+
     /// Record a `fan_out == 0` group publish and return whether to `warn!`.
     ///
     /// Increments `publish_zero_fanout` (surfaced as

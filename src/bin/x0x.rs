@@ -1148,6 +1148,8 @@ enum DiagnosticsSub {
     Ws,
     /// Print each quarantined sidecar copy with its size (read-only, D148).
     SidecarQuarantine,
+    /// Print outbound webhook push status and delivery counters (durable owner only).
+    Webhooks,
     /// Print durable-history writer/reaper counters (ADR-0023).
     History,
 }
@@ -2910,6 +2912,7 @@ async fn run(
             DiagnosticsSub::SidecarQuarantine => {
                 commands::network::diagnostics_sidecar_quarantine(&client).await
             }
+            DiagnosticsSub::Webhooks => commands::network::diagnostics_webhooks(&client).await,
             DiagnosticsSub::History => commands::history::diagnostics(&client).await,
         },
         Commands::History { sub } => match sub {

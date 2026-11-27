@@ -2670,6 +2670,9 @@ fn render_gui_html() -> String {
 /// other topic frames: a lagging subscriber is dropped by the broadcast
 /// channel, never blocks ingest.
 pub(super) async fn emit_mention_event(state: &AppState, frame: MentionFrame) {
+    if let Some(ref webhook) = state.webhook_service {
+        webhook.try_send_mention(&frame);
+    }
     // ADR-0066 §3d (row 25): the annotation is resolved HERE, at emit time,
     // and BEFORE the `ws_topics` read-lock — so the two locks are never
     // nested, and every subscriber of the group's channel receives the same
@@ -2700,6 +2703,7 @@ pub(super) struct MentionFrame {
     pub(super) reason: String,
     pub(super) mentions: Vec<String>,
     pub(super) timestamp: u64,
+    pub(super) body: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4281,6 +4285,7 @@ mod tests {
                 reason: "mention".to_string(),
                 mentions: vec!["cc".repeat(32)],
                 timestamp: 1_788_091_400_000,
+                body: None,
             },
         )
         .await;
