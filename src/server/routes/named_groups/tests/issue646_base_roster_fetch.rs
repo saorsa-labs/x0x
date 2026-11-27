@@ -14,7 +14,8 @@
 use super::*;
 
 use crate::groups::invite::{
-    INVITE_VERSION_V4, INVITE_VERSION_V6, MAX_FETCHED_BASE_ROSTER_ENTRIES,
+    INVITE_VERSION_V4, INVITE_VERSION_V6, MAX_CHUNKED_BASE_ROSTER_ENTRIES,
+    MAX_FETCHED_BASE_ROSTER_ENTRIES,
 };
 use crate::groups::state_commit::{
     roster_projection_digest_only, roster_root_of_projection, RosterMemberSnapshot,
@@ -142,13 +143,24 @@ async fn over_cap_mint_is_v6_content_addressed_within_budget() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("128-member mint failed: {e:?}"))?;
     assert_eq!(fetch_cap_invite.version, INVITE_VERSION_V6);
 
-    // Past the FETCH cap the mint refuses with the typed size refusal.
+    // Past the chunked FETCH cap (1024) the mint refuses with the typed size refusal.
+    let chunked_cap_id = format!("cf01{}", "00".repeat(30));
+    let chunked_cap = seed_group_with_members(
+        &authority,
+        &chunked_cap_id,
+        MAX_CHUNKED_BASE_ROSTER_ENTRIES - 1,
+    )
+    .await; // +creator = 1024
+    let (chunked_cap_invite, _) = assemble_signed_v4_invite(&authority, &chunked_cap, 3_600, None)
+        .map_err(|e| anyhow::anyhow!("chunked-cap mint failed: {e:?}"))?;
+    assert_eq!(chunked_cap_invite.version, INVITE_VERSION_V6);
+
     let huge_id = "cc".repeat(32);
-    let huge = seed_group_with_members(&authority, &huge_id, MAX_FETCHED_BASE_ROSTER_ENTRIES).await;
+    let huge = seed_group_with_members(&authority, &huge_id, MAX_CHUNKED_BASE_ROSTER_ENTRIES).await;
     match assemble_signed_v4_invite(&authority, &huge, 3_600, None) {
         Err(MintInviteError::TooLarge { field, size }) => {
             assert_eq!(field, "base_roster");
-            assert_eq!(size, MAX_FETCHED_BASE_ROSTER_ENTRIES + 1);
+            assert_eq!(size, MAX_CHUNKED_BASE_ROSTER_ENTRIES + 1);
         }
         other => panic!("expected TooLarge(base_roster), got {other:?}"),
     }
@@ -985,6 +997,7 @@ async fn dispatch_drops_base_roster_fetch_from_mismatched_sender() -> Result<()>
         member_agent_id: member_hex.clone(),
         roster_root: live_root.clone(),
         secret_hash: secret_hash.clone(),
+        accepts_chunks: true,
     };
 
     // Mismatched sender: consumed, nothing admitted.
@@ -1004,6 +1017,7 @@ async fn dispatch_drops_base_roster_fetch_from_mismatched_sender() -> Result<()>
         member_agent_id: member_hex.clone(),
         roster_root: "00".repeat(32),
         secret_hash: "11".repeat(32),
+        accepts_chunks: true,
     };
     assert!(dispatch_join_result_message(&inviter, &member, true, unauthorized).await);
     assert_eq!(inviter.join_result_fetch_admission.in_flight(), 0);
@@ -1030,6 +1044,7 @@ async fn dispatch_drops_base_roster_fetch_from_mismatched_sender() -> Result<()>
         member_agent_id: second_hex,
         roster_root: live_root.clone(),
         secret_hash: secret_hash.clone(),
+        accepts_chunks: true,
     };
     assert!(dispatch_join_result_message(&inviter, &second, true, second_fetch).await);
     assert_eq!(
@@ -1532,5 +1547,302 @@ async fn already_pending_v6_rejoin_answers_without_a_fetch() -> Result<()> {
         base_roster_fetch::preseeded_projection_untouched_for_test(&stable_group_id, &signed_root),
         "an already-pending re-join must not fetch"
     );
+    Ok(())
+}
+
+/// Chunked v6 base-roster delivery reassembles out-of-order chunks above 128
+/// entries, verifies the signed root, rejects unrequested chunks without
+/// buffering, and rejects tampered chunks.
+#[tokio::test]
+async fn chunked_base_roster_reassembles_and_verifies_root() -> Result<()> {
+    let (joiner, _dir) = daemon_state().await?;
+    let group_id = "ef".repeat(32);
+    let inviter = AgentId([42u8; 32]);
+    let full: BTreeMap<String, RosterMemberSnapshot> = (0..200usize)
+        .map(|i| {
+            (
+                format!("{i:064x}"),
+                RosterMemberSnapshot {
+                    role: if i == 0 {
+                        x0x::groups::GroupRole::Admin
+                    } else {
+                        x0x::groups::GroupRole::Member
+                    },
+                    state: x0x::groups::GroupMemberState::Active,
+                    treekem_key_package_hash: None,
+                    certificate_digest: None,
+                    certificate: None,
+                },
+            )
+        })
+        .collect();
+    let root = roster_root_of_projection(&full);
+    let items: Vec<_> = full.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let chunk0: BTreeMap<_, _> = items[..128].iter().cloned().collect();
+    let chunk1: BTreeMap<_, _> = items[128..].iter().cloned().collect();
+
+    // Unrequested chunk is dropped and allocates no buffer.
+    base_roster_fetch::deliver_base_roster_chunk(
+        &joiner, &inviter, &group_id, &root, 0, 2, &chunk0,
+    );
+    assert!(joiner
+        .base_roster_chunk_buffers
+        .lock()
+        .expect("buffers")
+        .is_empty());
+
+    // Park a waiter and deliver chunks out of order (chunk 1 then chunk 0).
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    joiner
+        .base_roster_fetch_slots
+        .lock()
+        .expect("slots")
+        .insert(
+            format!("{group_id}|{root}"),
+            vec![base_roster_fetch::BaseRosterWaiter::for_test(
+                inviter, sender,
+            )],
+        );
+    base_roster_fetch::deliver_base_roster_chunk(
+        &joiner, &inviter, &group_id, &root, 1, 2, &chunk1,
+    );
+    base_roster_fetch::deliver_base_roster_chunk(
+        &joiner, &inviter, &group_id, &root, 0, 2, &chunk0,
+    );
+    let reply = receiver.await.expect("chunked reply wakes waiter");
+    assert_eq!(reply, base_roster_fetch::BaseRosterFetchReply::Served(full));
+    assert!(joiner
+        .base_roster_chunk_buffers
+        .lock()
+        .expect("buffers")
+        .is_empty());
+    Ok(())
+}
+
+/// Creating a named group with discovery tags normalizes them into the stored
+/// group info and signed card, and rejects oversize tags.
+#[tokio::test]
+async fn create_group_normalizes_and_validates_tags() -> Result<()> {
+    let (state, _dir) = daemon_state().await?;
+    let resp = create_named_group(
+        State(Arc::clone(&state)),
+        Json(CreateGroupRequest {
+            name: "Community".to_string(),
+            description: "Large public space".to_string(),
+            display_name: None,
+            preset: Some("public_open".to_string()),
+            policy: None,
+            tags: vec![
+                " #Rust ".to_string(),
+                "p2p".to_string(),
+                "rust".to_string(),
+                "".to_string(),
+            ],
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(resp).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let gid = body["group_id"].as_str().expect("group_id");
+    let info = state
+        .named_groups
+        .read()
+        .await
+        .get(gid)
+        .cloned()
+        .expect("stored");
+    assert_eq!(info.tags, vec!["rust".to_string(), "p2p".to_string()]);
+
+    let bad = create_named_group(
+        State(Arc::clone(&state)),
+        Json(CreateGroupRequest {
+            name: "BadTag".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: Some("public_open".to_string()),
+            policy: None,
+            tags: vec!["x".repeat(x0x::groups::invite::INVITE_MAX_TAG_LEN + 1)],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+/// Authority-side `handle_open_join_request` admits a non-banned requester onto
+/// an `OpenJoin` + `SignedPublic` group via a standard `MemberAdded` commit and
+/// rejects banned or non-open-join groups.
+#[tokio::test]
+async fn open_join_authority_commits_member_added_and_rejects_banned() -> Result<()> {
+    let (authority, _dir) = daemon_state().await?;
+    let resp = create_named_group(
+        State(Arc::clone(&authority)),
+        Json(CreateGroupRequest {
+            name: "OpenCommunity".to_string(),
+            description: String::new(),
+            display_name: Some("Founder".to_string()),
+            preset: Some("public_open".to_string()),
+            policy: None,
+            tags: vec!["community".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(resp).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let gid = body["group_id"].as_str().expect("group_id").to_string();
+
+    let joiner_id = AgentId([77u8; 32]);
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    handle_open_join_request(
+        Arc::clone(&authority),
+        joiner_id,
+        gid.clone(),
+        Some("Alice".to_string()),
+    )
+    .await;
+    let info = authority
+        .named_groups
+        .read()
+        .await
+        .get(&gid)
+        .cloned()
+        .expect("group");
+    assert!(info.has_active_member(&joiner_hex));
+    assert_eq!(
+        info.members_v2
+            .get(&joiner_hex)
+            .and_then(|m| m.display_name.as_deref()),
+        Some("Alice")
+    );
+
+    // Banned agent cannot open-join.
+    let banned_id = AgentId([88u8; 32]);
+    let banned_hex = hex::encode(banned_id.as_bytes());
+    {
+        let mut groups = authority.named_groups.write().await;
+        let g = groups.get_mut(&gid).expect("group");
+        g.add_member(
+            banned_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        g.ban_member(&banned_hex, None);
+    }
+    handle_open_join_request(Arc::clone(&authority), banned_id, gid.clone(), None).await;
+    let after = authority
+        .named_groups
+        .read()
+        .await
+        .get(&gid)
+        .cloned()
+        .expect("group");
+    assert!(!after.has_active_member(&banned_hex));
+    Ok(())
+}
+
+/// `GET /groups/:id/messages` supports `limit` and `before` pagination with
+/// `has_more` and `next_before`.
+#[tokio::test]
+async fn public_messages_pagination_respects_limit_and_before() -> Result<()> {
+    let (state, _dir) = daemon_state().await?;
+    let resp = create_named_group(
+        State(Arc::clone(&state)),
+        Json(CreateGroupRequest {
+            name: "PagedSpace".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: Some("public_open".to_string()),
+            policy: None,
+            tags: Vec::new(),
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(resp).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let gid = body["group_id"].as_str().expect("group_id").to_string();
+    let stable = state
+        .named_groups
+        .read()
+        .await
+        .get(&gid)
+        .expect("group")
+        .stable_group_id()
+        .to_string();
+    let kp = state.agent.identity().agent_keypair();
+    let state_hash = state
+        .named_groups
+        .read()
+        .await
+        .get(&gid)
+        .expect("group")
+        .state_hash
+        .clone();
+    {
+        let mut cache = state.public_messages.write().await;
+        let slot = cache.entry(stable.clone()).or_default();
+        for i in 1..=5u64 {
+            let msg = x0x::groups::GroupPublicMessage::sign(
+                stable.clone(),
+                state_hash.clone(),
+                0,
+                kp,
+                None,
+                x0x::groups::GroupPublicMessageKind::Chat,
+                format!("msg-{i}"),
+                i * 1000,
+                None,
+                None,
+                None,
+            )?;
+            slot.push(msg);
+        }
+    }
+
+    let app = axum::Router::new()
+        .route(
+            "/groups/:id/messages",
+            axum::routing::get(get_group_public_messages),
+        )
+        .layer(axum::Extension(
+            crate::server::rider_auth::ActorContext::Owner { durable: true },
+        ))
+        .with_state(Arc::clone(&state));
+    use tower::ServiceExt;
+
+    let page1 = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(format!("/groups/{gid}/messages?limit=2"))
+                .body(axum::body::Body::empty())?,
+        )
+        .await?;
+    let (s1, b1) = response_json(page1).await?;
+    assert_eq!(s1, StatusCode::OK, "{b1}");
+    assert_eq!(b1["has_more"], json!(true));
+    assert_eq!(b1["next_before"], json!(4000));
+    let m1 = b1["messages"].as_array().expect("messages");
+    assert_eq!(m1.len(), 2);
+    assert_eq!(m1[0]["body"], json!("msg-4"));
+    assert_eq!(m1[1]["body"], json!("msg-5"));
+
+    let page2 = app
+        .oneshot(
+            axum::http::Request::get(format!("/groups/{gid}/messages?limit=2&before=4000"))
+                .body(axum::body::Body::empty())?,
+        )
+        .await?;
+    let (s2, b2) = response_json(page2).await?;
+    assert_eq!(s2, StatusCode::OK, "{b2}");
+    assert_eq!(b2["has_more"], json!(true));
+    assert_eq!(b2["next_before"], json!(2000));
+    let m2 = b2["messages"].as_array().expect("messages");
+    assert_eq!(m2.len(), 2);
+    assert_eq!(m2[0]["body"], json!("msg-2"));
+    assert_eq!(m2[1]["body"], json!("msg-3"));
     Ok(())
 }

@@ -1314,6 +1314,7 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
         display_name: None,
         preset: None,
         policy: Some(home_policy(&owner)),
+        tags: Vec::new(),
     };
     let response = create_named_group(State(Arc::clone(state)), Json(req)).await;
     let resp = response.into_response();
@@ -2282,6 +2283,7 @@ pub(in crate::server::routes) mod tests {
             display_name: None,
             preset: None,
             policy: Some(home_policy(&owner)),
+            tags: Vec::new(),
         };
         let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
         let (status, body) = response_json(response.into_response()).await?;
@@ -2313,6 +2315,7 @@ pub(in crate::server::routes) mod tests {
             display_name: None,
             preset: None,
             policy: Some(home_policy(&owner)),
+            tags: Vec::new(),
         };
         let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
         let (status, body) = response_json(response.into_response()).await?;
@@ -2387,6 +2390,7 @@ pub(in crate::server::routes) mod tests {
             display_name: None,
             preset: None,
             policy: Some(home_policy(&owner)),
+            tags: Vec::new(),
         };
         let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
         let (status, body) = response_json(response.into_response()).await?;
@@ -2496,6 +2500,7 @@ pub(in crate::server::routes) mod tests {
             display_name: None,
             preset: None,
             policy: Some(home_policy(&owner)),
+            tags: Vec::new(),
         };
         let response = create_named_group(State(Arc::clone(state)), Json(req)).await;
         let (status, body) = response_json(response.into_response()).await?;
@@ -2868,6 +2873,7 @@ pub(in crate::server::routes) mod tests {
                 display_name: None,
                 preset: None,
                 policy: Some(home_policy(&owner)),
+                tags: Vec::new(),
             }),
         )
         .await
@@ -3517,6 +3523,7 @@ pub(in crate::server::routes) mod tests {
             display_name: None,
             preset: None,
             policy: Some(home_policy(&victim.user_id())),
+            tags: Vec::new(),
         };
         let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
         let (status, body) = response_json(response.into_response()).await?;
@@ -3545,6 +3552,7 @@ pub(in crate::server::routes) mod tests {
             display_name: None,
             preset: None,
             policy: Some(home_policy(&owner)),
+            tags: Vec::new(),
         };
         let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
         let (status, body) = response_json(response.into_response()).await?;
@@ -5692,6 +5700,7 @@ pub(in crate::server::routes) mod tests {
                 display_name: None,
                 preset: None,
                 policy: None,
+                tags: Vec::new(),
             }),
         )
         .await

@@ -532,3 +532,80 @@ const cases=[
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+#[test]
+fn gui_spaces_community_hardening_invariants() {
+    let html = include_str!("../src/gui/x0x-gui.html");
+    // P0 XSS: Space description and DM contact label are HTML-escaped.
+    assert!(
+        html.contains("${esc(g.description||'No description')}"),
+        "Space detail must escape g.description"
+    );
+    assert!(
+        html.contains("esc(c.label||short(c.agent_id))"),
+        "Sidebar DM list must escape c.label"
+    );
+    // P0 Invite reuse: never cache single-use invites across clicks.
+    assert!(
+        !html.contains("savedInvites"),
+        "GUI must not cache single-use invites in savedInvites"
+    );
+    assert!(
+        html.contains("copySpaceCard("),
+        "Space detail should expose reusable Copy Group Card for discoverable spaces"
+    );
+    // P0 Destructive delete requires confirmation.
+    let withdraw_start = html
+        .find("async function nagWithdrawState(")
+        .expect("nagWithdrawState exists");
+    let withdraw_snippet = &html[withdraw_start..withdraw_start + 300];
+    assert!(
+        withdraw_snippet.contains("confirm("),
+        "nagWithdrawState must require explicit user confirmation"
+    );
+    // P0 Private chat encrypts/decrypts via /groups/:id/secure/{encrypt,decrypt} and verifies edit/delete authors.
+    assert!(
+        html.contains("publishSpaceGossip(") && html.contains("decryptSpaceGossip("),
+        "Private space gossip must encrypt and decrypt through the group secure plane"
+    );
+    let edit_start = html
+        .find("function applyRemoteEdit(")
+        .expect("applyRemoteEdit exists");
+    assert!(
+        html[edit_start..edit_start + 260].contains("msg.sender_id!==senderId"),
+        "applyRemoteEdit must enforce sender ownership"
+    );
+    let del_start = html
+        .find("function applyRemoteDelete(")
+        .expect("applyRemoteDelete exists");
+    assert!(
+        html[del_start..del_start + 260].contains("msg.sender_id!==senderId"),
+        "applyRemoteDelete must enforce sender ownership"
+    );
+    // P1 SignedPublic pagination, thread_root sends, and admin_only composer guard.
+    assert!(
+        html.contains("loadOlderSignedPublicMessages("),
+        "SignedPublic chat must support loading older messages"
+    );
+    assert!(
+        html.contains("Announcement space — only admins can post."),
+        "SignedPublic admin_only spaces must gate the composer for non-admins"
+    );
+    // P2 Space apps: Feed uses group store, Web sandbox is empty, Discover supports open-join.
+    assert!(
+        html.contains("openSpacePageStore(sid,'feed')"),
+        "Space Feed must use the policy-bound group store"
+    );
+    assert!(
+        html.contains("iframe.setAttribute('sandbox','')"),
+        "Web preview iframe must use a strict empty sandbox"
+    );
+    assert!(
+        html.contains("data-nag-open-join"),
+        "Discover cards must wire OpenJoin admission"
+    );
+    assert!(
+        html.contains("data-nag-roster-search") && html.contains("data-nag-roster-filter"),
+        "Manage roster must provide search and role/state filtering for large communities"
+    );
+}

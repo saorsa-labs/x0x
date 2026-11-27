@@ -1352,7 +1352,15 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         );
         return Err("public-group bootstrap sender is not a known contact".to_string());
     }
-    if !contact_or_grant {
+    let open_join_consent = group.home.is_none()
+        && group.policy.admission == x0x::groups::GroupAdmission::OpenJoin
+        && group.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic
+        && crate::server::routes::named_groups::has_pending_open_join(
+            state,
+            group.stable_group_id(),
+            sender,
+        );
+    if !contact_or_grant && !open_join_consent {
         let catchup_consent = {
             let groups = state.named_groups.read().await;
             crate::server::resolve_group_entry_locked(&groups, group.stable_group_id()).is_some_and(
@@ -1421,12 +1429,30 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         // the inbound snapshot's stable id, or the frontier comparison below
         // reads "new group" and the install proceeds against the wrong record.
         match crate::server::resolve_group_entry_locked(&groups, &group_id).map(|(_, info)| info) {
-            Some(installed) => Some((
-                (installed.state_revision, installed.state_hash.clone()) == frontier,
-                installed_catchup_admin_consent(installed, &group, &sender_hex),
-            )),
+            Some(installed) => {
+                // An explicit local open-join may upgrade a non-member
+                // OpenJoin card stub directly to the authority-committed
+                // member snapshot (never replacing an active, banned, or
+                // withdrawn local record).
+                let replaceable_open_join_stub = open_join_consent
+                    && !installed.withdrawn
+                    && !installed.has_active_member(&local_agent_hex)
+                    && !installed.is_banned(&local_agent_hex)
+                    && installed.invite_lineage.is_none()
+                    && installed.policy.admission == x0x::groups::GroupAdmission::OpenJoin
+                    && installed.policy.confidentiality
+                        == x0x::groups::GroupConfidentiality::SignedPublic;
+                if replaceable_open_join_stub {
+                    None
+                } else {
+                    Some((
+                        (installed.state_revision, installed.state_hash.clone()) == frontier,
+                        installed_catchup_admin_consent(installed, &group, &sender_hex),
+                    ))
+                }
+            }
             None => {
-                if !contact_or_grant {
+                if !contact_or_grant && !open_join_consent {
                     tracing::debug!(
                         sender = %LogHexId::agent(&sender_hex),
                         "ignoring public-group bootstrap from unknown or blocked sender"
@@ -1540,12 +1566,23 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     }
 
     let outcome = persist_named_groups_mutation(state, |groups| {
-        if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS
-            || groups.contains_key(&group_id)
-            || groups
-                .values()
-                .any(|existing| existing.stable_group_id() == group_id)
+        if let Some((existing_key, existing)) =
+            crate::server::resolve_group_entry_locked(groups, &group_id)
+                .map(|(k, info)| (k.to_string(), info))
         {
+            let replaceable_open_join_stub = open_join_consent
+                && !existing.withdrawn
+                && !existing.has_active_member(&local_agent_hex)
+                && !existing.is_banned(&local_agent_hex)
+                && existing.invite_lineage.is_none()
+                && existing.policy.admission == x0x::groups::GroupAdmission::OpenJoin
+                && existing.policy.confidentiality
+                    == x0x::groups::GroupConfidentiality::SignedPublic;
+            if !replaceable_open_join_stub {
+                return false;
+            }
+            groups.remove(&existing_key);
+        } else if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS {
             return false;
         }
         groups.insert(group_id.clone(), group);
@@ -1557,6 +1594,9 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     // `ReplacedNotDurable` is visible but not yet proven to survive a crash, so
     // it withholds the ACK and the sender retries.
     if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        if open_join_consent {
+            crate::server::routes::named_groups::clear_pending_open_join(state, &group_id, sender);
+        }
         ensure_named_group_listeners(Arc::clone(state), &group_id).await;
         tracing::info!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "installed signed-public group bootstrap");
         Ok(DmTypedPayloadCompletion::Inserted)

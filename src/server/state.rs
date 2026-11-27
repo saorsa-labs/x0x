@@ -1009,6 +1009,21 @@ pub(super) struct AppState {
     /// bound to the inviter its invite names. Replies are never cached.
     pub(super) base_roster_fetch_slots:
         StdMutex<HashMap<String, Vec<crate::server::routes::named_groups::BaseRosterWaiter>>>,
+    /// Chunk reassembly state for multi-chunk v6 base-roster replies (>128
+    /// Active+Banned entries). Only populated while a matching waiter is
+    /// parked and cleared on waiter drop or completion.
+    pub(super) base_roster_chunk_buffers: StdMutex<
+        HashMap<
+            (String, x0x::identity::AgentId),
+            crate::server::routes::named_groups::BaseRosterChunkAssembly,
+        >,
+    >,
+    /// Explicit local `POST /groups/:id/open-join` requests keyed by
+    /// `(stable_group_id, authority_agent_id) -> requested_at` (5-min TTL,
+    /// bounded to 64 entries) so `public_group_bootstrap` admits the
+    /// authority's snapshot only for an open-join this daemon initiated.
+    pub(super) pending_open_joins:
+        StdMutex<HashMap<(String, x0x::identity::AgentId), std::time::Instant>>,
     /// Expected inviter for a pending TreeKEM join-result response, keyed by
     /// stable group id + joining member id. Transient process-local state.
     pub(super) expected_join_result_inviters: StdMutex<HashMap<String, ExpectedJoinResultInviter>>,

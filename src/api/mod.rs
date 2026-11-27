@@ -1301,7 +1301,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group create",
         description: "Create named group",
         category: "named-groups",
-        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME"), RequestField::body("description", false), RequestField::body("display_name", false), RequestField::body("preset", false), RequestField::body_as("policy", false, "--policy")]),
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME"), RequestField::body("description", false), RequestField::body("display_name", false), RequestField::body("preset", false), RequestField::body_as("policy", false, "--policy"), RequestField::body_as("tags", false, "--tag")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1358,7 +1358,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group messages",
         description: "Retrieve cached public messages (non-members on Public read)",
         category: "named-groups",
-        request: RequestSpec::Fields(&[RequestField::query("thread_root", false)]),
+        request: RequestSpec::Fields(&[RequestField::query("thread_root", false), RequestField::query("limit", false), RequestField::query("before", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -1414,6 +1414,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
             RequestField::derived_body("mode"),
             RequestField::derived_body("expected_owner_user_id"),
         ]),
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/open-join",
+        cli_name: "group open-join",
+        description: "Request authority-committed membership in a discovered OpenJoin SignedPublic group",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body("display_name", false)]),
     },
     EndpointDef {
         method: Method::Get,
