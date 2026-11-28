@@ -1454,6 +1454,7 @@ async fn serve_with_options_inner(
         ),
         startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
         self_leave_rekey_fences: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        treekem_page_bookkeeping: routes::named_groups::TreeKemPageBookkeeping::default(),
         startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
         startup_catchup_backoff_owner: std::sync::atomic::AtomicU64::new(0),
         #[cfg(test)]
