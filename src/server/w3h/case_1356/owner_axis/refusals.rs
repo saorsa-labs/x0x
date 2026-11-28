@@ -20,6 +20,7 @@ use crate::groups::recovery::{
     encode_message, AttestAnswer, GroupAttestResponseV1, GroupRecoveryMessageV1, RecoveryRef,
     ReseatAuthorisation, ReseatAuthorisationFields, ReseatBasis,
 };
+use crate::network::sim::LaneClass;
 use std::sync::atomic::Ordering;
 
 pub(super) const FINAL_D3: &str =
@@ -50,15 +51,39 @@ struct Injection {
 
 /// J's answer to one injection.
 struct Answer {
+    sent: String,
     delivered: usize,
     refusal: Option<String>,
     contained: bool,
 }
 
+/// O dials J when it has no link to J. J's held requests fail as lost
+/// frames, and J closes its link after each one. The re-dials (J's, and its
+/// peers' one-sided repair) wait out backoffs that `network.rs` measures in
+/// real time, so whether the link is up at an injection depends on the
+/// runner's speed. With no link, O's send goes to J's gossip inbox and no
+/// direct frame reaches J.
+async fn link_o_to_j(sim: &Sim) -> Result<()> {
+    let network = sim
+        .state("O")?
+        .agent
+        .network()
+        .cloned()
+        .context("O has no network")?;
+    if network.is_connected(&sim.peer("J")?).await {
+        return Ok(());
+    }
+    let addr = crate::server::w3h::sim_addr(sim.node_index("J")?)?;
+    sim.within("O dials J", secs(10), network.connect_addr(addr))
+        .await?
+        .context("O dials J")?;
+    Ok(())
+}
+
 /// O sends `injection` to J as a `group_attest_response`, then waits for
 /// J's `last_refusal` to name the expected cause. J's ack to O is held, so
-/// the send can report a failure after the frame is delivered; the
-/// delivered count is the evidence.
+/// the send can report a failure after the frame is delivered; the count
+/// of delivered direct frames is the evidence.
 async fn inject(sim: &Sim, group: &str, base: &View, injection: &Injection) -> Result<Answer> {
     let (j, _) = sim.ids("J")?;
     let payload = encode_message(&GroupRecoveryMessageV1::Response(GroupAttestResponseV1 {
@@ -70,16 +95,24 @@ async fn inject(sim: &Sim, group: &str, base: &View, injection: &Injection) -> R
             invite: injection.invite.clone(),
         },
     }))?;
+    link_o_to_j(sim).await?;
     let cut = sim
         .fabric()
         .mark_indexed(format!("case: O injects {}", injection.what));
     // The send waits out J's held ack (its attempts and retry), so it
     // runs in a barrier, where virtual time moves.
     let agent = sim.state("O")?.agent.clone();
-    sim.within(&format!("O sends {}", injection.what), SEND_BOUND, async {
-        let _ = agent.send_direct(&j, payload).await;
-    })
-    .await?;
+    let sent = sim
+        .within(
+            &format!("O sends {}", injection.what),
+            SEND_BOUND,
+            agent.send_direct(&j, payload),
+        )
+        .await?;
+    let sent = match sent {
+        Ok(receipt) => format!("ok by {:?}", receipt.path),
+        Err(error) => format!("error {error}"),
+    };
     let want = format!("authorisation_refused:{}", injection.expect);
     let mut refusal = None;
     let waited = sim
@@ -105,8 +138,15 @@ async fn inject(sim: &Sim, group: &str, base: &View, injection: &Injection) -> R
     let contained = st.is_some_and(|st| st.recovery_state() == Some("reseat_required"))
         && !has_reseat_journal(sim, "J")?
         && same_record(jv.as_ref(), Some(base));
+    let delivered = sim
+        .fabric()
+        .delivered_writes_after(&sim.peer("O")?, &sim.peer("J")?, cut)
+        .iter()
+        .filter(|(write, _)| write.lane.class == LaneClass::Direct)
+        .count();
     Ok(Answer {
-        delivered: delivered_after(sim, "O", "J", cut)?,
+        sent,
+        delivered,
         refusal,
         contained,
     })
@@ -139,7 +179,7 @@ struct FromJ {
 /// that J writes first after `joined`. The hold sees those first writes
 /// and holds them, and `fresh` counts them if one is delivered.
 fn originated_by_j_after(sim: &Sim, joined: usize, after: usize) -> Result<FromJ> {
-    use crate::network::sim::{Fate, LaneClass};
+    use crate::network::sim::Fate;
     let j = sim.peer("J")?.0;
     let mut origins = std::collections::HashMap::new();
     let mut counts = Vec::new();
@@ -502,7 +542,10 @@ pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt)
         receipt.evidence(
             "o_injection_delivered_to_j",
             answer.delivered > 0,
-            format!("{}: frames O->J {}", injection.what, answer.delivered),
+            format!(
+                "{}: direct frames O->J {}",
+                injection.what, answer.delivered
+            ),
             at(sim),
         );
         let refused = answer.refusal.as_deref()
@@ -510,8 +553,8 @@ pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt)
         // An injection that never reached J is INFRA (the evidence above).
         red |= answer.delivered > 0 && !(refused && answer.contained);
         receipt.note(format!(
-            "{}: J last_refusal {:?} (want {}); contained {}",
-            injection.what, answer.refusal, injection.expect, answer.contained
+            "{}: O's send {}; J last_refusal {:?} (want {}); contained {}",
+            injection.what, answer.sent, answer.refusal, injection.expect, answer.contained
         ));
         checks.push((injection.checks.0, refused));
         checks.push((injection.checks.1, answer.contained));

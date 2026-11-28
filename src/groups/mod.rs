@@ -219,7 +219,7 @@ pub enum InviteOrigin {
 /// #469 E3: hard cap on unconsumed + unexpired issued-invite records per
 /// group; minting refuses with `invite_cap_reached` at the cap (after
 /// pruning consumed/expired records).
-pub const MAX_LIVE_ISSUED_INVITES_PER_GROUP: usize = 64;
+pub const MAX_LIVE_ISSUED_INVITES_PER_GROUP: usize = 256;
 
 /// Locally-issued invite record used to authenticate joiner-authored
 /// `MemberJoined` requests at the original inviter.

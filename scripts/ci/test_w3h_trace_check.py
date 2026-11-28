@@ -75,6 +75,41 @@ class TraceCheckTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertIn('w3h_missing: no trace written', CHECK.check(d, 1, ['w3h_missing']))
 
+    def test_case_of_a_dead_shard_is_infra_missing_not_a_gate_failure(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, 'w3h_live-1.trace', TRACE)
+            self.write(d, 'w3h_part-1.trace', TRACE)
+            self.receipt(d, 1, 'GREEN', case='w3h_part')
+            listed = Path(d, 'infra-missing-cases')
+            listed.write_text('w3h_dead\nw3h_part\n')
+            infra = frozenset(('w3h_dead', 'w3h_part'))
+            problems = CHECK.check(d, 2, ['w3h_dead'], infra=infra)
+            problems += CHECK.check_receipts(
+                d, 2, ['w3h_dead=GREEN', 'w3h_part=GREEN'], infra)
+            self.assertEqual(sorted(p.partition(' (')[0] for p in problems), [
+                'W3H-INFRA-MISSING w3h_dead: 0 receipts, expected 2',
+                'W3H-INFRA-MISSING w3h_dead: no trace written',
+                'W3H-INFRA-MISSING w3h_part: 1 receipts, expected 2',
+                'W3H-INFRA-MISSING w3h_part: 1 traces, expected 2',
+                'w3h_live: 1 traces, expected 2',
+            ])
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                status = CHECK.main([d, '--runs', '2', '--expect', 'w3h_dead=GREEN',
+                                     '--infra-missing-file', str(listed)])
+            self.assertEqual(status, 1)
+            self.assertIn('W3H-INFRA-MISSING w3h_dead: 0 receipts, expected 2', stderr.getvalue())
+            self.assertIn('W3H-GATE FAIL w3h_live: 1 traces, expected 2', stderr.getvalue())
+            self.assertNotIn('W3H-GATE FAIL w3h_dead', stderr.getvalue())
+
+    def test_wrong_verdict_in_a_dead_shard_case_still_fails_the_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.receipt(d, 1, 'RED', case='w3h_part')
+            problems = CHECK.check_receipts(d, 2, ['w3h_part=GREEN'], frozenset(('w3h_part',)))
+            self.assertIn('w3h_part: verdict RED, expected GREEN', problems)
+
     def receipt(self, d, pid, verdict, stages=None, case='w3h_red', ok=True):
         import json
         if stages is None:

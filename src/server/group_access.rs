@@ -510,6 +510,11 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         level: AccessLevel::PublicWrite,
     },
     RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/open-join",
+        level: AccessLevel::PublicWrite,
+    },
+    RouteAccess {
         method: Method::GET,
         path: "/groups/:id/join-status",
         level: AccessLevel::PublicRead,
@@ -2046,6 +2051,11 @@ mod tests {
             ),
             (Method::GET, "/groups/cards/:id", AccessLevel::PublicRead),
             (Method::POST, "/groups/join", AccessLevel::PublicWrite),
+            (
+                Method::POST,
+                "/groups/:id/open-join",
+                AccessLevel::PublicWrite,
+            ),
             (
                 Method::GET,
                 "/groups/:id/join-status",

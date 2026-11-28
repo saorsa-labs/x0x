@@ -155,6 +155,31 @@ class ShardPlanTest(unittest.TestCase):
                 self.assertEqual(stem.rpartition('-')[0], case)
             self.assertEqual(SHARDS.tag_traces('s3', directory), 0)
 
+    def test_missing_traces_names_shards_with_no_uploaded_file(self):
+        d3 = 'w3h_1356_control_s3_d3_authorisation_refusals_typed'
+        names = ['w3h_1023_a', d3, 'w3h_other']
+        with tempfile.TemporaryDirectory() as incoming:
+            for entry in ('long-1023', 's3-d3.1', 's3-d3.3', 's3-d3.4'):
+                shard = Path(incoming) / f'w3h-traces-{entry}'
+                shard.mkdir()
+                (shard / 'x-1.trace').write_text('x')
+            (Path(incoming) / 'w3h-traces-rest').mkdir()
+            self.assertEqual(SHARDS.missing_traces(names, incoming),
+                             [('s3-d3.2', [d3]), ('rest', ['w3h_other'])])
+
+    def test_cli_missing_traces_prints_infra_lines_and_writes_the_cases(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as incoming:
+            out = Path(incoming) / 'cases'
+            with redirect_stdout(stdout):
+                self.assertEqual(SHARDS.main(['--missing-traces', incoming, str(out)]), 0)
+            cases = out.read_text().split()
+        self.assertEqual(cases, SHARDS.discover())
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [f'W3H-INFRA shard {entry} uploaded no traces (runner lost or job failed)'
+             for entry in SHARDS.matrix(SHARDS.discover())['group']])
+
     def test_s3_and_s4_prefixes_do_not_fall_through_to_rest(self):
         self.assertEqual(SHARDS.group_of('w3h_1356_future_case'), 's3')
         self.assertEqual(SHARDS.group_of('w3h_1357_future_case'), 's4')

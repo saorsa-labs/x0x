@@ -151,6 +151,17 @@ jobs:
           python3 -B scripts/ci/test_check_nextest_groups.py -v
           python3 -B scripts/ci/check-nextest-groups.py
 
+      # Cold lib test builds stopped the runner with exit 143 (runs
+      # 45100407823, 45312481918); same swap as Signing path 100k.
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
+
       - name: Record disk before Run tests
         run: |
           echo "=== disk before Run tests ==="
@@ -573,6 +584,17 @@ jobs:
         with:
           tool: nextest@0.9.151
 
+      # Cold lib test builds stopped the runner with exit 143 (runs
+      # 45100407823, 45312481918); same swap as Signing path 100k.
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
+
       - name: Install the published v0.46.1
         run: bash scripts/ci/prepare-released-h-s3-home.sh
 
@@ -878,6 +900,17 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -shared -fPIC -o target/w3h/libw3h_shim.so scripts/w3h/w3h_shim.c -ldl
           rm -rf target/w3h/traces
 
+      # Cold lib test builds stopped the runner with exit 143 (runs
+      # 45100407823, 45312481918); same swap as Signing path 100k.
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
+
       - name: Run W3-H cases 20 times
         env:
           X0X_ISOLATION_ROLE: w3h-harness
@@ -971,7 +1004,13 @@ jobs:
         with:
           pattern: w3h-traces-*
           path: w3h-incoming
-          merge-multiple: true
+
+      - name: Name shards that uploaded no traces
+        shell: bash
+        run: |
+          mkdir -p w3h-incoming target/w3h
+          python3 -B scripts/ci/w3h-shards.py --missing-traces w3h-incoming target/w3h/infra-missing-cases \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Merge shard traces
         run: |
@@ -979,10 +1018,15 @@ jobs:
           find w3h-incoming -type f -print0 | while IFS= read -r -d '' file; do
             base="$(basename "$file")"
             dest="target/w3h/traces/${base}"
-            if [ -e "$dest" ]; then
-              echo "duplicate W3-H trace file ${base}" >&2
-              exit 1
-            fi
+            case "$base" in
+              *.first-digest|*.divergent-digest) ;;
+              *)
+                if [ -e "$dest" ]; then
+                  echo "duplicate W3-H trace file ${base}" >&2
+                  exit 1
+                fi
+                ;;
+            esac
             cp "$file" "$dest"
           done
           traces="$(find target/w3h/traces -name '*.trace' | wc -l)"
@@ -999,6 +1043,7 @@ jobs:
       - name: W3-H gate (verdict-stable reruns, D196)
         run: >-
           python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20
+          --infra-missing-file target/w3h/infra-missing-cases
           --require w3h_s1_control_group_invite_join_over_public_api
           --require w3h_red_1256_gossip_only_event_after_a_gossip_member_added
           --require w3h_1256_control_second_event_also_by_dm

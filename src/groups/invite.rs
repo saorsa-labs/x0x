@@ -252,6 +252,14 @@ pub const MAX_INVITE_ROSTER_ENTRIES: usize = 20;
 /// `invite_too_large` as before #646.
 pub const MAX_FETCHED_BASE_ROSTER_ENTRIES: usize = 128;
 
+/// Maximum Active+Banned projection entries a chunked v6 base-roster fetch may
+/// carry across [`MAX_BASE_ROSTER_CHUNKS`] single-DM chunks (each capped at
+/// [`MAX_FETCHED_BASE_ROSTER_ENTRIES`] entries so every individual chunk stays
+/// inside [`crate::dm::MAX_PAYLOAD_BYTES`]).
+pub const MAX_BASE_ROSTER_CHUNKS: u16 = 8;
+pub const MAX_CHUNKED_BASE_ROSTER_ENTRIES: usize =
+    MAX_FETCHED_BASE_ROSTER_ENTRIES * (MAX_BASE_ROSTER_CHUNKS as usize);
+
 /// Typed refusal reasons for v4 invite verification (#469 A2). These are
 /// the `reason` strings counted by `invites_refused{reason}` and surfaced
 /// as typed 4xx errors by the join route.

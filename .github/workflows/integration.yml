@@ -157,6 +157,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
+      # Cold lib test build stopped the runner with exit 143 (runs
+      # 45365745014, 45464106344); same swap as ci-full.yml.
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
       - name: Run daemon API integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test daemon_api_integration -- -- --ignored
       - name: Run named group D4 signed commit integration tests
@@ -166,7 +176,8 @@ jobs:
       - name: Run doctor bundle redaction proof
         run: bash scripts/ci/nextest-isolated.sh --all-features --test doctor_bundle -- -- --ignored
       - name: Run bound-port forwarding regression
-        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
+        timeout-minutes: 10
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test forward_bound_port -- --run-ignored ignored-only --no-tests=fail -E 'test(=port_zero_forwards_are_listed_and_removed_by_bound_address)'
 
   # Agent-usability eval (#1174): a fresh agent driven only by `x0x onboard`
   # output plus the core SKILL.md must send a DM, join a group and write a

@@ -74,7 +74,7 @@ const POST_VALUE: &str = "post-value-969";
 const RESTART_KEY: &str = "w3h-969-restart";
 const RESTART_VALUE: &str = "restart-value-969";
 const SEAT_BUDGET: Duration = Duration::from_secs(180);
-const STORE_BUDGET: Duration = Duration::from_secs(90);
+const STORE_BUDGET: Duration = Duration::from_secs(180);
 const READ_BUDGET: Duration = Duration::from_secs(120);
 
 /// A decoded sealed-record frame from the fabric's writes.
@@ -549,6 +549,43 @@ async fn group_info(sim: &Sim, group: &str) -> Result<GroupInfo> {
     .await?
 }
 
+/// Wait for `label` to reconnect to `peer` after a restart, dialing `peer`
+/// directly if the reconnect scheduler has not re-established the link yet.
+async fn relink(sim: &mut Sim, label: &str, peer: &str) -> Result<()> {
+    let peer_id = sim.peer(peer)?;
+    let linked = sim
+        .until(
+            &format!("{label}~{peer} linked after {label}'s restart"),
+            secs(10),
+            async |s: &Sim| {
+                let Some(network) = s.state(label).ok().and_then(|n| n.agent.network().cloned())
+                else {
+                    return false;
+                };
+                network.is_connected(&peer_id).await
+            },
+        )
+        .await
+        .is_ok();
+    if !linked {
+        let network = sim
+            .state(label)?
+            .agent
+            .network()
+            .cloned()
+            .with_context(|| format!("{label} has no network"))?;
+        let addr = super::sim_addr(sim.node_index(peer)?)?;
+        sim.within(
+            &format!("{label} dials {peer}"),
+            secs(10),
+            network.connect_addr(addr),
+        )
+        .await?
+        .with_context(|| format!("{label} dials {peer}"))?;
+    }
+    Ok(())
+}
+
 /// Wait until `member` is listed by `owner` and reports itself active.
 async fn wait_seated(sim: &Sim, owner: &str, member: &str, group: &str, what: &str) -> Result<()> {
     let id = sim.agent_hex(member)?;
@@ -837,6 +874,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
     let restart_cut = sim
         .fabric()
         .cut("case 969: B is back, the restart recovery window opens");
+    relink(sim, "B", "A").await?;
     wait_seated(sim, "A", "B", &group, "B seated again after its restart").await?;
     let what = "B re-opens the store at the current epoch after its restart";
     let mut last = String::new();

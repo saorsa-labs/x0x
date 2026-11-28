@@ -215,6 +215,7 @@ async fn create_public_group(state: &Arc<AppState>) -> Result<String> {
             display_name: None,
             preset: Some("public_open".to_string()),
             policy: None,
+            tags: Vec::new(),
         }),
     )
     .await

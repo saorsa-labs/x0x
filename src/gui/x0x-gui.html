@@ -1220,9 +1220,10 @@ function storeKeyCard(label,hint,onClick,labelFont){
   card.addEventListener('click',onClick);
   return card;
 }
-// JS-string escaper for use inside onclick='...' inline handlers.
-// Escapes quotes, backslashes, and control chars so the value is safe inside a JS string literal.
-function escJs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/</g,'\\x3c').replace(/>/g,'\\x3e')}
+// JS-string escaper safe inside both single/double-quoted JS literals AND
+// double-quoted HTML event attributes (encodes quotes/angle brackets as \uXXXX
+// so the HTML parser can never terminate an attribute on a raw `"`).
+function escJs(s){return String(s??'').replace(/\\/g,'\\\\').replace(/'/g,'\\u0027').replace(/"/g,'\\u0022').replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/&/g,'\\u0026').replace(/\r/g,'\\r').replace(/\n/g,'\\n')}
 // Unicode-safe base64 encode/decode for KvStore values (wiki, web, etc.)
 function u8encode(s){return btoa(unescape(encodeURIComponent(s)))}
 function u8decode(s){return decodeURIComponent(escape(atob(s)))}
@@ -1413,6 +1414,8 @@ async function createChannel(spaceId){
   if(!r||!r._http_ok){channelModalError('Channel NOT created. '+apiError(r));return}
   if(r&&r._http_status===202&&r.published===false){channelModalError('Channel saved locally; not yet published to the group. '+String(r.reason||''))}
   if(!spacePageStoreCurrent(spaceId,st)){channelModalError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
+  // Best-effort per-channel key avoids LWW overwrite when two members create channels concurrently.
+  api('/stores/'+encSeg(st.id)+'/'+encSeg('ch/'+name),{method:'PUT',body:JSON.stringify({value:u8encode(JSON.stringify(channel)),content_type:'application/json'})}).catch(()=>{});
   channelCache[spaceId]=channels;
   delete channelErrors[spaceId];
   document.querySelector('.modal-overlay').remove();
@@ -1445,26 +1448,55 @@ async function loadSpaceChannels(spaceId){
     channelCache[spaceId]=defaultChannels(spaceId);
     return channelCache[spaceId];
   }
+  let channels=[];
   if(!r||!r._http_ok){
-    if(r&&r._http_status===404){
-      // No index yet: the space genuinely has no extra channels.
-      delete channelErrors[spaceId];
+    if(!r||r._http_status!==404){
+      channelErrors[spaceId]='Could not load the channel list. '+apiError(r);
       channelCache[spaceId]=defaultChannels(spaceId);
       return channelCache[spaceId];
     }
-    channelErrors[spaceId]='Could not load the channel list. '+apiError(r);
+  }else{
+    const v=r.value===undefined||r.value===null?'':r.value;
+    try{channels=JSON.parse(u8decode(v))}catch(e){
+      channelErrors[spaceId]='The channel list in this space is damaged; showing only #general.';
+      channelCache[spaceId]=defaultChannels(spaceId);
+      return channelCache[spaceId];
+    }
+    if(!Array.isArray(channels))channels=[];
+  }
+  // Merge any per-channel keys (`ch/*`) in parallel so concurrent creators do not clobber each other.
+  const kr=await api('/stores/'+encSeg(st.id)+'/keys').catch(()=>null);
+  if(!spacePageStoreCurrent(spaceId,st)){
+    channelErrors[spaceId]=SPACE_POLICY_MOVED_AFTER_READ;
     channelCache[spaceId]=defaultChannels(spaceId);
     return channelCache[spaceId];
   }
-  const v=r.value===undefined||r.value===null?'':r.value;
-  let channels=[];
-  try{channels=JSON.parse(u8decode(v))}catch(e){
-    channelErrors[spaceId]='The channel list in this space is damaged; showing only #general.';
-    channelCache[spaceId]=defaultChannels(spaceId);
-    return channelCache[spaceId];
+  if(kr&&kr._http_ok&&Array.isArray(kr.keys)){
+    const have=new Set(channels.map(c=>c&&c.name).filter(Boolean));
+    const chKeys=kr.keys.map(k=>typeof k==='string'?k:(k&&k.key)||'').filter(k=>k.startsWith('ch/'));
+    const fetched=await Promise.all(chKeys.map(async ck=>{
+      const cname=ck.slice(3);
+      if(!cname||have.has(cname)||!/^[a-z0-9-]+$/.test(cname))return null;
+      const cr=await api('/stores/'+encSeg(st.id)+'/'+encSeg(ck)).catch(()=>null);
+      if(cr&&cr._http_ok&&cr.value){
+        try{
+          const parsed=JSON.parse(u8decode(cr.value));
+          if(parsed&&typeof parsed.name==='string'&&/^[a-z0-9-]+$/.test(parsed.name))return parsed;
+        }catch(e){}
+      }
+      return null;
+    }));
+    if(!spacePageStoreCurrent(spaceId,st)){
+      channelErrors[spaceId]=SPACE_POLICY_MOVED_AFTER_READ;
+      channelCache[spaceId]=defaultChannels(spaceId);
+      return channelCache[spaceId];
+    }
+    fetched.forEach(parsed=>{
+      if(parsed&&!have.has(parsed.name)){channels.push(parsed);have.add(parsed.name)}
+    });
   }
   delete channelErrors[spaceId];
-  channelCache[spaceId]=Array.isArray(channels)&&channels.length?channels:defaultChannels(spaceId);
+  channelCache[spaceId]=channels.length?channels:defaultChannels(spaceId);
   return channelCache[spaceId];
 }
 
@@ -1480,10 +1512,30 @@ function defaultChannels(spaceId){
 function getThreadMeta(msgId){return threadCache[msgId]||null}
 
 function openThread(spaceId,msg){
-  const threadTopic=getThreadTopic(spaceId,msg.id);
-  wsSub(threadTopic);
+  const isSignedPub=currentSpaceConfidentiality==='signed_public'&&S.get('spaceId')===spaceId;
+  const threadTopic=isSignedPub?'':getThreadTopic(spaceId,msg.id);
+  if(threadTopic)wsSub(threadTopic);
   S.set('threadId',msg.id);
   showDetail('thread',{spaceId,parentMsg:msg,topic:threadTopic});
+  if(isSignedPub&&msg&&msg.id){
+    loadSignedPublicThreadReplies(spaceId,msg.id);
+  }
+}
+
+async function loadSignedPublicThreadReplies(spaceId,threadRoot){
+  const r=await api('/groups/'+encSeg(spaceId)+'/messages?thread_root='+encodeURIComponent(threadRoot)+'&limit=100');
+  if(!r||!r.ok||!Array.isArray(r.messages))return;
+  for(const m of r.messages){
+    const {dedupKey,msg}=normalizeSignedPublicMsg(spaceId,m);
+    if(signedPublicSeen.has(dedupKey)){
+      upgradeSignedPublicMsgId(spaceId,spaceId+'_general',dedupKey,msg);
+      continue;
+    }
+    signedPublicSeen.add(dedupKey);
+    signedPublicIdByKey.set(dedupKey,msg.id);
+    if(msg.id===threadRoot&&!msg.thread_root)continue;
+    addThreadReply(threadRoot,{...msg,thread_root:threadRoot});
+  }
 }
 
 function generateMsgId(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
@@ -1509,6 +1561,7 @@ function loadReactions(chatKey){reactionStore[chatKey]=LS.get('rxn_'+chatKey,{})
 function saveReactions(chatKey){LS.set('rxn_'+chatKey,reactionStore[chatKey]||{})}
 
 function toggleReaction(chatKey,msgId,emoji){
+  if(S.get('view')==='space'&&currentSpaceConfidentiality==='signed_public')return;
   if(!reactionStore[chatKey])reactionStore[chatKey]={};
   if(!reactionStore[chatKey][msgId])reactionStore[chatKey][msgId]={};
   const r=reactionStore[chatKey][msgId];
@@ -1518,15 +1571,22 @@ function toggleReaction(chatKey,msgId,emoji){
   if(idx>=0)r[emoji].splice(idx,1); else r[emoji].push(me);
   if(r[emoji].length===0)delete r[emoji];
   saveReactions(chatKey);
-  // Publish reaction event via gossip
   if(currentChannelTopic){
-    wsPub(currentChannelTopic,{type:'reaction',msg_id:msgId,emoji,sender_id:me,sender_name:LS.get('display_name','')||short(me),action:idx>=0?'remove':'add',timestamp:Date.now()});
+    publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'reaction',msg_id:msgId,emoji,sender_id:me,sender_name:LS.get('display_name','')||short(me),action:idx>=0?'remove':'add',timestamp:Date.now()});
   }
-  // Re-render reactions on this message
   renderReactionsOnMsg(chatKey,msgId);
 }
 
+function isSafeReactionEmoji(emoji){
+  return typeof emoji==='string'&&emoji.length>0&&emoji.length<=16&&!/[<>&"'\x00-\x1f]/.test(emoji);
+}
+
+function isSafeRemoteId(id){
+  return typeof id==='string'&&id.length>0&&id.length<=128&&/^[a-zA-Z0-9_.:-]+$/.test(id);
+}
+
 function applyRemoteReaction(chatKey,msgId,emoji,senderId,action){
+  if(!isSafeReactionEmoji(emoji)||!isSafeRemoteId(msgId))return;
   if(!reactionStore[chatKey])reactionStore[chatKey]={};
   if(!reactionStore[chatKey][msgId])reactionStore[chatKey][msgId]={};
   const r=reactionStore[chatKey][msgId];
@@ -1544,9 +1604,9 @@ function renderReactionsOnMsg(chatKey,msgId){
   if(!el)return;
   const r=getReactions(chatKey,msgId);
   const me=S.get('agentId');
-  el.innerHTML=Object.entries(r).map(([emoji,users])=>
+  el.innerHTML=Object.entries(r).filter(([emoji])=>isSafeReactionEmoji(emoji)).map(([emoji,users])=>
     '<button class="rxn'+(users.includes(me)?' mine':'')+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(emoji)+'\')">'
-    +emoji+'<span class="cnt">'+users.length+'</span></button>'
+    +esc(emoji)+'<span class="cnt">'+users.length+'</span></button>'
   ).join('');
 }
 
@@ -1661,24 +1721,23 @@ function startEditMsg(chatKey,msgId){
   document.getElementById('edit-'+msgId).focus();
 }
 
-function confirmEdit(chatKey,msgId){
+async function confirmEdit(chatKey,msgId){
+  if(S.get('view')==='space'&&currentSpaceConfidentiality==='signed_public')return;
   const inp=document.getElementById('edit-'+msgId);
   if(!inp)return;
   const newText=inp.value.trim();
   if(!newText)return;
-  // Update local
+  if(currentChannelTopic){
+    const ok=await publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'edit',msg_id:msgId,text:newText,sender_id:S.get('agentId'),timestamp:Date.now()});
+    if(!ok)return;
+  }
   const msgs=chatHistory[chatKey]||[];
   const msg=msgs.find(m=>m.id===msgId);
   if(msg)msg.text=newText;
   if(!editedMsgs[chatKey])editedMsgs[chatKey]={};
   editedMsgs[chatKey][msgId]={text:newText,timestamp:Date.now()};
   saveEditsDeletes(chatKey);
-  LS.set('chat_'+chatKey,chatHistory[chatKey]);
-  // Publish edit event
-  if(currentChannelTopic){
-    wsPub(currentChannelTopic,{type:'edit',msg_id:msgId,text:newText,sender_id:S.get('agentId'),timestamp:Date.now()});
-  }
-  // Re-render message body
+  LS.set('chat_'+chatKey,(chatHistory[chatKey]||[]).slice(-200));
   const body=document.querySelector('#msg-'+msgId+' .body');
   if(body)body.innerHTML=renderMd(newText)+'<span class="edited-tag">(edited)</span>';
 }
@@ -1693,15 +1752,15 @@ function cancelEdit(chatKey,msgId){
   }
 }
 
-function deleteMsg(chatKey,msgId){
+async function deleteMsg(chatKey,msgId){
+  if(S.get('view')==='space'&&currentSpaceConfidentiality==='signed_public')return;
+  if(currentChannelTopic){
+    const ok=await publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'delete',msg_id:msgId,sender_id:S.get('agentId'),timestamp:Date.now()});
+    if(!ok)return;
+  }
   if(!deletedMsgs[chatKey])deletedMsgs[chatKey]=new Set();
   deletedMsgs[chatKey].add(msgId);
   saveEditsDeletes(chatKey);
-  // Publish delete event
-  if(currentChannelTopic){
-    wsPub(currentChannelTopic,{type:'delete',msg_id:msgId,sender_id:S.get('agentId'),timestamp:Date.now()});
-  }
-  // Update DOM
   const msgEl=document.getElementById('msg-'+msgId);
   if(msgEl){
     msgEl.classList.add('deleted');
@@ -1714,19 +1773,23 @@ function deleteMsg(chatKey,msgId){
   }
 }
 
-function applyRemoteEdit(chatKey,msgId,newText){
+function applyRemoteEdit(chatKey,msgId,newText,senderId){
   const msgs=chatHistory[chatKey]||[];
-  const msg=msgs.find(m=>m.id===msgId);
-  if(msg)msg.text=newText;
+  const msg=msgs.find(m=>m.id===msgId)||msgCache[msgId];
+  if(!msg||!senderId||msg.sender_id!==senderId)return;
+  msg.text=newText;
   if(!editedMsgs[chatKey])editedMsgs[chatKey]={};
   editedMsgs[chatKey][msgId]={text:newText,timestamp:Date.now()};
   saveEditsDeletes(chatKey);
-  LS.set('chat_'+chatKey,chatHistory[chatKey]);
+  LS.set('chat_'+chatKey,(chatHistory[chatKey]||[]).slice(-200));
   const body=document.querySelector('#msg-'+msgId+' .body');
   if(body)body.innerHTML=renderMd(newText)+'<span class="edited-tag">(edited)</span>';
 }
 
-function applyRemoteDelete(chatKey,msgId){
+function applyRemoteDelete(chatKey,msgId,senderId){
+  const msgs=chatHistory[chatKey]||[];
+  const msg=msgs.find(m=>m.id===msgId)||msgCache[msgId];
+  if(!msg||!senderId||msg.sender_id!==senderId)return;
   if(!deletedMsgs[chatKey])deletedMsgs[chatKey]=new Set();
   deletedMsgs[chatKey].add(msgId);
   saveEditsDeletes(chatKey);
@@ -1747,10 +1810,11 @@ let lastTypingSent=0;
 
 function sendTypingEvent(){
   if(!currentChannelTopic)return;
+  if(S.get('view')==='space'&&currentSpaceConfidentiality==='signed_public')return;
   const now=Date.now();
-  if(now-lastTypingSent<2000)return; // Throttle to every 2s
+  if(now-lastTypingSent<2000)return;
   lastTypingSent=now;
-  wsPub(currentChannelTopic,{type:'typing',sender_id:S.get('agentId'),sender_name:LS.get('display_name','')||short(S.get('agentId')),timestamp:now});
+  publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'typing',sender_id:S.get('agentId'),sender_name:LS.get('display_name','')||short(S.get('agentId')),timestamp:now});
 }
 
 function applyTypingEvent(topic,senderId,senderName){
@@ -1802,6 +1866,7 @@ function getPinned(chatKey){return pinnedCache[chatKey]||LS.get('pins_'+chatKey,
 function savePinned(chatKey){LS.set('pins_'+chatKey,pinnedCache[chatKey]||[])}
 
 async function togglePin(chatKey,msgId){
+  if(S.get('view')==='space'&&currentSpaceConfidentiality==='signed_public')return;
   if(!pinnedCache[chatKey])pinnedCache[chatKey]=getPinned(chatKey);
   const idx=pinnedCache[chatKey].indexOf(msgId);
   if(idx>=0)pinnedCache[chatKey].splice(idx,1); else{
@@ -1809,9 +1874,8 @@ async function togglePin(chatKey,msgId){
     pinnedCache[chatKey].push(msgId);
   }
   savePinned(chatKey);
-  // Publish pin event via gossip
   if(currentChannelTopic){
-    wsPub(currentChannelTopic,{type:'pin',msg_id:msgId,action:idx>=0?'unpin':'pin',sender_id:S.get('agentId'),timestamp:Date.now()});
+    publishSpaceGossip(S.get('spaceId'),currentChannelTopic,{type:'pin',msg_id:msgId,action:idx>=0?'unpin':'pin',sender_id:S.get('agentId'),timestamp:Date.now()});
   }
   renderPinnedBar();
   toast(idx>=0?'Message unpinned':'Message pinned','info');
@@ -2017,15 +2081,16 @@ function renderSidebar(){
   let sh='';
   sortedGroups.forEach(g=>{
     const active=S.get('view')==='space'&&sid===g.group_id;
-    sh+='<div class="sb-item'+(active?' active':'')+'" onclick="navigateSpace(\''+g.group_id+'\',\'chat\')" title="'+esc(g.name||'Space')+'">';
+    const isSignedPub=isSignedPublicSpace(g);
+    sh+='<div class="sb-item'+(active?' active':'')+'" onclick="navigateSpace(\''+escJs(g.group_id)+'\',\'chat\')" title="'+esc(g.name||'Space')+'">';
     sh+='<span class="dot" style="background:var(--gn)"></span>';
     sh+='<span>'+esc(g.name||short(g.group_id))+'</span>';
     sh+='</div>';
     if(active){
       sh+='<div class="sb-sub">';
-      // Channels for this space
-      const channels=getSpaceChannels(g.group_id);
-      const curChan=S.get('channel')||'general';
+      // SignedPublic spaces share one authoritative #general stream.
+      const channels=isSignedPub?defaultChannels(g.group_id):getSpaceChannels(g.group_id);
+      const curChan=isSignedPub?'general':(S.get('channel')||'general');
       channels.forEach(ch=>{
         const chActive=sapp==='chat'&&curChan===ch.name;
         const unread=LS.get('unread_ch_'+g.group_id+'_'+ch.name,0);
@@ -2034,12 +2099,14 @@ function renderSidebar(){
         if(unread>0)sh+='<span class="unread">'+unread+'</span>';
         sh+='</div>';
       });
-      sh+='<div class="channel-item" onclick="showCreateChannel(\''+g.group_id+'\')" style="color:var(--tx3)"><span class="hash">+</span><span>Add channel</span></div>';
+      if(!isSignedPub){
+        sh+='<div class="channel-item" onclick="showCreateChannel(\''+escJs(g.group_id)+'\')" style="color:var(--tx3)"><span class="hash">+</span><span>Add channel</span></div>';
+      }
       // Other apps
       const appIcons={board:'&#128203;',files:'&#128193;',swarm:'&#128029;',feed:'&#128240;',wiki:'&#128214;',web:'&#127760;',scratch:'&#128221;'};
       const apps=['board','files','swarm','feed','wiki','web','scratch'];
       apps.forEach(a=>{
-        sh+='<div class="sb-item'+(sapp===a?' active':'')+'" onclick="navigateSpace(\''+g.group_id+'\',\''+a+'\')">';
+        sh+='<div class="sb-item'+(sapp===a?' active':'')+'" onclick="navigateSpace(\''+escJs(g.group_id)+'\',\''+a+'\')">';
         sh+='<span class="icon">'+appIcons[a]+'</span><span>'+a.charAt(0).toUpperCase()+a.slice(1)+'</span></div>';
       });
       sh+='</div>';
@@ -2053,9 +2120,9 @@ function renderSidebar(){
   sortedContacts.forEach(c=>{
     const active=S.get('view')==='dm'&&dmt===c.agent_id;
     const unread=LS.get('unread_'+c.agent_id,0);
-    dh+='<div class="sb-item'+(active?' active':'')+'" onclick="navigateDm(\''+c.agent_id+'\')" title="'+esc(c.label||c.agent_id)+'">';
+    dh+='<div class="sb-item'+(active?' active':'')+'" onclick="navigateDm(\''+escJs(c.agent_id)+'\')" title="'+esc(c.label||c.agent_id)+'">';
     dh+=presenceHtml(false);
-    dh+='<span>'+(c.label||short(c.agent_id))+'</span>';
+    dh+='<span>'+esc(c.label||short(c.agent_id))+'</span>';
     if(unread>0)dh+='<span class="badge-count">'+unread+'</span>';
     dh+='</div>';
   });
@@ -2475,15 +2542,78 @@ function renderIdentityChainLegacy(){
    ═══════════════════════════════════════════════════════════════════ */
 let spaceChatTopic='',spaceBoardId='',spaceKvId='',currentChannelTopic='';
 let boardSymphonyOnly=LS.get('board_symphony_only',false),boardPollSeq=0;
-// Confidentiality of the currently-mounted space, fetched from
-// `GET /groups/:id`. Used by sendSpaceChat() to route SignedPublic
-// groups through `POST /groups/:id/send` (which produces an
-// authority-signed GroupPublicMessage) instead of the gossip path.
-// 'mls_encrypted' (or empty) keeps the legacy behaviour.
 let currentSpaceConfidentiality='';
+let currentSpacePolicy=null;
+let currentSpaceRole=null;
+let currentSpaceMembershipState='';
+const currentSpaceMembers={}; // { sid: { agent_id: display_name } }
+const signedPublicPagination={}; // { sid: { hasMore, nextBefore, loading } }
+let currentSwarmTopics=[];
 const chatHistory={};
 const swarmTasks={};
 const threadReplies={}; // { threadId: [messages] }
+
+function isSignedPublicSpace(gOrSid){
+  const sid=typeof gOrSid==='string'?gOrSid:(gOrSid&&gOrSid.group_id);
+  if(sid&&sid===S.get('spaceId')&&currentSpaceConfidentiality)return currentSpaceConfidentiality==='signed_public';
+  const g=typeof gOrSid==='object'&&gOrSid?gOrSid:(S.get('groups')||[]).find(x=>x.group_id===sid);
+  return !!(g&&((g.policy&&g.policy.confidentiality==='signed_public')||(g.policy_summary&&g.policy_summary.confidentiality==='signed_public')));
+}
+
+function isEncryptedSpace(gOrSid){
+  // Fail-closed: anything not positively identified as signed_public is
+  // treated as encrypted so unknown future confidentiality modes never degrade to plaintext.
+  return !isSignedPublicSpace(gOrSid);
+}
+
+function resolveKnownSenderName(sid,agentId){
+  if(!agentId)return '';
+  const bySpace=currentSpaceMembers[sid];
+  if(bySpace&&bySpace[agentId])return bySpace[agentId];
+  const contact=(S.get('contacts')||[]).find(c=>c.agent_id===agentId);
+  if(contact&&contact.label)return contact.label;
+  const disc=(S.get('discovered')||[]).find(d=>d.agent_id===agentId);
+  if(disc&&disc.display_name)return disc.display_name;
+  return '';
+}
+
+function resolveSpaceSenderName(sid,agentId){
+  if(!agentId)return 'peer';
+  return resolveKnownSenderName(sid,agentId)||short(agentId);
+}
+
+async function publishSpaceGossip(sid,topic,payload){
+  if(!topic)return false;
+  if(sid&&isEncryptedSpace(sid)){
+    const enc=await api('/groups/'+encSeg(sid)+'/secure/encrypt',{
+      method:'POST',
+      body:JSON.stringify({payload_b64:u8encode(JSON.stringify(payload))})
+    });
+    if(!enc||!enc.ok||!enc.ciphertext_b64){
+      toast('Encrypted send failed: '+apiError(enc),'error');
+      return false;
+    }
+    const env={v:1,enc:true,ciphertext_b64:enc.ciphertext_b64,secret_epoch:enc.secret_epoch};
+    if(enc.nonce_b64)env.nonce_b64=enc.nonce_b64;
+    wsPub(topic,env);
+    return true;
+  }
+  wsPub(topic,payload);
+  return true;
+}
+
+async function decryptSpaceGossip(sid,data){
+  if(!sid||!data||!data.ciphertext_b64)return null;
+  const decBody={ciphertext_b64:data.ciphertext_b64};
+  if(data.nonce_b64)decBody.nonce_b64=data.nonce_b64;
+  if(data.secret_epoch!==undefined&&data.secret_epoch!==null)decBody.secret_epoch=data.secret_epoch;
+  const r=await api('/groups/'+encSeg(sid)+'/secure/decrypt',{
+    method:'POST',
+    body:JSON.stringify(decBody)
+  });
+  if(!r||!r.ok||!r.payload_b64)return null;
+  try{return JSON.parse(u8decode(r.payload_b64))}catch(e){return null}
+}
 
 function renderSpace(){
   const sid=S.get('spaceId');
@@ -2494,12 +2624,12 @@ function renderSpace(){
   return `<div class="row mb" style="justify-content:space-between;align-items:center">
     <h2 style="margin:0">${esc(name)}</h2>
     <div class="row" style="gap:4px">
-      <button class="ghost" onclick="showSpaceInfo('${sid}')" title="Space info">&#9432;</button>
-      <button class="ghost" onclick="genSpaceInvite('${sid}')" title="Invite">&#128279;</button>
+      <button class="ghost" onclick="showSpaceInfo('${escJs(sid)}')" title="Space info">&#9432;</button>
+      <button class="ghost" onclick="genSpaceInvite('${escJs(sid)}')" title="Mint fresh single-use invite">&#128279;</button>
     </div>
   </div>
   <div class="sub-tabs">${tabs.map(t=>
-    `<button class="${t===app?'active':''}" onclick="navigateSpace('${sid}','${t}')">${t==='kv'?'Store':t.charAt(0).toUpperCase()+t.slice(1)}</button>`
+    `<button class="${t===app?'active':''}" onclick="navigateSpace('${escJs(sid)}','${t}')">${t==='kv'?'Store':t.charAt(0).toUpperCase()+t.slice(1)}</button>`
   ).join('')}</div>
   <div id="space-content"></div>`;
 }
@@ -2507,62 +2637,61 @@ function renderSpace(){
 async function mountSpace(){
   const sid=S.get('spaceId');
   const app=S.get('spaceApp');
-  // Generation guard: three awaited REST calls happen before the topic
-  // subscribes below. If the user navigates elsewhere (or mounts another
-  // space) mid-flight, a stale continuation must not subscribe topics for
-  // a space nobody is viewing (leak) or resurrect a subscription the
-  // newer view just dropped.
   const gen=++spaceMountGen;
   const stale=()=>gen!==spaceMountGen||S.get('view')!=='space'||S.get('spaceId')!==sid;
-  // Load channels for this space
-  await loadSpaceChannels(sid);
-  if(stale())return;
-  renderSidebar();
-  // Subscribe to the base chat topic (for backward compat) and channel topic
+  currentSwarmTopics.forEach(t=>wsUnsub(t));
+  currentSwarmTopics=[];
   const g=await api('/groups/'+sid);
   if(stale())return;
+  currentSpacePolicy=null;
+  currentSpaceRole=null;
+  currentSpaceMembershipState='';
+  currentSpaceConfidentiality='';
   if(g&&g.ok){
     spaceChatTopic=g.chat_topic||'';
-    if(spaceChatTopic)wsSub(spaceChatTopic);
-    // Capture confidentiality so sendSpaceChat() can branch
-    // between gossip (MlsEncrypted) and the daemon-signed REST path
-    // (SignedPublic). Fall back to '' if the daemon shape changes.
-    currentSpaceConfidentiality=(g.policy && g.policy.confidentiality) || '';
+    currentSpacePolicy=g.policy||null;
+    currentSpaceConfidentiality=(g.policy&&g.policy.confidentiality)||'';
+    currentSpaceMembershipState=g.membership_state||'';
+    const members=Array.isArray(g.members)?g.members:[];
+    const map={};
+    const myAid=S.get('agentId')||'';
+    members.forEach(m=>{
+      if(m&&m.agent_id){
+        if(m.display_name&&m.display_name.trim())map[m.agent_id]=m.display_name.trim();
+        if(m.agent_id===myAid)currentSpaceRole=m.role||null;
+      }
+    });
+    currentSpaceMembers[sid]=map;
   }
-  // Tear down any previous SignedPublic receive state, then re-arm
-  // for this space if it is SignedPublic. Two receive paths run in
-  // parallel:
-  //   1. WebSocket push on `x0x.groups.public.{stable_group_id}` for
-  //      sub-second latency. The daemon publishes the signed envelope
-  //      on that topic.
-  //   2. 30 s poll of `GET /groups/:id/messages` as a backstop for WS
-  //      reconnects / drops. Same dedup key as the push path.
-  // All three surfaces (GUI, Dioxus, SwiftUI) use the same topic +
-  // dedup strategy.
+  if(currentSpaceConfidentiality!=='signed_public'){
+    await loadSpaceChannels(sid);
+    if(stale())return;
+  }
+  renderSidebar();
   if(signedPublicPollTimer){clearInterval(signedPublicPollTimer);signedPublicPollTimer=null}
+  if(signedPublicBackfillTimer){clearTimeout(signedPublicBackfillTimer);signedPublicBackfillTimer=null}
   if(signedPublicTopic){wsUnsub(signedPublicTopic);signedPublicTopic=''}
   signedPublicSeen.clear();
+  signedPublicIdByKey.clear();
   if(currentSpaceConfidentiality==='signed_public'){
-    // Fetch the stable group_id (Phase D.3) which is what the daemon
-    // uses for the public topic; it can differ from the mls_group_id
-    // we use for other REST calls.
-    const st=await api('/groups/'+sid+'/state');
+    const st=await api('/groups/'+encSeg(sid)+'/state');
     if(stale())return;
     if(st&&st.ok&&st.group_id){
       signedPublicTopic='x0x.groups.public.'+st.group_id;
       signedPublicSpaceId=sid;
       wsSub(signedPublicTopic);
     }
-    // Immediate poll so any messages cached before the WS connected
-    // appear straight away.
+    currentChannelTopic='';
     signedPublicPoll(sid,true);
     signedPublicPollTimer=setInterval(()=>{
       if(S.get('view')==='space'&&S.get('spaceId')===sid)signedPublicPoll(sid,false);
     },30000);
+  }else{
+    if(spaceChatTopic)wsSub(spaceChatTopic);
+    const chan=S.get('channel')||'general';
+    currentChannelTopic=getChannelTopic(sid,chan);
+    wsSub(currentChannelTopic);
   }
-  const chan=S.get('channel')||'general';
-  currentChannelTopic=getChannelTopic(sid,chan);
-  wsSub(currentChannelTopic);
   const el=document.getElementById('space-content');
   if(!el)return;
   switch(app){
@@ -2580,35 +2709,31 @@ async function mountSpace(){
 
 // --- Space: Chat (Channel-aware with threads) ---
 function renderSpaceChat(el,sid){
-  const chan=S.get('channel')||'general';
-  const channels=getSpaceChannels(sid);
+  const isSignedPub=currentSpaceConfidentiality==='signed_public';
+  const chan=isSignedPub?'general':(S.get('channel')||'general');
+  const channels=isSignedPub?defaultChannels(sid):getSpaceChannels(sid);
   const chanMeta=channels.find(c=>c.name===chan)||{name:chan,description:''};
   const chatKey=sid+'_'+chan;
   const hist=LS.get('chat_'+chatKey,[]);
   if(!chatHistory[chatKey])chatHistory[chatKey]=hist;
   loadReactions(chatKey);loadEditsDeletes(chatKey);
   pinnedCache[chatKey]=getPinned(chatKey);
-  // Reset unread count for this channel
   LS.set('unread_ch_'+sid+'_'+chan,0);
   renderSidebar();
   const cats=Object.keys(EMOJI_CATS);
-  const pins=getPinned(chatKey);
-  el.innerHTML=`${channelErrors[sid]?'<div class="card mb" style="font-size:12px;color:var(--rd)">'+esc(channelErrors[sid])+'</div>':''}<div class="channel-header">
-    <span class="hash" style="font-size:18px;color:var(--tx3)">#</span>
-    <div style="flex:1">
-      <div class="name">${esc(chan)}</div>
-      ${chanMeta.description?'<div class="desc">'+esc(chanMeta.description)+'</div>':''}
-    </div>
-    <button class="ghost" title="Search messages" onclick="toggleSearch()" style="font-size:16px">🔍</button>
-  </div>
-  <div id="pinned-bar" class="pinned-bar" style="${pins.length?'':'display:none'}" onclick="togglePinnedPanel()">${pins.length?'📌 <strong>'+pins.length+'</strong> pinned message'+(pins.length>1?'s':''):''}</div>
-  <div id="pinned-panel" class="pinned-panel" style="display:none"></div>
-  <div class="chat-wrap" style="position:relative">
-    <div id="search-overlay" class="search-overlay" style="display:none"></div>
-    <div class="chat-msgs" id="chat-msgs"></div>
-    <div id="typing-indicator" class="typing-indicator"></div>
-    <div id="compose-quote" class="compose-quote" style="display:none"></div>
-    <div class="chat-input" style="position:relative">
+  const pins=isSignedPub?[]:getPinned(chatKey);
+  const isAdminOrOwner=currentSpaceRole==='admin'||currentSpaceRole==='owner';
+  const adminOnlyBlocked=isSignedPub&&currentSpacePolicy&&currentSpacePolicy.write_access==='admin_only'&&!isAdminOrOwner;
+  const guestBlocked=isSignedPub&&currentSpaceMembershipState&&currentSpaceMembershipState!=='active'&&currentSpacePolicy&&currentSpacePolicy.write_access!=='moderated_public';
+  let composerHtml='';
+  if(adminOnlyBlocked){
+    composerHtml='<div class="card" style="font-size:12px;color:var(--tx3);padding:10px 14px;text-align:center">Announcement space — only admins can post.</div>';
+  }else if(guestBlocked){
+    const openJoinBtn=(currentSpacePolicy&&currentSpacePolicy.admission==='open_join')
+      ?` <button class="pri" style="margin-left:8px;padding:4px 10px;font-size:11px" onclick="openJoinFromSpace('${escJs(sid)}')">Join space</button>`:'';
+    composerHtml=`<div class="card" style="font-size:12px;color:var(--tx3);padding:10px 14px;text-align:center">You are browsing this public space as a guest.${openJoinBtn}</div>`;
+  }else{
+    composerHtml=`<div class="chat-input" style="position:relative">
       <div id="mention-ac" class="mention-ac"></div>
       <button class="ghost" title="Emoji" onclick="toggleComposerEmoji()" style="font-size:16px;padding:6px">😀</button>
       <input id="chat-in" placeholder="Message #${esc(chan)}…" oninput="onChatInput(event)" onkeydown="if(handleMentionKey(event))return;if(event.key==='Enter')sendSpaceChat()">
@@ -2618,12 +2743,63 @@ function renderSpaceChat(el,sid){
         <div class="ep-tabs">${cats.map((c,i)=>'<button class="'+(i===0?'active':'')+'" onclick="switchComposerEmojiTab(this,\''+escJs(c)+'\')" title="'+esc(c)+'">'+EMOJI_CATS[c][0]+'</button>').join('')}</div>
         <div class="ep-grid"></div>
       </div>
+    </div>`;
+  }
+  const encPill=currentSpaceConfidentiality==='mls_encrypted'
+    ?'<span class="policy policy-encrypted" style="font-size:10px;margin-right:6px">&#128274; E2E</span>'
+    :(isSignedPub?'<span class="nag-badge warn" style="font-size:10px;margin-right:6px">Signed public</span>':'');
+  el.innerHTML=`${channelErrors[sid]&&!isSignedPub?'<div class="card mb" style="font-size:12px;color:var(--rd)">'+esc(channelErrors[sid])+'</div>':''}<div class="channel-header">
+    <span class="hash" style="font-size:18px;color:var(--tx3)">#</span>
+    <div style="flex:1">
+      <div class="name">${esc(chan)}</div>
+      ${chanMeta.description?'<div class="desc">'+esc(chanMeta.description)+'</div>':''}
     </div>
+    ${encPill}
+    <button class="ghost" title="Search messages" onclick="toggleSearch()" style="font-size:16px">🔍</button>
+  </div>
+  <div id="pinned-bar" class="pinned-bar" style="${pins.length?'':'display:none'}" onclick="togglePinnedPanel()">${pins.length?'📌 <strong>'+pins.length+'</strong> pinned message'+(pins.length>1?'s':''):''}</div>
+  <div id="pinned-panel" class="pinned-panel" style="display:none"></div>
+  <div class="chat-wrap" style="position:relative">
+    <div id="search-overlay" class="search-overlay" style="display:none"></div>
+    <div id="chat-load-older" style="display:none;text-align:center;padding:6px 0"><button class="ghost" style="font-size:11px" onclick="loadOlderSignedPublicMessages('${escJs(sid)}')">Load older messages</button></div>
+    <div class="chat-msgs" id="chat-msgs"></div>
+    <div id="typing-indicator" class="typing-indicator"></div>
+    <div id="compose-quote" class="compose-quote" style="display:none"></div>
+    ${composerHtml}
   </div>`;
   const msgs=document.getElementById('chat-msgs');
   (chatHistory[chatKey]||[]).forEach(m=>appendChatMsg(msgs,m,sid));
   msgs.scrollTop=msgs.scrollHeight;
+  updateLoadOlderBar(sid);
   clearQuote();
+}
+
+async function openJoinFromSpace(sid){
+  const dn=LS.get('display_name','').trim();
+  const body={};
+  if(dn)body.display_name=dn;
+  const r=await api('/groups/'+encSeg(sid)+'/open-join',{method:'POST',body:JSON.stringify(body)});
+  if(r&&r.ok){
+    toast('Join request sent to space authority — membership will activate shortly.','success');
+    await pollGroups();
+    mountSpace();
+  }else{
+    toast('Join failed: '+apiError(r),'error');
+  }
+}
+
+function updateLoadOlderBar(sid){
+  if(S.get('view')!=='space'||S.get('spaceId')!==sid)return;
+  const bar=document.getElementById('chat-load-older');
+  if(!bar)return;
+  const pg=signedPublicPagination[sid];
+  if(currentSpaceConfidentiality==='signed_public'&&pg&&pg.hasMore&&pg.nextBefore){
+    bar.style.display='block';
+    const btn=bar.querySelector('button');
+    if(btn){btn.disabled=!!pg.loading;btn.textContent=pg.loading?'Loading…':'Load older messages'}
+  }else{
+    bar.style.display='none';
+  }
 }
 
 function filterComposerEmoji(input){
@@ -2635,16 +2811,12 @@ function filterComposerEmoji(input){
   grid.innerHTML=all.map(e=>'<button onclick="insertComposerEmoji(\''+escJs(e)+'\')">'+e+'</button>').join('');
 }
 
-function sendSpaceChat(){
+async function sendSpaceChat(){
   const inp=document.getElementById('chat-in');
+  if(!inp)return;
   const t=inp.value.trim();if(!t)return;
   const sid=S.get('spaceId');
   const chan=S.get('channel')||'general';
-  // SignedPublic groups must go through `POST /groups/:id/send` so
-  // the daemon authority-signs the message and publishes it on the
-  // public topic. Skip the gossip path for those — non-members would
-  // not be able to verify a raw gossip post anyway, and the daemon
-  // already publishes the signed envelope on its own topic.
   if(currentSpaceConfidentiality==='signed_public'){
     sendSpaceChatSignedPublic(sid,t,inp);
     return;
@@ -2653,32 +2825,20 @@ function sendSpaceChat(){
   const name=LS.get('display_name','')||short(S.get('agentId'));
   const msgId=generateMsgId();
   const msg={id:msgId,text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),channel:chan};
-  // Attach quote if replying
   if(quoteMsg){msg.quote_id=quoteMsg.id;msg.quote_text=quoteMsg.text;msg.quote_name=quoteMsg.sender_name}
-  wsPub(currentChannelTopic,msg);
-  // Also pub to legacy base topic for backward compat
-  if(spaceChatTopic&&spaceChatTopic!==currentChannelTopic)wsPub(spaceChatTopic,msg);
+  const ok=await publishSpaceGossip(sid,currentChannelTopic,msg);
+  if(!ok)return;
+  if(spaceChatTopic&&spaceChatTopic!==currentChannelTopic){
+    await publishSpaceGossip(sid,spaceChatTopic,msg);
+  }
   addChatMsg(sid+'_'+chan,{...msg,own:true});
   inp.value='';inp.focus();
   clearQuote();
-  // Check for mentions and notify
   if(isMentioned(t))toast('You mentioned yourself','info');
 }
 
-/// SignedPublic send path (Phase E). Uses the REST endpoint so the
-/// daemon produces a real `GroupPublicMessage` (state-bound,
-/// ML-DSA-signed), publishes it to the public topic
-/// (`x0x.groups.public.{stable_group_id}`), and caches it locally.
-///
-/// Own-message rendering is driven by the WebSocket push subscription
-/// on the public topic and, as a reconnect backstop, the 30 s
-/// `signedPublicPoll()` loop. All three surfaces (GUI, Dioxus,
-/// SwiftUI) use the same push + poll architecture for SignedPublic
-/// receive with a shared `(author, timestamp, signature[0..12])`
-/// dedup key, so cross-peer visibility is consistent regardless of
-/// which client sent the message.
 async function sendSpaceChatSignedPublic(sid,text,inp){
-  const r=await api('/groups/'+sid+'/send',{
+  const r=await api('/groups/'+encSeg(sid)+'/send',{
     method:'POST',
     body:JSON.stringify({body:text,kind:'chat'})
   });
@@ -2686,59 +2846,186 @@ async function sendSpaceChatSignedPublic(sid,text,inp){
     inp.value='';inp.focus();
     clearQuote();
     if(isMentioned(text))toast('You mentioned yourself','info');
-    // Trigger one immediate poll tick so the sender's own message
-    // renders even if the WS subscription is still registering.
     signedPublicPoll(sid,true);
   }else{
     toast('Send failed: '+(r&&r.error||'unknown'),'error');
   }
 }
 
-/// Poll `GET /groups/:id/messages` for SignedPublic groups and merge
-/// the result into the chat history. The daemon has already validated
-/// signatures, write-access, and banned-author constraints — we just
-/// render. Runs as a reconnect backstop every 30 s while the user is
-/// viewing a SignedPublic space; the primary receive path is the
-/// WebSocket subscription to `x0x.groups.public.{stable_group_id}`
-/// armed in `mountSpace`. Torn down in `mountSpace` when leaving the
-/// space.
 let signedPublicPollTimer=null;
+let signedPublicBackfillTimer=null;
 let signedPublicTopic='';
 let spaceMountGen=0;
 let signedPublicSpaceId='';
 const signedPublicSeen=new Set();
+const signedPublicIdByKey=new Map();
+
+function isCanonicalMsgId(id){
+  return typeof id==='string'&&/^[0-9a-f]{64}$/.test(id);
+}
+
+function scheduleSignedPublicBackfill(sid){
+  if(!sid||signedPublicBackfillTimer)return;
+  signedPublicBackfillTimer=setTimeout(()=>{
+    signedPublicBackfillTimer=null;
+    if(S.get('view')==='space'&&S.get('spaceId')===sid&&currentSpaceConfidentiality==='signed_public'){
+      signedPublicPoll(sid,true);
+    }
+  },250);
+}
+
+function upgradeSignedPublicMsgId(sid,chatKey,dedupKey,canonicalMsg){
+  if(!canonicalMsg||!isCanonicalMsgId(canonicalMsg.id))return false;
+  const prevId=signedPublicIdByKey.get(dedupKey);
+  if(!prevId||prevId===canonicalMsg.id)return false;
+  signedPublicIdByKey.set(dedupKey,canonicalMsg.id);
+  const existing=msgCache[prevId];
+  delete msgCache[prevId];
+  const updated=existing?Object.assign(existing,{id:canonicalMsg.id}):canonicalMsg;
+  cacheMsg(updated);
+  const hist=chatHistory[chatKey];
+  if(Array.isArray(hist)){
+    for(let i=0;i<hist.length;i++){
+      if(hist[i]&&hist[i].id===prevId){
+        hist[i].id=canonicalMsg.id;
+        cacheMsg(hist[i]);
+      }
+    }
+    LS.set('chat_'+chatKey,hist.slice(-200));
+  }
+  if(canonicalMsg.thread_root&&Array.isArray(threadReplies[canonicalMsg.thread_root])){
+    const reps=threadReplies[canonicalMsg.thread_root];
+    for(let i=0;i<reps.length;i++){
+      if(reps[i]&&reps[i].id===prevId)reps[i].id=canonicalMsg.id;
+    }
+  }
+  if(S.get('detailType')==='thread'&&S.get('threadId')===prevId){
+    S.set('threadId',canonicalMsg.id);
+  }
+  const oldEl=document.getElementById('msg-'+prevId);
+  if(oldEl&&oldEl.parentNode){
+    const tmp=document.createElement('div');
+    appendChatMsg(tmp,updated,sid);
+    if(tmp.firstChild)oldEl.replaceWith(tmp.firstChild);
+  }
+  return true;
+}
+
+function normalizeSignedPublicMsg(sid,m){
+  const myAid=S.get('agentId')||'';
+  const sigKey=(m.author_agent_id||'')+':'+(m.timestamp||0)+':'+((m.signature||'').slice(0,12));
+  const id=m.msg_id||sigKey;
+  return {
+    dedupKey:sigKey,
+    msg:{
+      id,
+      text:m.body||'',
+      sender_name:resolveSpaceSenderName(sid,m.author_agent_id),
+      sender_id:m.author_agent_id||'',
+      timestamp:m.timestamp||Date.now(),
+      channel:'general',
+      thread_root:m.thread_root||'',
+      signed_public:true,
+      own:m.author_agent_id===myAid,
+    }
+  };
+}
+
 async function signedPublicPoll(sid,force){
   if(!sid)return;
   if(currentSpaceConfidentiality!=='signed_public')return;
-  const r=await api('/groups/'+sid+'/messages');
+  const r=await api('/groups/'+encSeg(sid)+'/messages?limit=100');
   if(!r||!r.ok||!Array.isArray(r.messages))return;
-  const chan=S.get('channel')||'general';
-  const chatKey=sid+'_'+chan;
-  const myAid=S.get('agentId')||'';
+  const chatKey=sid+'_general';
+  const prevPg=signedPublicPagination[sid];
+  if(!prevPg){
+    signedPublicPagination[sid]={hasMore:!!r.has_more,nextBefore:r.next_before||null,loading:false,exhausted:!r.has_more};
+  }else if(!prevPg.exhausted){
+    // Preserve an already-walked older cursor; never resurrect Load Older once exhausted.
+    if(r.next_before&&(prevPg.nextBefore===null||r.next_before<prevPg.nextBefore)){
+      prevPg.nextBefore=r.next_before;
+    }
+    if(r.has_more)prevPg.hasMore=true;
+  }
   let appended=false;
   for(const m of r.messages){
-    const key=(m.author_agent_id||'')+':'+(m.timestamp||0)+':'+((m.signature||'').slice(0,12));
-    if(signedPublicSeen.has(key))continue;
-    signedPublicSeen.add(key);
-    const msg={
-      id:key,
-      text:m.body||'',
-      sender_name:short(m.author_agent_id)||'peer',
-      sender_id:m.author_agent_id||'',
-      timestamp:m.timestamp||Date.now(),
-      channel:chan,
-      signed_public:true,
-      own:m.author_agent_id===myAid,
-    };
-    addChatMsg(chatKey,msg);
+    const {dedupKey,msg}=normalizeSignedPublicMsg(sid,m);
+    if(signedPublicSeen.has(dedupKey)){
+      upgradeSignedPublicMsgId(sid,chatKey,dedupKey,msg);
+      continue;
+    }
+    signedPublicSeen.add(dedupKey);
+    signedPublicIdByKey.set(dedupKey,msg.id);
+    if(msg.thread_root){
+      addThreadReply(msg.thread_root,msg);
+    }else{
+      addChatMsg(chatKey,msg);
+    }
     appended=true;
   }
-  // Keep the seen set bounded on long-running views.
+  updateLoadOlderBar(sid);
   if(signedPublicSeen.size>5000){
     const it=signedPublicSeen.values();
-    for(let i=0;i<1000;i++)signedPublicSeen.delete(it.next().value);
+    for(let i=0;i<1000;i++){
+      const k=it.next().value;
+      signedPublicSeen.delete(k);
+      signedPublicIdByKey.delete(k);
+    }
   }
   return appended;
+}
+
+async function loadOlderSignedPublicMessages(sid){
+  const pg=signedPublicPagination[sid];
+  if(!pg||!pg.hasMore||!pg.nextBefore||pg.loading)return;
+  pg.loading=true;
+  updateLoadOlderBar(sid);
+  try{
+    const r=await api('/groups/'+encSeg(sid)+'/messages?limit=100&before='+encodeURIComponent(pg.nextBefore));
+    if(!r||!r.ok||!Array.isArray(r.messages)){
+      toast('Could not load older messages: '+apiError(r),'error');
+      return;
+    }
+    pg.hasMore=!!r.has_more;
+    pg.nextBefore=r.next_before||null;
+    if(!pg.hasMore)pg.exhausted=true;
+    const chatKey=sid+'_general';
+    if(!chatHistory[chatKey])chatHistory[chatKey]=[];
+    const older=[];
+    for(const m of r.messages){
+      const {dedupKey,msg}=normalizeSignedPublicMsg(sid,m);
+      if(signedPublicSeen.has(dedupKey)){
+        upgradeSignedPublicMsgId(sid,chatKey,dedupKey,msg);
+        continue;
+      }
+      signedPublicSeen.add(dedupKey);
+      signedPublicIdByKey.set(dedupKey,msg.id);
+      cacheMsg(msg);
+      if(msg.thread_root){
+        addThreadReply(msg.thread_root,msg);
+      }else{
+        seenMsgHashes.add(msgHash(msg));
+        older.push(msg);
+      }
+    }
+    older.sort((a,b)=>(a.timestamp||0)-(b.timestamp||0));
+    if(older.length){
+      chatHistory[chatKey]=older.concat(chatHistory[chatKey]);
+      chatHistory[chatKey]._pagedOlder=true;
+      LS.set('chat_'+chatKey,chatHistory[chatKey].slice(-200));
+      const msgsEl=document.getElementById('chat-msgs');
+      if(msgsEl&&S.get('view')==='space'&&S.get('spaceId')===sid&&S.get('spaceApp')==='chat'){
+        const prevHeight=msgsEl.scrollHeight;
+        const prevScrollTop=msgsEl.scrollTop;
+        msgsEl.innerHTML='';
+        chatHistory[chatKey].forEach(m=>appendChatMsg(msgsEl,m,sid));
+        msgsEl.scrollTop=Math.max(0,prevScrollTop+(msgsEl.scrollHeight-prevHeight));
+      }
+    }
+  }finally{
+    pg.loading=false;
+    updateLoadOlderBar(sid);
+  }
 }
 
 const seenMsgHashes=new Set();
@@ -2748,24 +3035,21 @@ function addChatMsg(chatKey,msg){
   const h=msgHash(msg);
   if(seenMsgHashes.has(h))return;
   seenMsgHashes.add(h);
-  if(seenMsgHashes.size>2000){const it=seenMsgHashes.values();for(let i=0;i<500;i++)seenMsgHashes.delete(it.next().value)}
-  // Cache for thread lookup
+  if(seenMsgHashes.size>4000){const it=seenMsgHashes.values();for(let i=0;i<1000;i++)seenMsgHashes.delete(it.next().value)}
   cacheMsg(msg);
-  // Skip thread broadcasts that are just indicators
   if(msg.thread_root&&!msg.broadcast)return;
   if(!chatHistory[chatKey])chatHistory[chatKey]=[];
   chatHistory[chatKey].push(msg);
-  if(chatHistory[chatKey].length>200)chatHistory[chatKey].splice(0,chatHistory[chatKey].length-200);
-  LS.set('chat_'+chatKey,chatHistory[chatKey]);
-  // Check if current view matches
+  const maxHist=chatHistory[chatKey]._pagedOlder?10000:1000;
+  if(chatHistory[chatKey].length>maxHist)chatHistory[chatKey].splice(0,chatHistory[chatKey].length-maxHist);
+  LS.set('chat_'+chatKey,chatHistory[chatKey].slice(-200));
   const sid=S.get('spaceId');
-  const chan=S.get('channel')||'general';
+  const chan=currentSpaceConfidentiality==='signed_public'?'general':(S.get('channel')||'general');
   const currentKey=sid+'_'+chan;
   if(S.get('view')==='space'&&S.get('spaceApp')==='chat'&&chatKey===currentKey){
     const msgs=document.getElementById('chat-msgs');
     if(msgs){appendChatMsg(msgs,msg,sid);msgs.scrollTop=msgs.scrollHeight}
   } else if(!msg.own){
-    // Increment unread count for channels/spaces not currently viewed
     const parts=chatKey.split('_');
     if(parts.length>=2){
       const unreadKey='unread_ch_'+chatKey;
@@ -2781,20 +3065,17 @@ function addThreadReply(threadId,msg){
   seenMsgHashes.add(h);
   if(!threadReplies[threadId])threadReplies[threadId]=[];
   threadReplies[threadId].push(msg);
-  // Update thread indicator count in chat
   if(!threadCache[threadId])threadCache[threadId]={reply_count:0,participants:[]};
   threadCache[threadId].reply_count=(threadReplies[threadId]||[]).length;
   if(msg.sender_name&&!threadCache[threadId].participants.includes(msg.sender_name)){
     threadCache[threadId].participants.push(msg.sender_name);
   }
   threadCache[threadId].last_reply_at=msg.timestamp;
-  // Update thread indicator in DOM
   const indicator=document.getElementById('thread-ind-'+threadId);
   if(indicator){
     const tc=threadCache[threadId];
     indicator.innerHTML='<span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).map(esc).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span>';
   }
-  // If thread panel is open for this thread, append reply
   if(S.get('detailType')==='thread'&&S.get('threadId')===threadId){
     const replies=document.getElementById('thread-replies');
     if(replies){appendChatMsg(replies,msg,S.get('spaceId'));replies.scrollTop=replies.scrollHeight}
@@ -2813,23 +3094,24 @@ function appendChatMsg(container,m,spaceId){
   const tc=msgId?threadCache[msgId]:null;
   const isBroadcast=m.broadcast&&m.thread_root;
   const isOwn=m.own||(m.sender_id===S.get('agentId'));
-  const isEdited=editedMsgs[chatKey]&&editedMsgs[chatKey][msgId];
+  const isSignedPub=!!m.signed_public||(spaceId&&currentSpaceConfidentiality==='signed_public'&&spaceId===S.get('spaceId'));
+  const isEdited=!isSignedPub&&editedMsgs[chatKey]&&editedMsgs[chatKey][msgId];
   const bodyText=isDeleted?'<em>This message was deleted</em>':renderMd(m.text||'')+(isEdited?'<span class="edited-tag">(edited)</span>':'');
-  // Quote preview if this message quotes another
   const quoteHtml=m.quote_id&&m.quote_text?'<div class="msg-quote" onclick="scrollToMsg(\''+escJs(m.quote_id)+'\')"><div class="q-who">'+esc(m.quote_name||'')+'</div>'+esc(m.quote_text)+'</div>':'';
-  // Hover action bar (reactions + quote + thread + edit/delete + pin)
-  const actionsHtml=msgId&&!isDeleted?`<div class="msg-actions"><div class="quick-react">${EMOJI_QUICK.map(e=>'<button title="'+e+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(e)+'\')">'+e+'</button>').join('')}<button title="More emoji" onclick="showEmojiPickerForMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">+</button></div>`
-    +(msgId&&spaceId?'<button title="Quote" onclick="setQuote(\''+escJs(msgId)+'\')">↩</button>':'')
-    +(msgId&&spaceId?'<button title="Thread" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">💬</button>':'')
-    +(msgId?'<button title="Pin" onclick="togglePin(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">📌</button>':'')
-    +(isOwn&&msgId?'<button title="Edit" onclick="startEditMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">✏️</button>':'')
-    +(isOwn&&msgId?'<button class="danger-act" title="Delete" onclick="deleteMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">🗑</button>':'')
-    +'</div>':'';
-  // Reactions
-  const rxns=getReactions(chatKey,msgId);
+  // SignedPublic messages are immutable authority-verified records: expose Thread only once the canonical 64-hex msg_id is known (no unsigned reactions/edit/delete/pin).
+  const actionsHtml=msgId&&!isDeleted?(isSignedPub
+    ?(spaceId&&!m.thread_root&&isCanonicalMsgId(msgId)?'<div class="msg-actions"><button title="Thread" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">💬</button></div>':'')
+    :`<div class="msg-actions"><div class="quick-react">${EMOJI_QUICK.map(e=>'<button title="'+e+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(e)+'\')">'+e+'</button>').join('')}<button title="More emoji" onclick="showEmojiPickerForMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">+</button></div>`
+      +(msgId&&spaceId?'<button title="Quote" onclick="setQuote(\''+escJs(msgId)+'\')">↩</button>':'')
+      +(msgId&&spaceId?'<button title="Thread" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">💬</button>':'')
+      +(msgId?'<button title="Pin" onclick="togglePin(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">📌</button>':'')
+      +(isOwn&&msgId?'<button title="Edit" onclick="startEditMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">✏️</button>':'')
+      +(isOwn&&msgId?'<button class="danger-act" title="Delete" onclick="deleteMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">🗑</button>':'')
+      +'</div>'):'';
+  const rxns=isSignedPub?{}:getReactions(chatKey,msgId);
   const me=S.get('agentId');
-  const rxnHtml=msgId?'<div class="msg-reactions" id="rxn-'+esc(msgId)+'">'+Object.entries(rxns).map(([emoji,users])=>
-    '<button class="rxn'+(users.includes(me)?' mine':'')+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(emoji)+'\')">'+emoji+'<span class="cnt">'+users.length+'</span></button>'
+  const rxnHtml=(msgId&&!isSignedPub)?'<div class="msg-reactions" id="rxn-'+esc(msgId)+'">'+Object.entries(rxns).filter(([emoji])=>isSafeReactionEmoji(emoji)).map(([emoji,users])=>
+    '<button class="rxn'+(users.includes(me)?' mine':'')+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(emoji)+'\')">'+esc(emoji)+'<span class="cnt">'+users.length+'</span></button>'
   ).join('')+'</div>':'';
 
   d.innerHTML=`${actionsHtml}${quoteHtml}<div class="meta">
@@ -3130,11 +3412,13 @@ async function boardAction(tid,action){
 }
 
 // --- Space: Files ---
+let spaceFileMembers=[];
 function renderSpaceFiles(el){
+  const sid=S.get('spaceId')||'';
   el.innerHTML=`<div class="row mb">
     <label for="file-recipient" style="align-self:center;color:var(--tx2);font-size:12px">Send to</label>
     <select id="file-recipient" style="flex:1" onchange="renderFileSendState()"></select>
-    <button class="ghost" onclick="pollContacts().then(renderFileRecipientOptions)">Refresh</button>
+    <button class="ghost" onclick="refreshFileRecipients('${escJs(sid)}')">Refresh</button>
   </div>
   <div class="drop-zone" id="file-drop" onclick="chooseFileForSend()">
     Drop files here or click to select
@@ -3151,8 +3435,21 @@ function renderSpaceFiles(el){
     dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('over');if(e.dataTransfer.files.length)handleFileDrop(e.dataTransfer.files[0])});
   }
   renderFileRecipientOptions();
-  pollContacts().then(renderFileRecipientOptions);
+  refreshFileRecipients(sid);
   pollTransfers();
+}
+
+async function refreshFileRecipients(sid){
+  const tasks=[pollContacts()];
+  if(sid){
+    tasks.push(api('/groups/'+encSeg(sid)+'/members').then(r=>{
+      spaceFileMembers=(r&&r.ok&&Array.isArray(r.members))?r.members:[];
+    }).catch(()=>{spaceFileMembers=[]}));
+  }else{
+    spaceFileMembers=[];
+  }
+  await Promise.all(tasks);
+  renderFileRecipientOptions();
 }
 
 function fileRecipients(){
@@ -3169,9 +3466,31 @@ function renderFileRecipientOptions(){
   const sel=document.getElementById('file-recipient');
   if(!sel)return;
   const previous=sel.value;
-  const recipients=fileRecipients();
-  sel.innerHTML='<option value="">Select a recipient…</option>'+recipients.map(c=>`<option value="${esc(c.agent_id)}">${esc(fileRecipientLabel(c))}</option>`).join('');
-  if(previous&&recipients.some(c=>c.agent_id===previous))sel.value=previous;
+  const myAid=S.get('agentId')||'';
+  const contacts=fileRecipients();
+  const seen=new Set();
+  const members=spaceFileMembers.filter(m=>m&&m.agent_id&&m.agent_id!==myAid&&m.state==='active');
+  let html='<option value="">Select a recipient…</option>';
+  if(members.length){
+    html+='<optgroup label="Space members">';
+    members.forEach(m=>{
+      seen.add(m.agent_id);
+      const label=(m.display_name&&m.display_name.trim()||short(m.agent_id,12))+' · '+short(m.agent_id,12)+' · '+(m.role||'member');
+      html+=`<option value="${esc(m.agent_id)}">${esc(label)}</option>`;
+    });
+    html+='</optgroup>';
+  }
+  const extraContacts=contacts.filter(c=>!seen.has(c.agent_id));
+  if(extraContacts.length){
+    html+='<optgroup label="Contacts">';
+    extraContacts.forEach(c=>{
+      seen.add(c.agent_id);
+      html+=`<option value="${esc(c.agent_id)}">${esc(fileRecipientLabel(c))}</option>`;
+    });
+    html+='</optgroup>';
+  }
+  sel.innerHTML=html;
+  if(previous&&seen.has(previous))sel.value=previous;
   renderFileSendState();
 }
 
@@ -3232,78 +3551,147 @@ async function pollTransfers(){
 }
 
 // --- Space: Swarm ---
+function spaceSwarmTopics(sid){
+  const p='x0x.group.'+sid.slice(0,16)+'.swarm';
+  return {tasks:p+'/tasks',results:p+'/results'};
+}
+
 function renderSpaceSwarm(el,sid){
-  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Delegate tasks to AI agents on the network. Post a task with capability tags — agents claim and return results via gossip pub/sub.</p>
-  <div class="row mb"><input id="sw-task" placeholder="Task description" style="flex:2"><input id="sw-caps" placeholder="Capabilities (comma-sep)"><button class="pri" onclick="postSwarmTask()">Post</button></div>
+  const topics=spaceSwarmTopics(sid);
+  currentSwarmTopics.forEach(t=>wsUnsub(t));
+  currentSwarmTopics=[topics.tasks,topics.results];
+  wsSub(topics.tasks);
+  wsSub(topics.results);
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Delegate tasks to AI agents in this space. Tasks are scoped to this space's swarm topic.</p>
+  <div class="row mb"><input id="sw-task" placeholder="Task description" style="flex:2"><input id="sw-caps" placeholder="Capabilities (comma-sep)"><button class="pri" onclick="postSwarmTask('${escJs(sid)}')">Post</button></div>
   <div class="grid g2">
     <div><h3>Live Feed</h3><div class="feed" id="sw-feed"></div></div>
     <div><h3>Agent Roster</h3><table><thead><tr><th>Agent</th><th>Status</th><th>Task</th></tr></thead><tbody id="sw-roster"></tbody></table></div>
   </div>`;
-  renderSwarmFeed();
+  renderSwarmFeed(sid);
+  renderSwarmRoster(sid);
 }
 
-function postSwarmTask(){
+async function postSwarmTask(sid){
+  const activeSid=sid||S.get('spaceId')||'';
   const t=document.getElementById('sw-task').value.trim();
   const c=document.getElementById('sw-caps').value.trim();
-  if(!t)return;
+  if(!t||!activeSid)return;
   const id=crypto.randomUUID?crypto.randomUUID():Math.random().toString(36).slice(2);
-  wsPub('x0x-swarm/tasks',{id,event:'posted',description:t,capability:c||null,requester:S.get('agentId'),timestamp:Date.now()});
-  swarmTasks[id]={id,description:t,capability:c,status:'posted',from:S.get('agentId'),ts:Date.now()};
-  renderSwarmFeed();
+  const topics=spaceSwarmTopics(activeSid);
+  const ok=await publishSpaceGossip(activeSid,topics.tasks,{id,space_id:activeSid,event:'posted',description:t,capability:c||null,requester:S.get('agentId'),timestamp:Date.now()});
+  if(!ok)return;
+  swarmTasks[id]={id,space_id:activeSid,description:t,capability:c,status:'posted',from:S.get('agentId'),ts:Date.now()};
+  renderSwarmFeed(activeSid);
+  renderSwarmRoster(activeSid);
   document.getElementById('sw-task').value='';document.getElementById('sw-caps').value='';
 }
 
-function renderSwarmFeed(){
+function renderSwarmFeed(sid){
+  const activeSid=sid||S.get('spaceId')||'';
   const fe=document.getElementById('sw-feed');
   if(!fe)return;
-  fe.innerHTML=Object.values(swarmTasks).sort((a,b)=>(b.ts||0)-(a.ts||0)).slice(0,50).map(t=>
+  const list=Object.values(swarmTasks).filter(t=>!t.space_id||t.space_id===activeSid).sort((a,b)=>(b.ts||0)-(a.ts||0)).slice(0,50);
+  fe.innerHTML=list.map(t=>
     `<div class="feed-item"><div class="content">
-      <span class="trust trust-${t.status==='completed'?'trusted':t.status==='claimed'?'known':'unknown'}" style="font-size:9px;margin-right:4px">${t.status}</span>
+      <span class="trust trust-${t.status==='completed'?'trusted':t.status==='claimed'?'known':'unknown'}" style="font-size:9px;margin-right:4px">${esc(t.status||'posted')}</span>
       ${esc(t.description||t.id)}
-      <div class="time">from ${short(t.from||t.requester)} · ${fmtTime(t.ts)}</div>
+      <div class="time">from ${esc(resolveSpaceSenderName(activeSid,t.from||t.requester))} · ${fmtTime(t.ts)}</div>
     </div></div>`
   ).join('')||'<div style="color:var(--tx3);padding:12px;font-size:12px">No tasks yet. Post one above.</div>';
 }
 
+function renderSwarmRoster(sid){
+  const activeSid=sid||S.get('spaceId')||'';
+  const tb=document.getElementById('sw-roster');
+  if(!tb)return;
+  const byAgent=new Map();
+  const members=currentSpaceMembers[activeSid]||{};
+  Object.entries(members).forEach(([aid,name])=>{
+    byAgent.set(aid,{agent:aid,name,status:'idle',task:'—'});
+  });
+  Object.values(swarmTasks).filter(t=>!t.space_id||t.space_id===activeSid).forEach(t=>{
+    const aid=t.claimed_by||t.worker||t.from||t.requester;
+    if(!aid)return;
+    const prev=byAgent.get(aid)||{agent:aid,name:resolveSpaceSenderName(activeSid,aid),status:'idle',task:'—'};
+    if(t.status==='claimed'||t.status==='completed'||prev.status==='idle'){
+      prev.status=t.status||'active';
+      prev.task=(t.description||t.id||'—').slice(0,48);
+    }
+    byAgent.set(aid,prev);
+  });
+  const rows=[...byAgent.values()];
+  tb.innerHTML=rows.map(r=>`<tr>
+    <td>${esc(r.name||short(r.agent))}</td>
+    <td><span class="trust trust-${r.status==='completed'?'trusted':r.status==='claimed'?'known':'unknown'}" style="font-size:9px">${esc(r.status)}</span></td>
+    <td style="font-size:11px;color:var(--tx2)">${esc(r.task)}</td>
+  </tr>`).join('')||'<tr><td colspan="3" style="color:var(--tx3)">No agents seen yet</td></tr>';
+}
+
 // --- Space: Feed ---
 function renderSpaceFeed(el,sid){
-  const topic='x0x.space.'+sid.slice(0,16)+'.feed';
-  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">A pub/sub powered social feed. Posts are broadcast to all space members via gossip and persisted in a KvStore.</p>
-  <div class="row mb"><textarea id="feed-in" rows="2" placeholder="What's happening?" style="flex:1;resize:vertical"></textarea><button class="pri" onclick="postFeed('${sid}')">Post</button></div>
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Space feed backed by this space's group-bound store. Private spaces keep posts encrypted to group members.</p>
+  <div class="row mb"><textarea id="feed-in" rows="2" placeholder="What's happening?" style="flex:1;resize:vertical"></textarea><button class="pri" onclick="postFeed('${escJs(sid)}')">Post</button><button class="ghost" onclick="loadFeedPosts('${escJs(sid)}')">Refresh</button></div>
+  <div id="feed-error" class="mb" style="display:none;font-size:12px;color:var(--rd)"></div>
   <div class="feed" id="feed-posts"></div>`;
-  wsSub(topic);
   loadFeedPosts(sid);
+}
+
+function feedError(msg){
+  const e=document.getElementById('feed-error');
+  if(!e)return;
+  if(!msg){e.style.display='none';e.textContent='';return}
+  e.textContent=msg;e.style.display='block';
 }
 
 async function postFeed(sid){
   const inp=document.getElementById('feed-in');
+  if(!inp)return;
   const text=inp.value.trim();if(!text)return;
-  const topic='x0x.space.'+sid.slice(0,16)+'.feed';
-  const post={text,author:LS.get('display_name','')||short(S.get('agentId')),author_id:S.get('agentId'),timestamp:Date.now()};
-  wsPub(topic,post);
-  addFeedPost(sid,post);
+  feedError('');
+  const st=await openSpacePageStore(sid,'feed');
+  if(!st.ok){feedError(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){feedError(SPACE_POLICY_MOVED_BEFORE);return}
+  const ts=Date.now();
+  const key='post-'+String(ts).padStart(15,'0')+'-'+generateMsgId().slice(0,8);
+  const post={id:key,text,author:LS.get('display_name','')||resolveSpaceSenderName(sid,S.get('agentId')),author_id:S.get('agentId'),timestamp:ts};
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(key),{method:'PUT',body:JSON.stringify({value:u8encode(JSON.stringify(post)),content_type:'application/json'})});
+  if(!r||!r._http_ok){feedError('Post not saved. '+apiError(r));return}
+  if(r._http_status===202&&r.published===false){feedError('Saved locally; not yet published to the group. '+String(r.reason||''));return}
+  if(!spacePageStoreCurrent(sid,st)){feedError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   inp.value='';
+  toast('Posted to space feed','success');
+  loadFeedPosts(sid);
 }
 
-function addFeedPost(sid,post){
-  const h=(post.author_id||'')+'|'+(post.text||'')+'|'+Math.floor((post.timestamp||0)/1000);
-  if(seenMsgHashes.has(h))return;
-  seenMsgHashes.add(h);
-  const key='feed_'+sid;
-  const posts=LS.get(key,[]);
-  posts.unshift(post);
-  if(posts.length>100)posts.length=100;
-  LS.set(key,posts);
-  renderFeedPosts(sid);
-}
-
-function loadFeedPosts(sid){renderFeedPosts(sid)}
-function renderFeedPosts(sid){
+async function loadFeedPosts(sid){
   const el=document.getElementById('feed-posts');if(!el)return;
-  const posts=LS.get('feed_'+sid,[]);
+  const st=await openSpacePageStore(sid,'feed');
+  if(!st.ok){spacePagesUnavailable(el,st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_BEFORE);return}
+  const kr=await api('/stores/'+encSeg(st.id)+'/keys');
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_AFTER_READ);return}
+  if(!kr||!kr._http_ok){spacePagesUnavailable(el,'Could not load feed posts. '+apiError(kr));return}
+  const keys=(kr.keys||[]).map(k=>typeof k==='string'?k:(k&&k.key)||'').filter(k=>k.startsWith('post-')).sort().reverse().slice(0,50);
+  if(!keys.length){
+    el.innerHTML='<div style="color:var(--tx3);padding:12px;font-size:12px">No posts yet. Be the first!</div>';
+    return;
+  }
+  const posts=[];
+  await Promise.all(keys.map(async k=>{
+    const pr=await api('/stores/'+encSeg(st.id)+'/'+encSeg(k)).catch(()=>null);
+    if(pr&&pr._http_ok&&pr.value){
+      try{
+        const parsed=JSON.parse(u8decode(pr.value));
+        if(parsed&&parsed.text)posts.push(parsed);
+      }catch(e){}
+    }
+  }));
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_AFTER_READ);return}
+  posts.sort((a,b)=>(b.timestamp||0)-(a.timestamp||0));
   el.innerHTML=posts.map(p=>`<div class="feed-item">
     <div class="content">
-      <div class="author" style="color:var(--am)">${esc(p.author||short(p.author_id))} ${trustHtml(getContactTrust(p.author_id))}</div>
+      <div class="author" style="color:var(--am)">${esc(p.author||resolveSpaceSenderName(sid,p.author_id))} ${trustHtml(getContactTrust(p.author_id))}</div>
       <div class="text">${esc(p.text)}</div>
       <div class="time">${fmtTime(p.timestamp)}</div>
     </div>
@@ -3607,16 +3995,49 @@ async function importLegacyPages(sid,app,sourceId,digest){
 function renderSpaceWiki(el,sid){
   el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Wiki pages are shared through this space's group store. You can read them when the space's read policy allows it, and save when your current role has write permission.</p>
   <div id="wiki-legacy" class="mb"></div>
-  <div class="row mb"><input id="wiki-slug" placeholder="Page name (e.g. getting-started)"><button class="pri" onclick="createWikiPage('${sid}')">Create Page</button></div>
+  <div class="row mb"><input id="wiki-slug" placeholder="Page name (e.g. getting-started)"><button class="pri" onclick="createWikiPage('${escJs(sid)}')">Create Page</button></div>
   <div id="wiki-pages"></div>
   <div id="wiki-editor" style="display:none" class="mt">
-    <h3 id="wiki-title"></h3>
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:6px">
+      <h3 id="wiki-title" style="margin:0"></h3>
+      <button class="ghost" style="font-size:11px" onclick="toggleWikiPreview()">Preview</button>
+    </div>
     <textarea id="wiki-content" rows="12" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px"></textarea>
+    <div id="wiki-preview" class="card" style="display:none;min-height:180px;padding:12px;font-size:13px"></div>
     <div id="wiki-error" class="mt" style="display:none;font-size:12px;color:var(--rd)"></div>
-    <div class="row mt"><button class="pri" onclick="saveWikiPage('${sid}')">Save</button><button onclick="document.getElementById('wiki-editor').style.display='none'">Cancel</button></div>
+    <div class="row mt"><button class="pri" onclick="saveWikiPage('${escJs(sid)}')">Save</button><button class="danger" onclick="deleteWikiPage('${escJs(sid)}')">Delete</button><button onclick="document.getElementById('wiki-editor').style.display='none'">Cancel</button></div>
   </div>`;
   loadWikiPages(sid);
   loadLegacyPageImport(sid,'wiki');
+}
+
+function toggleWikiPreview(){
+  const ta=document.getElementById('wiki-content');
+  const pv=document.getElementById('wiki-preview');
+  if(!ta||!pv)return;
+  const showing=pv.style.display!=='none';
+  if(showing){
+    pv.style.display='none';ta.style.display='block';
+  }else{
+    pv.innerHTML=renderMarkdown(ta.value||'');
+    ta.style.display='none';pv.style.display='block';
+  }
+}
+
+async function deleteWikiPage(sid){
+  const slug=currentWikiSlug;
+  if(!slug)return;
+  if(!confirm('Delete wiki page "'+slug+'"?'))return;
+  wikiError('');
+  const st=await openSpacePageStore(sid,'wiki');
+  if(!st.ok){wikiError(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){wikiError(SPACE_POLICY_MOVED_BEFORE);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(slug),{method:'DELETE'});
+  if(!r||!r._http_ok){wikiError('Not deleted. '+apiError(r));return}
+  if(!spacePageStoreCurrent(sid,st)){wikiError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
+  if(currentWikiSlug===slug){document.getElementById('wiki-editor').style.display='none';currentWikiSlug=''}
+  toast('Page deleted','success');
+  loadWikiPages(sid);
 }
 
 function createWikiPage(sid){
@@ -3832,14 +4253,15 @@ async function deleteScratchKey(sid){
 function renderSpaceWeb(el,sid){
   el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Web pages are shared through this space's group store. You can read them when the space's read policy allows it, and save when your current role has write permission.</p>
   <div id="web-legacy" class="mb"></div>
-  <div class="row mb"><input id="web-path" placeholder="Page path (e.g. index, about)"><button class="pri" onclick="editWebPage('${sid}')">Edit Page</button></div>
+  <div class="row mb"><input id="web-path" placeholder="Page path (e.g. index, about)"><button class="pri" onclick="editWebPage('${escJs(sid)}')">Edit Page</button></div>
   <div id="web-preview" class="card" style="min-height:200px;padding:20px">
     <div style="color:var(--tx3);text-align:center;padding:40px">Select or create a page to preview</div>
   </div>
   <div id="web-editor" style="display:none" class="mt">
+    <h3 id="web-editor-title" style="margin:0 0 6px 0"></h3>
     <textarea id="web-content" rows="10" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px" placeholder="HTML or Markdown content"></textarea>
     <div id="web-error" class="mt" style="display:none;font-size:12px;color:var(--rd)"></div>
-    <div class="row mt"><button class="pri" onclick="saveWebPage('${sid}')">Save</button><button onclick="document.getElementById('web-editor').style.display='none'">Cancel</button></div>
+    <div class="row mt"><button class="pri" onclick="saveWebPage('${escJs(sid)}')">Save</button><button class="danger" onclick="deleteWebPage('${escJs(sid)}')">Delete</button><button onclick="document.getElementById('web-editor').style.display='none'">Cancel</button></div>
   </div>
   <h3>Pages</h3><div id="web-pages"></div>`;
   resetWebPreviewGen();
@@ -3848,13 +4270,46 @@ function renderSpaceWeb(el,sid){
 }
 let currentWebPath='';
 
-function editWebPage(sid){
-  const path=document.getElementById('web-path').value.trim()||'index';
-  currentWebPath=path;
+async function editWebPage(sid,explicitPath){
+  const pathInp=document.getElementById('web-path');
+  const path=(explicitPath||(pathInp&&pathInp.value.trim())||'index').trim();
   webError('');
+  const st=await openSpacePageStore(sid,'web');
+  if(!st.ok){webError(st.reason);document.getElementById('web-editor').style.display='block';return}
+  if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_BEFORE);document.getElementById('web-editor').style.display='block';return}
+  let existing='';
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(path));
+  if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_AFTER_READ);return}
+  if(r&&r._http_ok){
+    const v=r.value===undefined||r.value===null?'':r.value;
+    try{existing=u8decode(v)}catch(e){existing=String(v)}
+  }else if(r&&r._http_status!==404){
+    webError('Could not load existing "'+path+'". '+apiError(r));
+    document.getElementById('web-editor').style.display='block';
+    return;
+  }
+  currentWebPath=path;
+  const titleEl=document.getElementById('web-editor-title');
+  if(titleEl)titleEl.textContent='Editing: '+path;
+  document.getElementById('web-content').value=existing;
   document.getElementById('web-editor').style.display='block';
-  document.getElementById('web-content').value='';
-  document.getElementById('web-path').value='';
+  if(pathInp)pathInp.value='';
+}
+
+async function deleteWebPage(sid){
+  const path=currentWebPath;
+  if(!path)return;
+  if(!confirm('Delete web page "'+path+'"?'))return;
+  webError('');
+  const st=await openSpacePageStore(sid,'web');
+  if(!st.ok){webError(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_BEFORE);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(path),{method:'DELETE'});
+  if(!r||!r._http_ok){webError('Not deleted. '+apiError(r));return}
+  if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
+  if(currentWebPath===path){document.getElementById('web-editor').style.display='none';currentWebPath=''}
+  toast('Page deleted','success');
+  loadWebPages(sid);
 }
 
 function webError(msg){
@@ -3942,12 +4397,19 @@ async function previewWebPage(sid,path){
   let content='';
   const v=r.value===undefined||r.value===null?'':r.value;
   try{content=u8decode(v)}catch(e){content=esc(String(v))}
-  // Render in a sandboxed iframe to prevent XSS from stored HTML
+  // Render in a strictly sandboxed iframe (no scripts, no same-origin access to GUI).
   const iframe=document.createElement('iframe');
-  iframe.sandbox='allow-same-origin'; // no allow-scripts
+  iframe.setAttribute('sandbox','');
   iframe.style.cssText='width:100%;min-height:200px;border:none;background:var(--bg)';
   iframe.srcdoc=content;
   preview.innerHTML='';
+  const hdr=document.createElement('div');
+  hdr.style.cssText='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:11px;color:var(--tx3)';
+  const lbl=document.createElement('span');lbl.textContent=path;
+  const ebtn=document.createElement('button');ebtn.textContent='Edit';ebtn.className='ghost';ebtn.style.fontSize='11px';
+  ebtn.onclick=()=>editWebPage(sid,path);
+  hdr.appendChild(lbl);hdr.appendChild(ebtn);
+  preview.appendChild(hdr);
   preview.appendChild(iframe);
 }
 
@@ -5548,11 +6010,11 @@ function renderThreadPanel(el,data){
   const parentMsg=data.parentMsg;
   const threadId=parentMsg.id;
   const spaceId=data.spaceId;
-  const topic=data.topic;
   const replies=threadReplies[threadId]||[];
   const trust=getContactTrust(parentMsg.sender_id);
   const tclass=trust==='Trusted'?'trusted':trust==='Known'?'known':'unknown';
-  const chan=S.get('channel')||'general';
+  const isSignedPub=currentSpaceConfidentiality==='signed_public'&&S.get('spaceId')===spaceId;
+  const chan=isSignedPub?'general':(S.get('channel')||'general');
   el.innerHTML=`<div class="thread-panel">
     <div class="detail-header">
       <h3>Thread</h3>
@@ -5570,7 +6032,7 @@ function renderThreadPanel(el,data){
     <div class="thread-replies" id="thread-replies"></div>
     <div class="thread-input">
       <input id="thread-in" placeholder="Reply…" style="flex:1" onkeydown="if(event.key==='Enter')sendThreadReply()">
-      <label class="broadcast-check"><input type="checkbox" id="thread-broadcast"> Also send to #${esc(chan)}</label>
+      ${isSignedPub?'':'<label class="broadcast-check"><input type="checkbox" id="thread-broadcast"> Also send to #'+esc(chan)+'</label>'}
       <button class="pri" onclick="sendThreadReply()" style="padding:6px 12px">Reply</button>
     </div>
   </div>`;
@@ -5580,27 +6042,44 @@ function renderThreadPanel(el,data){
   setTimeout(()=>document.getElementById('thread-in').focus(),100);
 }
 
-function sendThreadReply(){
+async function sendThreadReply(){
   const inp=document.getElementById('thread-in');
+  if(!inp)return;
   const t=inp.value.trim();if(!t)return;
   const threadId=S.get('threadId');
   const spaceId=S.get('spaceId');
-  const chan=S.get('channel')||'general';
+  const isSignedPub=currentSpaceConfidentiality==='signed_public';
+  const chan=isSignedPub?'general':(S.get('channel')||'general');
   if(!threadId||!spaceId)return;
+  if(isSignedPub){
+    if(!isCanonicalMsgId(threadId)){
+      toast('Message ID is still syncing — retry in a moment','warn');
+      return;
+    }
+    const r=await api('/groups/'+encSeg(spaceId)+'/send',{
+      method:'POST',
+      body:JSON.stringify({body:t,kind:'chat',thread_root:threadId})
+    });
+    if(r&&r.ok){
+      inp.value='';inp.focus();
+      loadSignedPublicThreadReplies(spaceId,threadId);
+    }else{
+      toast('Reply failed: '+(r&&r.error||'unknown'),'error');
+    }
+    return;
+  }
   const name=LS.get('display_name','')||short(S.get('agentId'));
   const msgId=generateMsgId();
   const msg={id:msgId,text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),thread_root:threadId,channel:chan};
-  // Publish to thread topic
   const threadTopic=getThreadTopic(spaceId,threadId);
-  wsPub(threadTopic,msg);
-  // Add reply locally
+  const ok=await publishSpaceGossip(spaceId,threadTopic,msg);
+  if(!ok)return;
   addThreadReply(threadId,{...msg,own:true});
-  // If broadcast checked, also send to channel
   const broadcast=document.getElementById('thread-broadcast');
   if(broadcast&&broadcast.checked){
     const broadcastMsg={...msg,broadcast:true};
-    wsPub(currentChannelTopic,broadcastMsg);
-    if(spaceChatTopic&&spaceChatTopic!==currentChannelTopic)wsPub(spaceChatTopic,broadcastMsg);
+    await publishSpaceGossip(spaceId,currentChannelTopic,broadcastMsg);
+    if(spaceChatTopic&&spaceChatTopic!==currentChannelTopic)await publishSpaceGossip(spaceId,spaceChatTopic,broadcastMsg);
     addChatMsg(spaceId+'_'+chan,{...broadcastMsg,own:true});
   }
   inp.value='';inp.focus();
@@ -5807,7 +6286,7 @@ function showSpaceInfo(groupId){
    ═══════════════════════════════════════════════════════════════════ */
 
 // Persistent state for the Discover view.
-const nagDiscover={mode:'all',query:'',cards:[],err:null,reqStatus:{},seq:0,pollTimer:null};
+const nagDiscover={mode:'all',query:'',cards:[],err:null,reqStatus:{},joinStatus:{},seq:0,pollTimer:null,debounceTimer:null};
 
 function nagLabelDiscoverability(v){return {hidden:'hidden',listed_to_contacts:'contacts',public_directory:'public'}[v]||v||'?'}
 function nagLabelAdmission(v){return {invite_only:'invite only',request_access:'request access',open_join:'open join'}[v]||v||'?'}
@@ -5823,6 +6302,7 @@ function renderDiscover(){
     <h2 style="margin-bottom:12px">Discover groups</h2>
     <div class="nag-toolbar">
       <input type="search" id="nag-discover-q" placeholder="Search by tag, name, or ID…" value="${esc(nagDiscover.query)}"${nagDiscover.mode==='nearby'?' disabled':''}>
+      ${nagDiscover.mode==='all'?'<button id="nag-mesh-search" title="Subscribe to tag and name directory shards for this query">Search mesh</button>':''}
       <div class="tabs" role="tablist">
         <button id="nag-tab-all" class="${nagDiscover.mode==='all'?'sel':''}" role="tab">All</button>
         <button id="nag-tab-nearby" class="${nagDiscover.mode==='nearby'?'sel':''}" role="tab">Nearby</button>
@@ -5838,9 +6318,13 @@ function mountDiscover(){
   if(q){
     q.addEventListener('input',e=>{
       nagDiscover.query=e.target.value;
-      nagRenderDiscoverList();
-      nagFetchDiscover();
+      if(nagDiscover.debounceTimer)clearTimeout(nagDiscover.debounceTimer);
+      nagDiscover.debounceTimer=setTimeout(()=>nagFetchDiscover(),250);
     });
+  }
+  const meshBtn=document.getElementById('nag-mesh-search');
+  if(meshBtn){
+    meshBtn.addEventListener('click',()=>nagSearchMesh());
   }
   document.getElementById('nag-tab-all').addEventListener('click',()=>{
     if(nagDiscover.mode==='all')return;
@@ -5855,6 +6339,17 @@ function mountDiscover(){
   if(nagDiscover.pollTimer){clearInterval(nagDiscover.pollTimer);nagDiscover.pollTimer=null}
   nagFetchDiscover();
   nagDiscover.pollTimer=setInterval(()=>{if(S.get('view')==='discover')nagFetchDiscover()},10000);
+}
+
+async function nagSearchMesh(){
+  const q=nagDiscover.query.trim().replace(/^#+/,'');
+  if(!q){toast('Enter a tag or name to subscribe on the mesh','info');return}
+  await Promise.all([
+    api('/groups/discover/subscribe',{method:'POST',body:JSON.stringify({kind:'tag',key:q})}).catch(()=>null),
+    api('/groups/discover/subscribe',{method:'POST',body:JSON.stringify({kind:'name',key:q})}).catch(()=>null),
+  ]);
+  toast('Subscribed to directory shards for "'+q+'" — results appear as peers reply','info');
+  nagFetchDiscover();
 }
 
 async function nagFetchDiscover(){
@@ -5897,7 +6392,7 @@ function nagRenderDiscoverList(){
   if(!nagDiscover.cards.length){
     const msg=nagDiscover.mode==='nearby'
       ?'No PublicDirectory groups have arrived on the shard plane yet.'
-      :nagDiscover.query.trim()?'No matches — try a different tag, name, or ID.':'No discoverable groups observed yet.';
+      :nagDiscover.query.trim()?'No matches — try clicking "Search mesh" to subscribe to shards for this query.':'No discoverable groups observed yet.';
     listEl.innerHTML=`<div class="nag-empty">${esc(msg)}</div>`;
     return;
   }
@@ -5905,12 +6400,26 @@ function nagRenderDiscoverList(){
   listEl.querySelectorAll('[data-nag-req]').forEach(btn=>{
     btn.addEventListener('click',()=>nagRequestAccess(btn.getAttribute('data-nag-req')));
   });
+  listEl.querySelectorAll('[data-nag-open-join]').forEach(btn=>{
+    btn.addEventListener('click',()=>nagOpenJoin(btn.getAttribute('data-nag-open-join')));
+  });
+  listEl.querySelectorAll('[data-nag-browse]').forEach(btn=>{
+    btn.addEventListener('click',()=>nagBrowsePublicGroup(btn.getAttribute('data-nag-browse')));
+  });
+}
+
+function isSafeGroupId(gid){
+  return typeof gid==='string'&&/^[0-9a-fA-F]{16,128}$/.test(gid);
 }
 
 function nagDiscoverCardHtml(card){
   const policy=card.policy_summary||{};
-  const canRequest=card.request_access_enabled && policy.admission==='request_access' && !card.withdrawn;
+  const validId=isSafeGroupId(card.group_id);
+  const canRequest=validId && card.request_access_enabled && policy.admission==='request_access' && !card.withdrawn;
+  const canOpenJoin=validId && policy.admission==='open_join' && policy.confidentiality==='signed_public' && !card.withdrawn;
+  const canBrowse=validId && policy.read_access==='public' && !card.withdrawn;
   const status=nagDiscover.reqStatus[card.group_id]||{kind:'idle'};
+  const jstatus=nagDiscover.joinStatus[card.group_id]||{kind:'idle'};
   const badges=[
     {label:nagLabelDiscoverability(policy.discoverability),tone:''},
     {label:nagLabelAdmission(policy.admission),tone:nagToneAdmission(policy.admission)},
@@ -5922,12 +6431,23 @@ function nagDiscoverCardHtml(card){
   let footer='';
   if(status.kind==='submitted')footer=`<span style="font-size:11px;color:var(--gn)">Request submitted — awaiting admin review.</span>`;
   else if(status.kind==='failed')footer=`<span style="font-size:11px;color:var(--rd)">Request failed: ${esc(status.msg||'')}</span>`;
-  let action='';
+  else if(jstatus.kind==='submitted')footer=`<span style="font-size:11px;color:var(--gn)">Open-join sent — membership activates when the authority confirms.</span>`;
+  else if(jstatus.kind==='failed')footer=`<span style="font-size:11px;color:var(--rd)">Join failed: ${esc(jstatus.msg||'')}</span>`;
+  const actions=[];
+  if(canBrowse){
+    actions.push(`<button data-nag-browse="${esc(card.group_id)}">Browse</button>`);
+  }
+  if(canOpenJoin){
+    const jDisabled=jstatus.kind==='pending'||jstatus.kind==='submitted';
+    const jLabel=jstatus.kind==='pending'?'Joining…':jstatus.kind==='submitted'?'Join sent':'Join';
+    actions.push(`<button class="pri" data-nag-open-join="${esc(card.group_id)}"${jDisabled?' disabled':''}>${esc(jLabel)}</button>`);
+  }
   if(canRequest){
     const disabled=status.kind==='pending'||status.kind==='submitted';
     const label=status.kind==='pending'?'Requesting…':status.kind==='submitted'?'Requested':'Request access';
-    action=`<button class="pri" data-nag-req="${esc(card.group_id)}"${disabled?' disabled':''}>${esc(label)}</button>`;
+    actions.push(`<button class="pri" data-nag-req="${esc(card.group_id)}"${disabled?' disabled':''}>${esc(label)}</button>`);
   }
+  const actionHtml=actions.length?`<div class="row" style="gap:6px">${actions.join('')}</div>`:'';
   return `<div class="nag-card">
     <div class="footer">
       <div>
@@ -5938,17 +6458,57 @@ function nagDiscoverCardHtml(card){
     </div>
     ${card.description?`<div class="desc">${esc(card.description)}</div>`:''}
     ${tags?`<div class="tags">${tags}</div>`:''}
-    ${(footer||action)?`<div class="footer">${footer}${action}</div>`:''}
+    ${(footer||actionHtml)?`<div class="footer">${footer}${actionHtml}</div>`:''}
   </div>`;
 }
 
+async function nagOpenJoin(gid){
+  if(!isSafeGroupId(gid))return;
+  const existing=nagDiscover.joinStatus[gid];
+  if(existing&&(existing.kind==='pending'||existing.kind==='submitted'))return;
+  nagDiscover.joinStatus[gid]={kind:'pending'};
+  nagRenderDiscoverList();
+  try{
+    const dn=LS.get('display_name','').trim();
+    const body={};
+    if(dn)body.display_name=dn;
+    const r=await api('/groups/'+encSeg(gid)+'/open-join',{method:'POST',body:JSON.stringify(body)});
+    if(r&&r.ok){
+      nagDiscover.joinStatus[gid]={kind:'submitted'};
+      toast('Open-join requested — opening space once confirmed','success');
+      await pollGroups();
+    }else{
+      nagDiscover.joinStatus[gid]={kind:'failed',msg:(r&&r.error)||'unknown'};
+    }
+  }catch(e){
+    nagDiscover.joinStatus[gid]={kind:'failed',msg:e.message||'network error'};
+  }
+  nagRenderDiscoverList();
+}
+
+async function nagBrowsePublicGroup(gid){
+  if(!isSafeGroupId(gid))return;
+  const card=nagDiscover.cards.find(c=>c.group_id===gid);
+  if(card){
+    const cardPayload=JSON.stringify(card);
+    const r=await api('/groups/cards/import',{method:'POST',body:cardPayload});
+    if(r&&r.ok){
+      await pollGroups();
+      navigateSpace(r.group_id||gid,'chat');
+      return;
+    }
+  }
+  navigateSpace(gid,'chat');
+}
+
 async function nagRequestAccess(gid){
+  if(!isSafeGroupId(gid))return;
   const existing=nagDiscover.reqStatus[gid];
   if(existing && (existing.kind==='pending'||existing.kind==='submitted'))return;
   nagDiscover.reqStatus[gid]={kind:'pending'};
   nagRenderDiscoverList();
   try{
-    const r=await api('/groups/'+gid+'/requests',{method:'POST',body:JSON.stringify({})});
+    const r=await api('/groups/'+encSeg(gid)+'/requests',{method:'POST',body:JSON.stringify({})});
     if(r && r.ok){nagDiscover.reqStatus[gid]={kind:'submitted'}}
     else{nagDiscover.reqStatus[gid]={kind:'failed',msg:(r&&r.error)||'unknown'}}
   }catch(e){nagDiscover.reqStatus[gid]={kind:'failed',msg:e.message||'network error'}}
@@ -5957,17 +6517,11 @@ async function nagRequestAccess(gid){
 
 /* ─ Admin: policy / state / roster / requests inside renderSpaceDetail ─ */
 
-async function nagRenderAdmin(gid){
+const nagRosterState={}; // { gid: { query, filter, limit, members, myAid, canManage } }
+
+async function nagRenderAdmin(gid,policyOpt){
   const host=document.getElementById('nag-admin-'+gid);
   if(!host)return;
-  // Learn the seat with the session token first. The join-request list
-  // needs an Admin+ seat, so it is fetched only for one. #1347: the list,
-  // approve and reject take one token class and send one bearer: the
-  // saved durable token, else the session token. On an ordinary group
-  // the session token is enough. On a Home the daemon asks for the
-  // durable token. A render must not prompt: a non-admin never sees the
-  // prompt, and an admin who has not saved a token sees the refusal
-  // instead of an empty list. The prompt is the panel button.
   const [stateResp,membersResp,meResp]=await Promise.all([
     api('/groups/'+gid+'/state').catch(()=>null),
     api('/groups/'+gid+'/members').catch(()=>null),
@@ -5978,6 +6532,8 @@ async function nagRenderAdmin(gid){
   const mine=members.find(m=>m.agent_id===myAid);
   const myRole=mine?mine.role:null;
   const isAdminOrAbove=myRole==='owner'||myRole==='admin';
+  const prevState=nagRosterState[gid]||{query:'',filter:'all',limit:50};
+  nagRosterState[gid]={query:prevState.query||'',filter:prevState.filter||'all',limit:prevState.limit||50,members,myAid,canManage:isAdminOrAbove};
   let requestsHtml='';
   if(isAdminOrAbove){
     const requestsResp=await apiWith(joinRequestBearer(),'/groups/'+gid+'/requests').catch(()=>null);
@@ -5988,14 +6544,26 @@ async function nagRenderAdmin(gid){
       requestsHtml=nagRequestsPanelHtml(gid,requests.filter(r=>r.status==='pending'));
     }
   }
-  host.innerHTML=nagPolicyPanelHtml(gid,isAdminOrAbove)
+  host.innerHTML=nagPolicyPanelHtml(gid,isAdminOrAbove,policyOpt||currentSpacePolicy)
     +nagStatePanelHtml(gid,stateResp&&stateResp.ok?stateResp:null,isAdminOrAbove)
     +nagRosterPanelHtml(gid,members,myAid,isAdminOrAbove)
     +requestsHtml;
   nagBindAdminHandlers(gid);
 }
 
-function nagPolicyPanelHtml(gid,canAdminister){
+function nagPolicyBadgesHtml(policy){
+  if(!policy)return '';
+  const badges=[
+    {label:nagLabelDiscoverability(policy.discoverability),tone:''},
+    {label:nagLabelAdmission(policy.admission),tone:nagToneAdmission(policy.admission)},
+    {label:nagLabelConfidentiality(policy.confidentiality),tone:nagToneConfidentiality(policy.confidentiality)},
+    {label:nagLabelRead(policy.read_access),tone:''},
+    {label:nagLabelWrite(policy.write_access),tone:''},
+  ].map(b=>`<span class="nag-badge ${b.tone}">${esc(b.label)}</span>`).join('');
+  return `<div class="nag-badges" style="margin:6px 0 10px 0">${badges}</div>`;
+}
+
+function nagPolicyPanelHtml(gid,canAdminister,policy){
   const disabled=!canAdminister?'disabled':'';
   const axisOpts=(opts)=>['<option value="">(leave unchanged)</option>',...opts.map(o=>`<option value="${o}">${o}</option>`)].join('');
   // Rename inputs are admin+ — daemon enforces. Wraps PATCH /groups/:id.
@@ -6003,13 +6571,14 @@ function nagPolicyPanelHtml(gid,canAdminister){
     <div class="row" style="display:flex;gap:var(--sp2);flex-wrap:wrap;align-items:center">
       <input id="nag-rename-name-${esc(gid)}" placeholder="New name (optional)" style="flex:1;min-width:160px;padding:4px 8px;border:1px solid var(--bd);background:var(--bg3);color:var(--tx1);border-radius:var(--r-sm);font-size:12px">
       <input id="nag-rename-desc-${esc(gid)}" placeholder="New description (optional)" style="flex:2;min-width:200px;padding:4px 8px;border:1px solid var(--bd);background:var(--bg3);color:var(--tx1);border-radius:var(--r-sm);font-size:12px">
-      <button onclick="nagRenameGroup('${esc(gid)}')">Save name/description</button>
+      <button onclick="nagRenameGroup('${escJs(gid)}')">Save name/description</button>
     </div>
     <div class="nag-feedback" data-k="rename-feedback" style="font-size:11px;color:var(--tx3);margin-top:4px"></div>
   </div>`:'';
   return `<div class="nag-panel" data-nag-policy="${esc(gid)}">
     <h3>Policy</h3>
     <div class="sub">Five-axis access control (admin+; legacy owner counts as admin).</div>
+    ${nagPolicyBadgesHtml(policy)}
     ${!canAdminister?'<div class="sub" style="color:var(--am)">Only an admin can change policy.</div>':''}
     ${renameRow}
     <div class="nag-policy-grid">
@@ -6060,8 +6629,25 @@ function nagStatePanelHtml(gid,state,canAdminister){
   </div>`;
 }
 
+function nagFilterRoster(members,query,filter){
+  const q=(query||'').trim().toLowerCase();
+  return members.filter(m=>{
+    if(filter==='admins'&&!(m.role==='admin'||m.role==='owner'))return false;
+    if(filter==='members'&&!(m.role==='member'&&m.state!=='banned'))return false;
+    if(filter==='banned'&&m.state!=='banned')return false;
+    if(q){
+      const hay=((m.display_name||'')+' '+(m.agent_id||'')+' '+(m.role||'')+' '+(m.state||'')).toLowerCase();
+      if(!hay.includes(q))return false;
+    }
+    return true;
+  });
+}
+
 function nagRosterPanelHtml(gid,members,myAid,canManage){
-  const rows=members.map(m=>{
+  const rs=nagRosterState[gid]||{query:'',filter:'all',limit:50};
+  const filtered=nagFilterRoster(members,rs.query,rs.filter);
+  const page=filtered.slice(0,rs.limit||50);
+  const rows=page.map(m=>{
     const dn=m.display_name&&m.display_name.trim()||nagShort(m.agent_id);
     const isSelf=m.agent_id===myAid;
     const manage=canManage && !isSelf;
@@ -6070,10 +6656,11 @@ function nagRosterPanelHtml(gid,members,myAid,canManage){
     if(manage){
       const promote=m.role!=='admin' ? `<button data-nag-role-agent="${esc(m.agent_id)}" data-nag-role="admin">${m.role==='owner'?'Set legacy owner to admin':'Promote to admin'}</button>`:'';
       const demote=m.role==='admin' ? `<button data-nag-role-agent="${esc(m.agent_id)}" data-nag-role="member">Demote to member</button>`:'';
+      const remove=!isBanned ? `<button data-nag-remove="${esc(m.agent_id)}">Remove</button>`:'';
       const ban=isBanned
         ? `<button data-nag-unban="${esc(m.agent_id)}">Unban</button>`
         : `<button class="danger" data-nag-ban="${esc(m.agent_id)}">Ban</button>`;
-      actions=`<div class="actions">${promote}${demote}${ban}</div>`;
+      actions=`<div class="actions">${promote}${demote}${remove}${ban}</div>`;
     }
     return `<div class="nag-row" data-nag-member="${esc(m.agent_id)}">
       <div class="info">
@@ -6084,19 +6671,40 @@ function nagRosterPanelHtml(gid,members,myAid,canManage){
       ${actions}
     </div>`;
   }).join('');
+  const showMore=filtered.length>page.length
+    ?`<div style="margin-top:8px;text-align:center"><button data-nag-roster-more>Show more (${filtered.length-page.length} remaining)</button></div>`:'';
+  const addRow=canManage?`<div class="row" style="gap:6px;margin-bottom:8px;flex-wrap:wrap">
+    <input id="nag-add-agent-${esc(gid)}" placeholder="Agent ID (64 hex chars)" style="flex:2;min-width:140px;font-size:11px">
+    <input id="nag-add-name-${esc(gid)}" placeholder="Display name (optional)" style="flex:1;min-width:100px;font-size:11px">
+    <button data-nag-member-add>Add member</button>
+  </div><div class="nag-feedback" data-k="roster-add-feedback" style="font-size:11px;color:var(--tx3);margin-bottom:8px"></div>`:'';
+  const controls=members.length>0?`<div class="row" style="gap:6px;margin-bottom:8px;flex-wrap:wrap">
+    <input type="search" data-nag-roster-search value="${esc(rs.query||'')}" placeholder="Filter members…" style="flex:1;min-width:120px;font-size:11px">
+    <select data-nag-roster-filter style="width:auto;font-size:11px">
+      <option value="all"${rs.filter==='all'?' selected':''}>All (${members.length})</option>
+      <option value="admins"${rs.filter==='admins'?' selected':''}>Admins</option>
+      <option value="members"${rs.filter==='members'?' selected':''}>Members</option>
+      <option value="banned"${rs.filter==='banned'?' selected':''}>Banned</option>
+    </select>
+  </div>`:'';
   return `<div class="nag-panel" data-nag-roster="${esc(gid)}">
-    <h3>Members (${members.length})</h3>
+    <h3>Members (${filtered.length}${filtered.length!==members.length?' of '+members.length:''})</h3>
     <div class="sub">Add, remove, ban, or change member roles.</div>
-    ${members.length?rows:'<div class="sub">No members yet.</div>'}
+    ${addRow}${controls}
+    ${page.length?rows:'<div class="sub">'+(members.length?'No matching members.':'No members yet.')+'</div>'}
+    ${showMore}
   </div>`;
 }
 
 function nagRequestsPanelHtml(gid,pending,notice){
   const rows=pending.map(req=>{
     const msg=req.message||'(no message)';
+    const who=resolveSpaceSenderName(gid,req.requester_agent_id);
+    const when=req.created_at?(' · '+fmtTime(req.created_at)):'';
     return `<div class="nag-row" data-nag-request="${esc(req.request_id)}">
       <div class="info">
-        <div style="font-weight:600">${esc(nagShort(req.requester_agent_id))}</div>
+        <div style="font-weight:600">${esc(who)}</div>
+        <div style="font-size:10px;color:var(--tx3)">${esc(nagShort(req.requester_agent_id))}${esc(when)}</div>
         <div style="font-size:11px;color:var(--tx2)">${esc(msg)}</div>
         <div class="feedback" data-k="feedback"></div>
       </div>
@@ -6106,9 +6714,10 @@ function nagRequestsPanelHtml(gid,pending,notice){
       </div>
     </div>`;
   }).join('');
+  const bulkBtn=(!notice&&pending.length>1)?`<div style="margin-bottom:8px"><button class="pri" data-nag-req-approve-all>Approve all (${pending.length})</button></div>`:'';
   const body=notice
     ? `<div class="sub">${esc(notice)}</div><div style="margin-top:8px"><button type="button" data-nag-req-token>Enter durable token</button></div>`
-    : (pending.length?rows:'<div class="sub">No pending requests.</div>');
+    : (pending.length?bulkBtn+rows:'<div class="sub">No pending requests.</div>');
   return `<div class="nag-panel" data-nag-requests="${esc(gid)}">
     <h3>Join requests${notice?'':` (${pending.length})`}</h3>
     <div class="sub">Review pending access requests and approve or reject.</div>
@@ -6117,12 +6726,54 @@ function nagRequestsPanelHtml(gid,pending,notice){
 }
 
 async function nagEnterDurableToken(gid){
-  // The stored token was refused, or there is none. Clear it so ownerApi
-  // prompts once for this click, then render again without prompting.
   OWNER_TOKEN='';
   try{sessionStorage.removeItem('x0x_owner_token')}catch(e){}
   await ownerApi('/groups/'+gid+'/requests');
   nagRenderAdmin(gid);
+}
+
+function nagBindRosterHandlers(panel,gid){
+  if(!panel)return;
+  panel.querySelectorAll('[data-nag-role-agent][data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role-agent'),btn.getAttribute('data-nag-role'))));
+  panel.querySelectorAll('[data-nag-remove]').forEach(btn=>btn.addEventListener('click',()=>nagRemoveMember(gid,btn.getAttribute('data-nag-remove'))));
+  panel.querySelectorAll('[data-nag-ban]').forEach(btn=>btn.addEventListener('click',()=>nagBan(gid,btn.getAttribute('data-nag-ban'))));
+  panel.querySelectorAll('[data-nag-unban]').forEach(btn=>btn.addEventListener('click',()=>nagUnban(gid,btn.getAttribute('data-nag-unban'))));
+  const addBtn=panel.querySelector('[data-nag-member-add]');
+  if(addBtn)addBtn.addEventListener('click',()=>nagAddMember(gid));
+  const searchEl=panel.querySelector('[data-nag-roster-search]');
+  if(searchEl)searchEl.addEventListener('input',e=>{
+    if(nagRosterState[gid]){
+      nagRosterState[gid].query=e.target.value;
+      nagRosterState[gid].limit=50;
+      const newPanel=nagRerenderRosterOnly(gid);
+      const s=newPanel&&newPanel.querySelector('[data-nag-roster-search]');
+      if(s){s.focus();s.setSelectionRange(s.value.length,s.value.length)}
+    }
+  });
+  const filterEl=panel.querySelector('[data-nag-roster-filter]');
+  if(filterEl)filterEl.addEventListener('change',e=>{
+    if(nagRosterState[gid]){nagRosterState[gid].filter=e.target.value;nagRosterState[gid].limit=50;nagRerenderRosterOnly(gid)}
+  });
+  const moreBtn=panel.querySelector('[data-nag-roster-more]');
+  if(moreBtn)moreBtn.addEventListener('click',()=>{
+    if(nagRosterState[gid]){nagRosterState[gid].limit=(nagRosterState[gid].limit||50)+50;nagRerenderRosterOnly(gid)}
+  });
+}
+
+function nagRerenderRosterOnly(gid){
+  const host=document.getElementById('nag-admin-'+gid);
+  const rs=nagRosterState[gid];
+  if(!host||!rs)return null;
+  const oldPanel=host.querySelector(`[data-nag-roster="${gid}"]`);
+  if(!oldPanel)return null;
+  const tmp=document.createElement('div');
+  tmp.innerHTML=nagRosterPanelHtml(gid,rs.members,rs.myAid,rs.canManage);
+  const newPanel=tmp.firstElementChild;
+  oldPanel.replaceWith(newPanel);
+  // Bind ONLY the newly inserted roster panel so host-wide policy/withdraw/request
+  // buttons never accumulate duplicate listeners on each filter keystroke.
+  nagBindRosterHandlers(newPanel,gid);
+  return newPanel;
 }
 
 function nagBindAdminHandlers(gid){
@@ -6134,12 +6785,12 @@ function nagBindAdminHandlers(gid){
   if(seal)seal.addEventListener('click',()=>nagSealState(gid));
   const withdraw=host.querySelector('[data-nag-state-withdraw]');
   if(withdraw)withdraw.addEventListener('click',()=>nagWithdrawState(gid));
-  host.querySelectorAll('[data-nag-role-agent][data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role-agent'),btn.getAttribute('data-nag-role'))));
-  host.querySelectorAll('[data-nag-ban]').forEach(btn=>btn.addEventListener('click',()=>nagBan(gid,btn.getAttribute('data-nag-ban'))));
-  host.querySelectorAll('[data-nag-unban]').forEach(btn=>btn.addEventListener('click',()=>nagUnban(gid,btn.getAttribute('data-nag-unban'))));
+  nagBindRosterHandlers(host.querySelector(`[data-nag-roster="${gid}"]`),gid);
   host.querySelectorAll('[data-nag-req-token]').forEach(btn=>btn.addEventListener('click',()=>nagEnterDurableToken(gid)));
   host.querySelectorAll('[data-nag-req-approve]').forEach(btn=>btn.addEventListener('click',()=>nagApproveRequest(gid,btn.getAttribute('data-nag-req-approve'))));
   host.querySelectorAll('[data-nag-req-reject]').forEach(btn=>btn.addEventListener('click',()=>nagRejectRequest(gid,btn.getAttribute('data-nag-req-reject'))));
+  const approveAll=host.querySelector('[data-nag-req-approve-all]');
+  if(approveAll)approveAll.addEventListener('click',()=>nagApproveAllRequests(gid));
 }
 
 function nagSetFeedback(sel,msg,tone){
@@ -6211,6 +6862,7 @@ async function nagSealState(gid){
 }
 
 async function nagWithdrawState(gid){
+  if(!confirm('Permanently delete this space for all members? This cannot be undone and withdraws its public card.'))return;
   nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Working…');
   const r=await api('/groups/'+gid+'/state/withdraw',{method:'POST'});
   if(r&&r.ok){nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Group deleted — public card superseded.','ok');nagRenderAdmin(gid)}
@@ -6221,23 +6873,52 @@ function nagMemberFeedback(gid,aid,msg,tone){
   nagSetFeedback(`[data-nag-roster="${gid}"] [data-nag-member="${aid}"] [data-k="feedback"]`,msg,tone);
 }
 
+async function nagAddMember(gid){
+  const aidInp=document.getElementById('nag-add-agent-'+gid);
+  const nameInp=document.getElementById('nag-add-name-'+gid);
+  const agent_id=(aidInp&&aidInp.value||'').trim();
+  const display_name=(nameInp&&nameInp.value||'').trim();
+  if(!agent_id){nagSetFeedback(`[data-nag-roster="${gid}"] [data-k="roster-add-feedback"]`,'Enter an agent ID.','err');return}
+  const body={agent_id};
+  if(display_name)body.display_name=display_name;
+  nagSetFeedback(`[data-nag-roster="${gid}"] [data-k="roster-add-feedback"]`,'Adding…');
+  const r=await api('/groups/'+encSeg(gid)+'/members',{method:'POST',body:JSON.stringify(body)});
+  if(r&&r.ok){
+    if(aidInp)aidInp.value='';
+    if(nameInp)nameInp.value='';
+    nagSetFeedback(`[data-nag-roster="${gid}"] [data-k="roster-add-feedback"]`,'Member added.','ok');
+    nagRenderAdmin(gid);
+  }else{
+    nagSetFeedback(`[data-nag-roster="${gid}"] [data-k="roster-add-feedback"]`,(r&&r.error)||'Add failed.','err');
+  }
+}
+
+async function nagRemoveMember(gid,aid){
+  if(!confirm('Remove member '+nagShort(aid)+' from this space? They can be re-invited later.'))return;
+  nagMemberFeedback(gid,aid,'Working…');
+  const r=await api('/groups/'+encSeg(gid)+'/members/'+encSeg(aid),{method:'DELETE'});
+  if(r&&r.ok){nagMemberFeedback(gid,aid,'Removed.','ok');nagRenderAdmin(gid)}
+  else{nagMemberFeedback(gid,aid,(r&&r.error)||'Remove failed.','err')}
+}
+
 async function nagSetRole(gid,aid,role){
   nagMemberFeedback(gid,aid,'Working…');
-  const r=await api(`/groups/${gid}/members/${aid}/role`,{method:'PATCH',body:JSON.stringify({role})});
+  const r=await api('/groups/'+encSeg(gid)+'/members/'+encSeg(aid)+'/role',{method:'PATCH',body:JSON.stringify({role})});
   if(r&&r.ok){nagMemberFeedback(gid,aid,`Role → ${role}.`,'ok');nagRenderAdmin(gid)}
   else{nagMemberFeedback(gid,aid,(r&&r.error)||'Role change failed.','err')}
 }
 
 async function nagBan(gid,aid){
+  if(!confirm('Ban '+nagShort(aid)+' from this space?'))return;
   nagMemberFeedback(gid,aid,'Working…');
-  const r=await api(`/groups/${gid}/ban/${aid}`,{method:'POST'});
+  const r=await api('/groups/'+encSeg(gid)+'/ban/'+encSeg(aid),{method:'POST'});
   if(r&&r.ok){nagMemberFeedback(gid,aid,'Banned.','ok');nagRenderAdmin(gid)}
   else{nagMemberFeedback(gid,aid,(r&&r.error)||'Ban failed.','err')}
 }
 
 async function nagUnban(gid,aid){
   nagMemberFeedback(gid,aid,'Working…');
-  const r=await api(`/groups/${gid}/ban/${aid}`,{method:'DELETE'});
+  const r=await api('/groups/'+encSeg(gid)+'/ban/'+encSeg(aid),{method:'DELETE'});
   if(r&&r.ok){nagMemberFeedback(gid,aid,'Unbanned.','ok');nagRenderAdmin(gid)}
   else{nagMemberFeedback(gid,aid,(r&&r.error)||'Unban failed.','err')}
 }
@@ -6253,14 +6934,31 @@ function joinRequestBearer(){return OWNER_TOKEN||SESSION_TOKEN}
 
 async function nagApproveRequest(gid,rid){
   nagRequestFeedback(gid,rid,'Working…');
-  const r=await ownerApi(`/groups/${gid}/requests/${rid}/approve`,{method:'POST'});
+  const r=await ownerApi('/groups/'+encSeg(gid)+'/requests/'+encSeg(rid)+'/approve',{method:'POST'});
   if(r&&r.ok){nagRequestFeedback(gid,rid,'Approved.','ok');nagRenderAdmin(gid)}
   else{nagRequestFeedback(gid,rid,(r&&r.error)||'Approve failed.','err')}
 }
 
+async function nagApproveAllRequests(gid){
+  const host=document.getElementById('nag-admin-'+gid);
+  if(!host)return;
+  const ids=[...host.querySelectorAll('[data-nag-req-approve]')].map(b=>b.getAttribute('data-nag-req-approve')).filter(Boolean);
+  if(!ids.length)return;
+  if(!confirm('Approve all '+ids.length+' pending join requests?'))return;
+  let approved=0,failed=0;
+  for(const rid of ids){
+    nagRequestFeedback(gid,rid,'Approving…');
+    const r=await ownerApi('/groups/'+encSeg(gid)+'/requests/'+encSeg(rid)+'/approve',{method:'POST'});
+    if(r&&r.ok){approved++;nagRequestFeedback(gid,rid,'Approved.','ok')}
+    else{failed++;nagRequestFeedback(gid,rid,(r&&r.error)||'Approve failed.','err')}
+  }
+  toast(failed?('Approved '+approved+' of '+ids.length+' ('+failed+' failed)'):('Approved all '+approved+' requests'),failed?'warning':'success');
+  nagRenderAdmin(gid);
+}
+
 async function nagRejectRequest(gid,rid){
   nagRequestFeedback(gid,rid,'Working…');
-  const r=await ownerApi(`/groups/${gid}/requests/${rid}/reject`,{method:'POST'});
+  const r=await ownerApi('/groups/'+encSeg(gid)+'/requests/'+encSeg(rid)+'/reject',{method:'POST'});
   if(r&&r.ok){nagRequestFeedback(gid,rid,'Rejected.','ok');nagRenderAdmin(gid)}
   else{nagRequestFeedback(gid,rid,(r&&r.error)||'Reject failed.','err')}
 }
@@ -6277,58 +6975,105 @@ function spaceOwnDisplayName(g,agentId){
 }
 
 async function renderSpaceDetail(el,data){
-  const g=await api('/groups/'+data.groupId);
+  const g=await api('/groups/'+encSeg(data.groupId));
   if(!g||!g.ok){el.innerHTML='<div class="detail-body" style="color:var(--tx3)">Space not found</div>';return}
   if(g.membership_state==='pending_authority_commit'){
-    el.innerHTML='<div class="detail-header"><h3>Waiting to join</h3><button class="detail-close" onclick="hideDetail()">&#10005;</button></div><div class="detail-body" style="color:var(--tx3)">Waiting for the group authority to confirm your membership.</div>';
+    const js=await api('/groups/'+encSeg(data.groupId)+'/join-status').catch(()=>null);
+    const cause=js&&js.pending_cause&&js.pending_cause.cause?('Cause: '+esc(js.pending_cause.cause)+(js.pending_cause.detail?' — '+esc(js.pending_cause.detail):'')):'';
+    const outcome=js&&js.last_join_outcome&&js.last_join_outcome.outcome?('Last outcome: '+esc(js.last_join_outcome.outcome)+(js.last_join_outcome.reason?' ('+esc(js.last_join_outcome.reason)+')':'')):'';
+    el.innerHTML=`<div class="detail-header"><h3>Waiting to join</h3><button class="detail-close" onclick="hideDetail()">&#10005;</button></div>
+      <div class="detail-body" style="color:var(--tx3)">
+        <p>Waiting for the group authority to confirm your membership.</p>
+        ${cause?'<div class="card mb" style="font-size:11px;color:var(--am)">'+cause+'</div>':''}
+        ${outcome?'<div class="card mb" style="font-size:11px">'+outcome+'</div>':''}
+        <div class="mt2"><button class="danger" onclick="if(confirm('Cancel and remove this pending space?'))leaveSpace('${escJs(data.groupId)}')">Cancel join</button></div>
+      </div>`;
     return;
   }
+  const tagsHtml=Array.isArray(g.tags)&&g.tags.length
+    ?`<div class="tags" style="margin-top:8px">${g.tags.map(t=>'<span class="tag">#'+esc(t)+'</span>').join('')}</div>`:'';
+  let statusBanner='';
+  if(g.withdrawn){
+    statusBanner+='<div class="card mb" style="border-color:var(--rd);color:var(--rd);font-size:12px">This space has been deleted (withdrawn).</div>';
+  }
+  if(g.fork_quarantine){
+    statusBanner+='<div class="card mb" style="border-color:var(--am);color:var(--am);font-size:12px">Fork quarantine active — membership writes are paused until an admin or owner clears recovery.</div>';
+  }
+  if(g.recovery&&g.recovery.state){
+    statusBanner+='<div class="card mb" style="border-color:var(--am);color:var(--am);font-size:12px">Recovery status: '+esc(String(g.recovery.state))+(g.recovery.reason?' ('+esc(String(g.recovery.reason))+')':'')+'</div>';
+  }
+  const isDiscoverable=g.policy&&g.policy.discoverability&&g.policy.discoverability!=='hidden';
   el.innerHTML=`<div class="detail-header">
     <h3>${esc(g.name)}</h3>
     <button class="detail-close" onclick="hideDetail()">&#10005;</button>
   </div>
   <div class="detail-body">
+    ${statusBanner}
     <div class="card mb">
-      <div style="font-size:12px;color:var(--tx3);margin-bottom:8px">${g.description||'No description'}</div>
+      <div style="font-size:12px;color:var(--tx3);margin-bottom:8px">${esc(g.description||'No description')}</div>
       <div style="font-size:11px"><span style="color:var(--tx3)">Members:</span> ${g.member_count||1}</div>
-      <div style="font-size:11px"><span style="color:var(--tx3)">Creator:</span> <span class="aid-short">${short(g.creator)}</span></div>
+      <div style="font-size:11px"><span style="color:var(--tx3)">Creator:</span> <span class="aid-short">${esc(short(g.creator))}</span></div>
       ${spaceDetailEncryptedBadge(g)}
+      ${tagsHtml}
     </div>
     <h3>Invite</h3>
     <div class="card mb">
-      <button class="pri" onclick="genSpaceInvite('${data.groupId}')">Generate Invite Link</button>
+      <div style="font-size:11px;color:var(--tx3);margin-bottom:8px">Each invite link is single-use. Click to mint a fresh link for each person.</div>
+      <div class="row" style="gap:6px;flex-wrap:wrap">
+        <button class="pri" onclick="genSpaceInvite('${escJs(data.groupId)}')">Mint Fresh Invite Link</button>
+        ${isDiscoverable?`<button onclick="copySpaceCard('${escJs(data.groupId)}')">Copy Group Card</button>`:''}
+      </div>
       <div id="detail-invite" style="margin-top:8px;font-size:10px;word-break:break-all;color:var(--cy)"></div>
+      <div id="detail-invite-meta" style="margin-top:4px;font-size:10px;color:var(--tx3)"></div>
     </div>
     <h3>Display Name</h3>
     <div class="card mb">
-      <div class="row"><input id="detail-dname" placeholder="Your name in this space" value="${esc(spaceOwnDisplayName(g,S.get('agentId')))}"><button onclick="setSpaceDisplayName('${data.groupId}')">Set</button></div>
+      <div class="row"><input id="detail-dname" placeholder="Your name in this space" value="${esc(spaceOwnDisplayName(g,S.get('agentId')))}"><button onclick="setSpaceDisplayName('${escJs(data.groupId)}')">Set</button></div>
     </div>
     <h3 style="margin-top:16px">Manage</h3>
-    <div id="nag-admin-${data.groupId}" class="mb">
+    <div id="nag-admin-${esc(data.groupId)}" class="mb">
       <div class="sub" style="font-size:11px;color:var(--tx3)">Loading admin controls…</div>
     </div>
-    <div class="mt2"><button class="danger" onclick="if(confirm('Leave this space?'))leaveSpace('${data.groupId}')">Leave Space</button></div>
+    <div class="mt2"><button class="danger" onclick="if(confirm('Leave this space?'))leaveSpace('${escJs(data.groupId)}')">Leave Space</button></div>
   </div>`;
-  nagRenderAdmin(data.groupId);
+  nagRenderAdmin(data.groupId,g.policy);
 }
 
-const savedInvites={};
 async function genSpaceInvite(gid){
-  if(savedInvites[gid]){
-    copyText(savedInvites[gid]);
-    toast('Invite link copied','success');
-    const el=document.getElementById('detail-invite');
-    if(el)el.textContent=savedInvites[gid];
-    return;
-  }
   const r=await api('/groups/'+gid+'/invite',{method:'POST',body:JSON.stringify({})});
+  const el=document.getElementById('detail-invite');
+  const meta=document.getElementById('detail-invite-meta');
   if(r&&r.ok&&r.invite_link){
-    savedInvites[gid]=r.invite_link;
     copyText(r.invite_link);
-    toast('Invite link copied','success');
-    const el=document.getElementById('detail-invite');
+    toast('Fresh single-use invite link copied','success');
     if(el)el.textContent=r.invite_link;
-  }else{toast('Failed to generate invite','error')}
+    if(meta){
+      const exp=r.expires_at?('Expires '+new Date(r.expires_at*1000).toLocaleString()):'';
+      meta.textContent='Single-use link'+(exp?' · '+exp:'');
+    }
+  }else{
+    const err=(r&&r.error)||'Failed to generate invite';
+    if(r&&r._http_status===429){
+      toast('Live invite limit reached — wait for existing invites to be used or expire.','error');
+    }else if(r&&r._http_status===413){
+      toast('Space roster exceeds invite size limit: '+err,'error');
+    }else{
+      toast('Invite failed: '+err,'error');
+    }
+    if(meta)meta.textContent=err;
+  }
+}
+
+async function copySpaceCard(gid){
+  const r=await api('/groups/cards/'+encSeg(gid));
+  if(r&&r._http_ok!==false&&r.group_id){
+    const copy={...r};
+    delete copy._http_ok;delete copy._http_status;
+    copyText(JSON.stringify(copy,null,2));
+    toast('Signed group card JSON copied — anyone can import or discover it','success');
+  }else{
+    toast('Could not fetch group card: '+apiError(r),'error');
+  }
 }
 
 async function setSpaceDisplayName(gid){
@@ -6340,7 +7085,6 @@ async function setSpaceDisplayName(gid){
 
 async function leaveSpace(gid){
   const r=await api('/groups/'+gid,{method:'DELETE'});
-  delete savedInvites[gid];
   hideDetail();
   // #369: a sole-member leave IS a deletion — say so instead of "Left space".
   const deleted=r&&typeof r==='object'&&r.deleted!==undefined;
@@ -6383,6 +7127,7 @@ function showCreateSpace(){
   const m=showModal(`<h2>Create Space</h2>
     <input id="modal-space-name" placeholder="Space name" style="width:100%;margin-bottom:12px">
     <input id="modal-space-desc" placeholder="Description (optional)" style="width:100%;margin-bottom:12px">
+    <input id="modal-space-tags" placeholder="Tags (comma-separated, optional, e.g. rust, community)" style="width:100%;margin-bottom:12px">
     <div style="font-size:12px;color:var(--tx3);margin-bottom:6px">Visibility</div>
     <div id="modal-space-presets" class="preset-grid">${presetTilesHtml('private_secure')}</div>
     <div class="actions" style="margin-top:14px">
@@ -6407,10 +7152,14 @@ async function createSpace(){
   const name=document.getElementById('modal-space-name').value.trim();
   if(!name)return;
   const desc=document.getElementById('modal-space-desc').value.trim();
+  const tagsEl=document.getElementById('modal-space-tags');
+  const tagsRaw=tagsEl?tagsEl.value.trim():'';
+  const tags=tagsRaw?tagsRaw.split(',').map(s=>s.trim().replace(/^#+/,'').toLowerCase()).filter(Boolean):[];
   const presetRadio=document.querySelector('input[name=modal-space-preset]:checked');
   const preset=presetRadio?presetRadio.value:'private_secure';
   const body={name,preset};
   if(desc)body.description=desc;
+  if(tags.length)body.tags=tags;
   const r=await api('/groups',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.ok){
     // Full-policy echo guard (codex r4/r5): compare EVERY axis, not just
@@ -6544,39 +7293,88 @@ async function importCardModal(){
 /* ═══════════════════════════════════════════════════════════════════
    JS SECTION 15: GOSSIP MESSAGE HANDLER
    ═══════════════════════════════════════════════════════════════════ */
-function onGossipMessage(topic,origin,data){
+function applySpaceChannelPayload(groupId,chanName,topic,origin,data){
+  if(!data)return;
+  const chatKey=groupId+'_'+chanName;
+  if(data.type==='reaction'&&data.msg_id){
+    applyRemoteReaction(chatKey,data.msg_id,data.emoji,origin,data.action);
+    return;
+  }
+  if(data.type==='edit'&&data.msg_id){
+    applyRemoteEdit(chatKey,data.msg_id,data.text,origin);
+    return;
+  }
+  if(data.type==='delete'&&data.msg_id){
+    applyRemoteDelete(chatKey,data.msg_id,origin);
+    return;
+  }
+  if(data.type==='typing'){
+    applyTypingEvent(topic,origin,data.sender_name);
+    return;
+  }
+  if(data.type==='pin'&&data.msg_id){
+    applyRemotePin(chatKey,data.msg_id,data.action);
+    return;
+  }
+  if(data.text){
+    const safeId=isSafeRemoteId(data.id)?data.id:generateMsgId();
+    const safeQuoteId=isSafeRemoteId(data.quote_id)?data.quote_id:'';
+    const knownName=resolveKnownSenderName(groupId,origin);
+    const msg={...data,id:safeId,quote_id:safeQuoteId,sender_id:origin,sender_name:knownName||data.sender_name||short(origin),own:false,channel:chanName};
+    addChatMsg(chatKey,msg);
+    if(isMentioned(data.text)){
+      toast((msg.sender_name||short(origin))+' mentioned you in #'+chanName,'info');
+    }
+  }
+}
+
+async function unwrapSpaceGossip(groupId,data){
+  if(isEncryptedSpace(groupId)){
+    // Fail-closed: encrypted spaces never accept unencrypted plaintext gossip frames.
+    if(!data||data.enc!==true||!data.ciphertext_b64)return null;
+    return await decryptSpaceGossip(groupId,data);
+  }
+  return data;
+}
+
+async function onGossipMessage(topic,origin,data){
   if(!data)return;
   const sid=S.get('spaceId');
   const chan=S.get('channel')||'general';
 
-  // SignedPublic push path. The daemon publishes a `GroupPublicMessage`
-  // envelope on `x0x.groups.public.{stable_group_id}`; the same dedup
-  // key as the /messages poll keeps both paths consistent.
+  // SignedPublic push path. Always pinned to #general.
   if(signedPublicTopic && topic===signedPublicTopic && data.signature){
-    const key=(data.author_agent_id||'')+':'+(data.timestamp||0)+':'+((data.signature||'').slice(0,12));
-    if(!signedPublicSeen.has(key)){
-      signedPublicSeen.add(key);
-      const myAid=S.get('agentId')||'';
-      const chatKey=(signedPublicSpaceId||sid)+'_'+(S.get('channel')||'general');
-      addChatMsg(chatKey,{
-        id:key,
-        text:data.body||'',
-        sender_name:short(data.author_agent_id)||'peer',
-        sender_id:data.author_agent_id||'',
-        timestamp:data.timestamp||Date.now(),
-        channel:S.get('channel')||'general',
-        signed_public:true,
-        own:data.author_agent_id===myAid,
-      });
+    const targetSid=signedPublicSpaceId||sid;
+    const {dedupKey,msg}=normalizeSignedPublicMsg(targetSid,data);
+    if(!signedPublicSeen.has(dedupKey)){
+      signedPublicSeen.add(dedupKey);
+      signedPublicIdByKey.set(dedupKey,msg.id);
+      if(msg.thread_root){
+        addThreadReply(msg.thread_root,msg);
+      }else{
+        addChatMsg(targetSid+'_general',msg);
+      }
+      if(!isCanonicalMsgId(msg.id)){
+        scheduleSignedPublicBackfill(targetSid);
+      }
     }
     return;
   }
 
   // Thread replies (topic: x0x.group.{id}.thread/{msgId})
-  if(topic.includes('.thread/')&&data.text){
-    const threadId=topic.split('.thread/')[1];
-    if(threadId){
-      addThreadReply(threadId,{...data,sender_id:origin,own:false});
+  if(topic.includes('.thread/')){
+    const parts=topic.split('.thread/');
+    const threadId=parts[1];
+    const idPrefix=parts[0].replace('x0x.group.','');
+    const match=(S.get('groups')||[]).find(g=>g.group_id.startsWith(idPrefix));
+    // Fail-closed: drop group-scoped frames if the group is not loaded yet.
+    if(topic.startsWith('x0x.group.')&&!match)return;
+    if(match&&isSignedPublicSpace(match))return;
+    const payload=match?await unwrapSpaceGossip(match.group_id,data):data;
+    if(threadId&&isSafeRemoteId(threadId)&&payload&&payload.text){
+      const safeId=isSafeRemoteId(payload.id)?payload.id:generateMsgId();
+      const knownName=match?resolveKnownSenderName(match.group_id,origin):'';
+      addThreadReply(threadId,{...payload,id:safeId,sender_id:origin,sender_name:knownName||payload.sender_name||short(origin),own:false});
     }
     return;
   }
@@ -6590,67 +7388,48 @@ function onGossipMessage(topic,origin,data){
     const groups=S.get('groups')||[];
     const match=groups.find(g=>g.group_id.startsWith(idPrefix));
     if(match){
-      const chatKey=match.group_id+'_'+chanName;
-      // Handle special event types
-      if(data.type==='reaction'&&data.msg_id){
-        applyRemoteReaction(chatKey,data.msg_id,data.emoji,data.sender_id||origin,data.action);
-        return;
-      }
-      if(data.type==='edit'&&data.msg_id){
-        applyRemoteEdit(chatKey,data.msg_id,data.text);
-        return;
-      }
-      if(data.type==='delete'&&data.msg_id){
-        applyRemoteDelete(chatKey,data.msg_id);
-        return;
-      }
-      if(data.type==='typing'){
-        applyTypingEvent(topic,data.sender_id||origin,data.sender_name);
-        return;
-      }
-      if(data.type==='pin'&&data.msg_id){
-        applyRemotePin(chatKey,data.msg_id,data.action);
-        return;
-      }
-      // Regular chat message
-      if(data.text){
-        const msg={...data,sender_id:origin,own:false,channel:chanName};
-        addChatMsg(chatKey,msg);
-        // Mention notification
-        if(isMentioned(data.text)){
-          toast((data.sender_name||short(origin))+' mentioned you in #'+chanName,'info');
-        }
-      }
+      if(isSignedPublicSpace(match))return;
+      const payload=await unwrapSpaceGossip(match.group_id,data);
+      if(payload)applySpaceChannelPayload(match.group_id,chanName,topic,origin,payload);
     }
     return;
   }
 
   // Legacy base chat topic (backward compat)
-  if(topic===spaceChatTopic){
-    const chatKey=sid+'_'+chan;
-    if(data.type==='reaction'&&data.msg_id){applyRemoteReaction(chatKey,data.msg_id,data.emoji,data.sender_id||origin,data.action);return}
-    if(data.type==='edit'&&data.msg_id){applyRemoteEdit(chatKey,data.msg_id,data.text);return}
-    if(data.type==='delete'&&data.msg_id){applyRemoteDelete(chatKey,data.msg_id);return}
-    if(data.type==='typing'){applyTypingEvent(topic,data.sender_id||origin,data.sender_name);return}
-    if(data.type==='pin'&&data.msg_id){applyRemotePin(chatKey,data.msg_id,data.action);return}
-    if(data.text){addChatMsg(chatKey,{...data,sender_id:origin,own:false});return}
+  if(topic===spaceChatTopic&&sid){
+    if(isSignedPublicSpace(sid))return;
+    const payload=await unwrapSpaceGossip(sid,data);
+    if(payload)applySpaceChannelPayload(sid,chan,topic,origin,payload);
+    return;
   }
 
-  // Swarm
-  if(topic==='x0x-swarm/tasks'&&data.id){
-    swarmTasks[data.id]={...swarmTasks[data.id],...data,status:data.event||'posted',from:origin,ts:data.timestamp||Date.now()};
-    renderSwarmFeed();
+  // Per-space Swarm (topic: x0x.group.{id_prefix}.swarm/tasks or /results)
+  if(topic.includes('.swarm/tasks')||topic==='x0x-swarm/tasks'){
+    const isGroupScoped=topic.startsWith('x0x.group.');
+    const idPrefix=isGroupScoped?topic.split('.swarm/')[0].replace('x0x.group.',''):'';
+    const match=idPrefix?(S.get('groups')||[]).find(g=>g.group_id.startsWith(idPrefix)):null;
+    if(isGroupScoped&&!match)return;
+    const payload=match?await unwrapSpaceGossip(match.group_id,data):data;
+    if(payload&&payload.id){
+      swarmTasks[payload.id]={...swarmTasks[payload.id],...payload,space_id:payload.space_id||(match&&match.group_id)||'',status:payload.event||'posted',from:origin,ts:payload.timestamp||Date.now()};
+      renderSwarmFeed(match&&match.group_id);
+      renderSwarmRoster(match&&match.group_id);
+    }
+    return;
   }
-  if(topic==='x0x-swarm/results'&&data.task_id&&swarmTasks[data.task_id]){
-    swarmTasks[data.task_id].status='completed';
-    renderSwarmFeed();
-  }
-  // Feed
-  if(topic.includes('.feed')&&data.text){
-    const idPrefix=topic.replace('x0x.space.','').replace('.feed','');
-    const groups=S.get('groups')||[];
-    const match=groups.find(g=>g.group_id.startsWith(idPrefix));
-    if(match){addFeedPost(match.group_id,{...data,own:false})}
+  if(topic.includes('.swarm/results')||topic==='x0x-swarm/results'){
+    const isGroupScoped=topic.startsWith('x0x.group.');
+    const idPrefix=isGroupScoped?topic.split('.swarm/')[0].replace('x0x.group.',''):'';
+    const match=idPrefix?(S.get('groups')||[]).find(g=>g.group_id.startsWith(idPrefix)):null;
+    if(isGroupScoped&&!match)return;
+    const payload=match?await unwrapSpaceGossip(match.group_id,data):data;
+    if(payload&&payload.task_id&&swarmTasks[payload.task_id]){
+      swarmTasks[payload.task_id].status='completed';
+      swarmTasks[payload.task_id].worker=origin;
+      renderSwarmFeed(match&&match.group_id);
+      renderSwarmRoster(match&&match.group_id);
+    }
+    return;
   }
 }
 

@@ -1762,6 +1762,7 @@ async fn build_gss(dir: &std::path::Path, owner_certified: bool) -> anyhow::Resu
             display_name: None,
             preset: None,
             policy: Some(policy),
+            tags: Vec::new(),
         }),
     )
     .await

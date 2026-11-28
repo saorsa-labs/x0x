@@ -22,8 +22,15 @@ and every one complete:
 - GREEN: the same, except that `cause` is not required and `final` passed.
 
 Byte-identical traces are REPORTED, not required (D196): the script prints
-the number of distinct traces per case and the first divergence. With
-`--strict-traces` a case with more than one distinct trace fails, for
+the number of distinct traces per case and the first divergence.
+
+`--infra-missing-file FILE` lists the cases of shards that uploaded no
+traces (`w3h-shards.py --missing-traces`). A missing or short trace or
+receipt count of such a case is printed as `W3H-INFRA-MISSING`, not as
+`W3H-GATE FAIL`; the exit status is still 1. Every other check of the
+traces and receipts that did arrive stays a gate failure.
+
+With `--strict-traces` a case with more than one distinct trace fails, for
 determinism work. A trace file is the digested canonical trace (everything
 up to the `teardown begins` mark), then an `APPENDIX` line and the teardown
 events; only the digested part is compared. Exit 1 on any failure.
@@ -73,20 +80,30 @@ def first_divergence(left, right):
     return ' | '.join(part for part in (removed, added) if part is not None)
 
 
-def check(directory, runs, required, strict_traces=False):
+INFRA = 'W3H-INFRA-MISSING'
+
+
+def count_problem(case, message, infra):
+    """A missing or short count: infra when the case's shard uploaded nothing."""
+    if case in infra:
+        return f'{INFRA} {case}: {message} (a shard of this case uploaded no traces)'
+    return f'{case}: {message}'
+
+
+def check(directory, runs, required, strict_traces=False, infra=frozenset()):
     """Trace presence and shim checks (blocking) and the distinct-trace
     report (blocking only with `strict_traces`)."""
     problems = []
     cases = load(directory)
     if not cases:
         problems.append(f'no traces in {directory}: nothing was checked')
-    for case in required:
+    for case in sorted(set(required) | set(infra)):
         if case not in cases:
-            problems.append(f'{case}: no trace written')
+            problems.append(count_problem(case, 'no trace written', infra))
     for case, traces in sorted(cases.items()):
         digests = {hashlib.blake2b(text.encode()).hexdigest() for _, text in traces}
         if len(traces) != runs:
-            problems.append(f'{case}: {len(traces)} traces, expected {runs}')
+            problems.append(count_problem(case, f'{len(traces)} traces, expected {runs}', infra))
         if any('entropy=controlled' not in text for _, text in traces):
             problems.append(f'{case}: entropy was not controlled (shim missing)')
         if len(digests) == 1:
@@ -131,7 +148,7 @@ def incomplete(receipt, verdict):
     return None
 
 
-def check_receipts(directory, runs, expectations):
+def check_receipts(directory, runs, expectations, infra=frozenset()):
     problems = []
     receipts = defaultdict(list)
     for path in sorted(Path(directory).glob('*.receipt.json')):
@@ -144,7 +161,7 @@ def check_receipts(directory, runs, expectations):
         case, _, verdict = expectation.partition('=')
         found = receipts.get(case, [])
         if len(found) != runs:
-            problems.append(f'{case}: {len(found)} receipts, expected {runs}')
+            problems.append(count_problem(case, f'{len(found)} receipts, expected {runs}', infra))
         verdicts = sorted({str(receipt.get('verdict')) for receipt in found})
         if len(verdicts) > 1:
             problems.append(f'{case}: verdicts differ across reruns: {verdicts}')
@@ -174,11 +191,19 @@ def main(argv=None):
                         help='CASE=RED|GREEN|INFRA, checked against receipts')
     parser.add_argument('--strict-traces', action='store_true',
                         help='also fail when a case has more than one distinct trace')
+    parser.add_argument('--infra-missing-file', type=Path,
+                        help='case names, one per line, of shards that uploaded no traces')
     args = parser.parse_args(argv)
-    problems = check(args.directory, args.runs, args.require, args.strict_traces)
-    problems += check_receipts(args.directory, args.runs, args.expect)
+    infra = frozenset()
+    if args.infra_missing_file:
+        infra = frozenset(args.infra_missing_file.read_text().split())
+    problems = check(args.directory, args.runs, args.require, args.strict_traces, infra)
+    problems += check_receipts(args.directory, args.runs, args.expect, infra)
     for problem in problems:
-        print(f'W3H-GATE FAIL {problem}', file=sys.stderr)
+        if problem.startswith(INFRA):
+            print(problem, file=sys.stderr)
+        else:
+            print(f'W3H-GATE FAIL {problem}', file=sys.stderr)
     return 1 if problems else 0
 
 
