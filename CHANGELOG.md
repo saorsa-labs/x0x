@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-11-28
+
+### Added
+
+- **Opt-in outbound signed webhook push (`[[notify.webhook]]`, #2241, A04 amendment).**
+  - Lets `x0xd` deliver HMAC-SHA256–signed batched HTTP webhooks (`X-X0X-Timestamp`,
+    `X-X0X-Signature`, optional bearer auth) for verified DMs, mentions, and
+    subscribed `group:<id>` / topic traffic, off by default unless configured.
+  - Adds `GET /diagnostics/webhooks` (`x0x diagnostics webhooks`) and updates
+    `docs/design/api-manifest.json` (234 endpoints), `docs/api-reference.md`,
+    `SKILL.md`, and `docs/skill/operations.md`.
+  - Includes post-validation public-message teeing, `webhook_meta` restart
+    cursor bounds, windowed `±60 s` DM deduplication (`dm_deliveries`),
+    persisted hourly/daily rate-cap tracking (`sent_log`), HTTP `408`/`429`
+    bounded retries (`MAX_RETRYABLE_ATTEMPTS = 24`), SSRF hardening (6to4,
+    Teredo, RFC 8215, redirect refusal), and clean `JoinSet` shutdown.
+
+### Fixed
+
+- **M2 upgrade/launcher settlement, apply-lock ordering, and `x0x doctor` (#2243, #2244, Refs #2012, #1379).**
+  - `run_trial` now retries `retire` on a `Committed` trial when the host
+    journal is `HostCommitted`, settling to `Idle` without rewriting
+    `trial.json`.
+  - `settle_idle` skips non-running participants (`!participant.was_running`,
+    matching `commit::host_commit`) and removes matching `upgrade-boot.json`
+    before writing `Idle` (propagating non-`NotFound` I/O errors so failed
+    unlinks retry on the next start).
+  - `BootRecords::blocks_apply()` permits an `upgrade-boot.json` matching a
+    settled (`Idle` / `Superseded`) journal, and `Prepared::stage_reading_anchor`
+    removes matching boot records from replaced settled transactions under locks
+    while leaving corrupt, foreign, or symlinked files intact.
+  - Moved `companion_failure::clear` under install locks for both restart-owned
+    and no-restart `Success` paths, split post-rename directory-sync errors from
+    rename failures (`record_with_sync_status`), and added a once-warn latch for
+    unreadable companion records in `health_verdict`.
+  - Updated `x0x doctor` (`src/cli/commands/daemon.rs`) to clarify
+    `down_upgrade_check` and emit POSIX-quoted `--name` and `--launcher` flags
+    in the `missing_daemon_check` remedy.
+- **TreeKEM catch-up head-sync and per-`AppState` isolation (#2245, #2247, Refs #2231).**
+  - `self_leave_key_package_reply` no longer swallows head-bearing empty
+    membership catch-up replies (`responder_state_hash: Some(...)`) as pending
+    KeyPackage waits, preserving `note_catchup_head` confirmation.
+  - Moved `self_leave_rekey_fences` and all five `TREEKEM_PAGE_*` catch-up
+    bookkeeping maps (`stop_rewarn`, `stopped_peers`, `ask_cursors`,
+    `rearm_baselines`, `rearm_inflight`) from process-global statics onto
+    `AppState`, preventing cross-daemon interference and stale pre-crash state
+    across restarts, and cleared `key_package_peers`, `ask_cursors`, and
+    `rearm_baselines` on group withdraw.
+- **Test stability & Track E soak baseline (#2239, #2240, #2246, Fixes #2232, #2226, Refs #1172).**
+  - Moved the forward bound-port regression to its own integration target
+    (`#2239`), relinked B to A after restart and aligned `STORE_BUDGET` in
+    W3-H `case_969` (`#2240`), and committed the Track E E0-b 26 h soak and
+    12 h configured-jemalloc A/B baseline at `docs/1172-e0b-soak-baseline.md`
+    (`#2246`).
+
 ## [0.51.0] - 2026-11-27
 
 ### Added
