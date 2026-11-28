@@ -285,7 +285,7 @@ body_mode = "full"                                        # or "metadata" (no te
 max_text_chars = 2000
 ```
 
-Both secret files must be `0600` (group/world-readable files are refused) and are zeroized in memory. Fast lane (`fast_window_ms`) carries allowlisted verified DMs and mentions; group/topic and non-allowlisted DMs (`unknown_sender`) coalesce in `batch_window_ms`. Hard `max_per_hour` / `max_per_day` caps hold excess items and send fast items first with `"rate_limited": true`. Inspect delivery health (never secrets) with `GET /diagnostics/webhooks` (durable owner token only; riders `403`).
+Both secret files must be `0600` (group/world-readable files are refused) and are zeroized in memory. Unverified DMs and unsigned/unverified topic messages are dropped; when `dm_allowlist` is non-empty, only verified DMs from listed senders are delivered. Fast lane (`fast_window_ms`) carries verified DMs and mentions; group/topic events coalesce in `batch_window_ms`. Hard `max_per_hour` / `max_per_day` caps persist across restarts, holding excess items and sending fast items first with `"rate_limited": true`. Inspect delivery health (never secrets) with `GET /diagnostics/webhooks` (durable owner token only; riders `403`).
 
 Each signed POST carries `X-X0x-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`:
 

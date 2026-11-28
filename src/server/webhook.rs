@@ -17,13 +17,15 @@ use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate as x0x;
-use crate::groups::{public_topic_for, GroupPublicMessage, GroupPublicMessageKind};
+use crate::groups::{
+    public_topic_for, GroupConfidentiality, GroupPublicMessage, GroupPublicMessageKind,
+};
 use crate::history::{classify::DmPayloadClass, Direction, HistoryQuery, Provenance, Scope};
 use crate::profile::CertMode;
 
@@ -33,13 +35,17 @@ use super::ws::MentionFrame;
 
 const WEBHOOK_STATE_DB_NAME: &str = "webhook_state.db";
 const DEDUPE_TTL_SECS: i64 = 7 * 86_400;
+const DEDUPE_BACKFILL_MARGIN_MS: i64 = 60_000;
+const BACKFILL_OVERLAP_MS: i64 = 2_000;
 const DEDUPE_PRUNE_INTERVAL_SECS: i64 = 3_600;
 const MAX_QUEUE_ITEMS: usize = 512;
 const MAX_BATCH_ITEMS: usize = 100;
 const MENTION_TEE_CAPACITY: usize = 256;
+const PUBLIC_MSG_TEE_CAPACITY: usize = 256;
 const DM_BACKFILL_LIMIT: usize = 200;
 const GROUP_BACKFILL_LIMIT: usize = 200;
 const MAX_4XX_ATTEMPTS: u32 = 3;
+pub(crate) const MAX_RETRYABLE_ATTEMPTS: u32 = 24;
 const BACKOFF_MIN_MS: u64 = 2_000;
 const BACKOFF_MAX_MS: u64 = 300_000;
 const HOUR_MS: u64 = 3_600_000;
@@ -47,6 +53,7 @@ const DAY_MS: u64 = 86_400_000;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const ABORT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const DEFAULT_FAST_WINDOW_MS: u64 = 5_000;
 const DEFAULT_BATCH_WINDOW_MS: u64 = 60_000;
 const DEFAULT_MAX_PER_HOUR: u32 = 6;
@@ -91,13 +98,13 @@ pub struct WebhookConfig {
     /// Event selectors (`dm`, `mention`, `group:<group_id>`, `topic:<topic>`).
     #[serde(default)]
     pub events: Vec<String>,
-    /// Optional 64-hex sender allowlist for fast-lane DM delivery.
+    /// Optional 64-hex sender allowlist; when non-empty, only verified DMs from listed senders are delivered.
     #[serde(default)]
     pub dm_allowlist: Vec<String>,
-    /// Coalescing window in milliseconds for fast-lane items (allowlisted verified DMs, mentions).
+    /// Coalescing window in milliseconds for fast-lane items (verified DMs, mentions).
     #[serde(default = "default_fast_window_ms")]
     pub fast_window_ms: u64,
-    /// Coalescing window in milliseconds for batched items (groups, topics, unknown-sender DMs).
+    /// Coalescing window in milliseconds for batched items (groups, topics).
     #[serde(default = "default_batch_window_ms")]
     pub batch_window_ms: u64,
     /// Hard maximum number of POST requests per rolling hour.
@@ -391,6 +398,32 @@ fn is_ipv6_ssrf_blocked(ip: Ipv6Addr) -> bool {
         );
         return is_ipv4_ssrf_blocked(v4);
     }
+    // 6to4 (2002::/16) embeds an IPv4 address in segments 1..=2.
+    if segs[0] == 0x2002 {
+        let v4 = Ipv4Addr::new(
+            (segs[1] >> 8) as u8,
+            (segs[1] & 0xff) as u8,
+            (segs[2] >> 8) as u8,
+            (segs[2] & 0xff) as u8,
+        );
+        return is_ipv4_ssrf_blocked(v4);
+    }
+    // Teredo (2001:0000::/32) embeds server IPv4 in segments 2..=3 and inverted client IPv4 in 6..=7.
+    if segs[0] == 0x2001 && segs[1] == 0x0000 {
+        let server_v4 = Ipv4Addr::new(
+            (segs[2] >> 8) as u8,
+            (segs[2] & 0xff) as u8,
+            (segs[3] >> 8) as u8,
+            (segs[3] & 0xff) as u8,
+        );
+        let client_v4 = Ipv4Addr::new(
+            !((segs[6] >> 8) as u8),
+            !((segs[6] & 0xff) as u8),
+            !((segs[7] >> 8) as u8),
+            !((segs[7] & 0xff) as u8),
+        );
+        return is_ipv4_ssrf_blocked(server_v4) || is_ipv4_ssrf_blocked(client_v4);
+    }
     ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
@@ -671,7 +704,7 @@ impl WebhookDedupeStore {
         }
         conn.execute_batch(
             "PRAGMA journal_mode = DELETE;
-             PRAGMA synchronous = NORMAL;
+             PRAGMA synchronous = FULL;
              CREATE TABLE IF NOT EXISTS delivered_keys (
                  webhook_name TEXT NOT NULL,
                  dedupe_key TEXT NOT NULL,
@@ -679,7 +712,17 @@ impl WebhookDedupeStore {
                  PRIMARY KEY (webhook_name, dedupe_key)
              );
              CREATE INDEX IF NOT EXISTS idx_webhook_delivered_at
-                 ON delivered_keys (delivered_at);",
+                 ON delivered_keys (delivered_at);
+             CREATE TABLE IF NOT EXISTS webhook_meta (
+                 webhook_name TEXT PRIMARY KEY,
+                 cursor_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS sent_log (
+                 webhook_name TEXT NOT NULL,
+                 sent_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_webhook_sent_log
+                 ON sent_log (webhook_name, sent_at_ms);",
         )?;
         let now_secs = unix_now_secs() as i64;
         let mut store = Self {
@@ -696,8 +739,82 @@ impl WebhookDedupeStore {
             "DELETE FROM delivered_keys WHERE delivered_at < ?1",
             rusqlite::params![cutoff],
         )?;
+        let sent_cutoff_ms = now_secs.saturating_mul(1_000).saturating_sub(DAY_MS as i64);
+        let _ = self.conn.execute(
+            "DELETE FROM sent_log WHERE sent_at_ms < ?1",
+            rusqlite::params![sent_cutoff_ms],
+        )?;
         self.last_prune_secs = now_secs;
         Ok(deleted)
+    }
+
+    /// Return `(cursor_ms, is_first_enable)` for `webhook_name`.
+    /// On first enable, persists `now_ms` so pre-enable history is never replayed.
+    pub(crate) fn init_or_get_cursor_ms(
+        &mut self,
+        webhook_name: &str,
+        now_ms: i64,
+    ) -> Result<(i64, bool), rusqlite::Error> {
+        let existing: Option<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT cursor_ms FROM webhook_meta WHERE webhook_name = ?1")?;
+            match stmt.query_row(rusqlite::params![webhook_name], |row| row.get(0)) {
+                Ok(val) => Some(val),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(err) => return Err(err),
+            }
+        };
+        if let Some(cursor_ms) = existing {
+            return Ok((cursor_ms, false));
+        }
+        self.conn.execute(
+            "INSERT INTO webhook_meta (webhook_name, cursor_ms) VALUES (?1, ?2)",
+            rusqlite::params![webhook_name, now_ms],
+        )?;
+        Ok((now_ms, true))
+    }
+
+    pub(crate) fn load_sent_timestamps(
+        &self,
+        webhook_name: &str,
+        now_ms: i64,
+    ) -> Result<Vec<u64>, rusqlite::Error> {
+        let day_cutoff = now_ms.saturating_sub(DAY_MS as i64);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT sent_at_ms FROM sent_log
+             WHERE webhook_name = ?1 AND sent_at_ms > ?2
+             ORDER BY sent_at_ms ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![webhook_name, day_cutoff], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(ts) = u64::try_from(row?) {
+                out.push(ts);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn record_sent(
+        &mut self,
+        webhook_name: &str,
+        sent_at_ms: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let day_cutoff = sent_at_ms.saturating_sub(DAY_MS as i64);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sent_log (webhook_name, sent_at_ms) VALUES (?1, ?2)",
+            rusqlite::params![webhook_name, sent_at_ms],
+        )?;
+        tx.execute(
+            "DELETE FROM sent_log WHERE webhook_name = ?1 AND sent_at_ms <= ?2",
+            rusqlite::params![webhook_name, day_cutoff],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn is_delivered(
@@ -716,17 +833,28 @@ impl WebhookDedupeStore {
         Ok(exists)
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_delivered(
         &mut self,
         webhook_name: &str,
         keys: &[String],
         now_secs: i64,
     ) -> Result<(), rusqlite::Error> {
-        if keys.is_empty() {
+        self.mark_delivered_and_advance(webhook_name, keys, now_secs, None)
+    }
+
+    pub(crate) fn mark_delivered_and_advance(
+        &mut self,
+        webhook_name: &str,
+        keys: &[String],
+        now_secs: i64,
+        advance_cursor_ms: Option<i64>,
+    ) -> Result<(), rusqlite::Error> {
+        if keys.is_empty() && advance_cursor_ms.is_none() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        {
+        if !keys.is_empty() {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO delivered_keys (webhook_name, dedupe_key, delivered_at)
                  VALUES (?1, ?2, ?3)",
@@ -734,6 +862,14 @@ impl WebhookDedupeStore {
             for key in keys {
                 stmt.execute(rusqlite::params![webhook_name, key, now_secs])?;
             }
+        }
+        if let Some(cursor_ms) = advance_cursor_ms {
+            tx.execute(
+                "INSERT INTO webhook_meta (webhook_name, cursor_ms) VALUES (?1, ?2)
+                 ON CONFLICT(webhook_name) DO UPDATE
+                 SET cursor_ms = MAX(cursor_ms, excluded.cursor_ms)",
+                rusqlite::params![webhook_name, cursor_ms],
+            )?;
         }
         tx.commit()?;
         if now_secs.saturating_sub(self.last_prune_secs) >= DEDUPE_PRUNE_INTERVAL_SECS {
@@ -743,11 +879,9 @@ impl WebhookDedupeStore {
     }
 }
 
-pub(crate) fn dm_dedupe_key(sender_hex: &str, received_at: u64, payload: &[u8]) -> String {
+pub(crate) fn dm_dedupe_key(sender_hex: &str, payload: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(sender_hex.to_ascii_lowercase().as_bytes());
-    hasher.update(b"|");
-    hasher.update(received_at.to_string().as_bytes());
     hasher.update(b"|");
     hasher.update(payload);
     format!("dm:{}", hex::encode(hasher.finalize()))
@@ -829,6 +963,7 @@ pub(crate) struct WebhookPostBody {
 pub(crate) struct QueuedWebhookItem {
     pub(crate) dedupe_key: String,
     pub(crate) lane: Lane,
+    pub(crate) enqueued_at_ms: u64,
     pub(crate) item: WebhookPayloadItem,
 }
 
@@ -852,6 +987,7 @@ pub(crate) enum BatchDisposition {
     Committed {
         keys: Vec<String>,
         status: u16,
+        max_enqueued_ms: Option<u64>,
     },
     RetryScheduled {
         retry_at_ms: u64,
@@ -860,6 +996,12 @@ pub(crate) enum BatchDisposition {
     Dropped4xx {
         batch_id: String,
         status: u16,
+        item_count: usize,
+    },
+    DroppedExpired {
+        batch_id: String,
+        last_status: Option<u16>,
+        attempts: u32,
         item_count: usize,
     },
 }
@@ -908,6 +1050,20 @@ impl WebhookScheduler {
             in_flight: None,
             retry_at_ms: None,
         }
+    }
+
+    pub(crate) fn seed_sent_timestamps(
+        &mut self,
+        timestamps_ms: impl IntoIterator<Item = u64>,
+        now_ms: u64,
+    ) {
+        let day_cutoff = now_ms.saturating_sub(DAY_MS);
+        let mut ts: Vec<u64> = timestamps_ms
+            .into_iter()
+            .filter(|&t| t > day_cutoff)
+            .collect();
+        ts.sort_unstable();
+        self.sent_timestamps_ms = VecDeque::from(ts);
     }
 
     pub(crate) fn queue_depth(&self) -> usize {
@@ -1107,12 +1263,20 @@ impl WebhookScheduler {
         match outcome {
             DeliveryOutcome::Success(status) => {
                 let mut keys = Vec::with_capacity(batch.items.len());
+                let mut max_enqueued_ms: Option<u64> = None;
                 for item in batch.items {
                     self.queued_keys.remove(&item.dedupe_key);
+                    max_enqueued_ms = Some(
+                        max_enqueued_ms.map_or(item.enqueued_at_ms, |m| m.max(item.enqueued_at_ms)),
+                    );
                     keys.push(item.dedupe_key);
                 }
                 self.retry_at_ms = None;
-                Some(BatchDisposition::Committed { keys, status })
+                Some(BatchDisposition::Committed {
+                    keys,
+                    status,
+                    max_enqueued_ms,
+                })
             }
             DeliveryOutcome::ClientError(status) => {
                 batch.attempts = batch.attempts.saturating_add(1);
@@ -1139,17 +1303,31 @@ impl WebhookScheduler {
                     })
                 }
             }
-            DeliveryOutcome::RetryableError(_) => {
+            DeliveryOutcome::RetryableError(status) => {
                 batch.attempts = batch.attempts.saturating_add(1);
-                let delay = compute_backoff_ms(batch.attempts, jitter_unit);
-                let retry_at_ms = now_ms.saturating_add(delay);
-                let attempts = batch.attempts;
-                self.in_flight = Some(batch);
-                self.retry_at_ms = Some(retry_at_ms);
-                Some(BatchDisposition::RetryScheduled {
-                    retry_at_ms,
-                    attempts,
-                })
+                if batch.attempts >= MAX_RETRYABLE_ATTEMPTS {
+                    let count = batch.items.len();
+                    for item in batch.items {
+                        self.queued_keys.remove(&item.dedupe_key);
+                    }
+                    self.retry_at_ms = None;
+                    Some(BatchDisposition::DroppedExpired {
+                        batch_id: batch.batch_id,
+                        last_status: status,
+                        attempts: batch.attempts,
+                        item_count: count,
+                    })
+                } else {
+                    let delay = compute_backoff_ms(batch.attempts, jitter_unit);
+                    let retry_at_ms = now_ms.saturating_add(delay);
+                    let attempts = batch.attempts;
+                    self.in_flight = Some(batch);
+                    self.retry_at_ms = Some(retry_at_ms);
+                    Some(BatchDisposition::RetryScheduled {
+                        retry_at_ms,
+                        attempts,
+                    })
+                }
             }
         }
     }
@@ -1303,11 +1481,19 @@ struct MentionTeeEvent {
     body: Option<String>,
 }
 
-type TargetSubscriber = (
-    Arc<ValidatedWebhook>,
-    Arc<WebhookStats>,
-    mpsc::Sender<QueuedWebhookItem>,
-);
+#[derive(Debug, Clone)]
+struct PublicMessageTeeEvent {
+    stable_group_id: String,
+    msg: GroupPublicMessage,
+}
+
+#[derive(Clone)]
+struct TargetSubscriber {
+    config: Arc<ValidatedWebhook>,
+    stats: Arc<WebhookStats>,
+    tx: mpsc::Sender<QueuedWebhookItem>,
+    backfill_since_ms: Option<i64>,
+}
 
 struct ActiveTarget {
     config: Arc<ValidatedWebhook>,
@@ -1322,11 +1508,14 @@ pub(crate) struct WebhookService {
     stats: Vec<Arc<WebhookStats>>,
     mention_tx: Option<mpsc::Sender<MentionTeeEvent>>,
     mention_dropped: AtomicU64,
+    public_msg_tx: Option<mpsc::Sender<PublicMessageTeeEvent>>,
+    public_msg_dropped: AtomicU64,
     dedupe: Option<Arc<StdMutex<WebhookDedupeStore>>>,
     targets: Mutex<Vec<ActiveTarget>>,
     mention_rx: Mutex<Option<mpsc::Receiver<MentionTeeEvent>>>,
+    public_msg_rx: Mutex<Option<mpsc::Receiver<PublicMessageTeeEvent>>>,
     cancel: CancellationToken,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    tasks: Mutex<JoinSet<()>>,
 }
 
 impl WebhookService {
@@ -1340,6 +1529,7 @@ impl WebhookService {
         let mut stats = Vec::with_capacity(config.webhook.len());
         let mut active_targets = Vec::new();
         let mut any_wants_mention = false;
+        let mut any_wants_group = false;
 
         for raw in &config.webhook {
             let trimmed = raw.name.trim().to_string();
@@ -1354,6 +1544,9 @@ impl WebhookService {
                     Ok(client) => {
                         if valid.wants_mention() {
                             any_wants_mention = true;
+                        }
+                        if !valid.group_ids().is_empty() {
+                            any_wants_group = true;
                         }
                         let st = Arc::new(WebhookStats::from_validated(&valid));
                         stats.push(Arc::clone(&st));
@@ -1417,15 +1610,25 @@ impl WebhookService {
             (None, None)
         };
 
+        let (public_msg_tx, public_msg_rx) = if any_wants_group && dedupe.is_some() {
+            let (tx, rx) = mpsc::channel(PUBLIC_MSG_TEE_CAPACITY);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         Some(Arc::new(Self {
             stats,
             mention_tx,
             mention_dropped: AtomicU64::new(0),
+            public_msg_tx,
+            public_msg_dropped: AtomicU64::new(0),
             dedupe,
             targets: Mutex::new(active_targets),
             mention_rx: Mutex::new(mention_rx),
+            public_msg_rx: Mutex::new(public_msg_rx),
             cancel: CancellationToken::new(),
-            tasks: Mutex::new(Vec::new()),
+            tasks: Mutex::new(JoinSet::new()),
         }))
     }
 
@@ -1451,6 +1654,28 @@ impl WebhookService {
         }
     }
 
+    /// Non-blocking tee called from `ingest_public_message` only after full
+    /// signature, membership, ban, write-policy, rider, and send-as validation.
+    pub(in crate::server) fn try_send_public_message(
+        &self,
+        stable_group_id: &str,
+        msg: &GroupPublicMessage,
+    ) {
+        if !matches!(msg.kind, GroupPublicMessageKind::Chat) {
+            return;
+        }
+        let Some(ref tx) = self.public_msg_tx else {
+            return;
+        };
+        let event = PublicMessageTeeEvent {
+            stable_group_id: stable_group_id.to_string(),
+            msg: msg.clone(),
+        };
+        if tx.try_send(event).is_err() {
+            self.public_msg_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Start background event taps and per-webhook delivery loops.
     pub(crate) async fn start(self: &Arc<Self>, state: Arc<AppState>) {
         let Some(dedupe) = self.dedupe.clone() else {
@@ -1464,42 +1689,83 @@ impl WebhookService {
             return;
         }
 
-        let mut spawned = Vec::new();
+        let now_ms_i64 = i64::try_from(unix_now_ms()).unwrap_or(i64::MAX);
+        let dedupe_floor_ms = now_ms_i64
+            .saturating_sub(DEDUPE_TTL_SECS.saturating_mul(1_000) - DEDUPE_BACKFILL_MARGIN_MS);
+
+        let mut tasks = self.tasks.lock().await;
         let mut dm_subscribers: Vec<TargetSubscriber> = Vec::new();
         let mut mention_subscribers: Vec<TargetSubscriber> = Vec::new();
         let mut group_subscribers: std::collections::HashMap<String, Vec<TargetSubscriber>> =
             std::collections::HashMap::new();
         let mut topic_subscribers: std::collections::HashMap<String, Vec<TargetSubscriber>> =
             std::collections::HashMap::new();
+        let mut groups_to_reconcile: Vec<String> = Vec::new();
 
         for target in &mut active {
+            let backfill_since_ms =
+                match dedupe_init_or_get_cursor(&dedupe, target.config.name.clone(), now_ms_i64)
+                    .await
+                {
+                    Some((_cursor_ms, true)) => None,
+                    Some((cursor_ms, false)) => Some(cursor_ms.max(dedupe_floor_ms)),
+                    None => None,
+                };
+
+            let make_sub = || TargetSubscriber {
+                config: Arc::clone(&target.config),
+                stats: Arc::clone(&target.stats),
+                tx: target.item_tx.clone(),
+                backfill_since_ms,
+            };
+
             if target.config.wants_dm() {
-                dm_subscribers.push((
-                    Arc::clone(&target.config),
-                    Arc::clone(&target.stats),
-                    target.item_tx.clone(),
-                ));
+                dm_subscribers.push(make_sub());
             }
             if target.config.wants_mention() {
-                mention_subscribers.push((
-                    Arc::clone(&target.config),
-                    Arc::clone(&target.stats),
-                    target.item_tx.clone(),
-                ));
+                mention_subscribers.push(make_sub());
             }
-            for gid in target.config.group_ids() {
-                group_subscribers.entry(gid).or_default().push((
-                    Arc::clone(&target.config),
-                    Arc::clone(&target.stats),
-                    target.item_tx.clone(),
-                ));
+            for raw_gid in target.config.group_ids() {
+                let resolved = {
+                    let groups = state.named_groups.read().await;
+                    crate::server::resolve_group_entry_locked(&groups, &raw_gid).map(|(_, info)| {
+                        (
+                            info.stable_group_id().to_string(),
+                            info.policy.confidentiality == GroupConfidentiality::MlsEncrypted,
+                            info.withdrawn,
+                        )
+                    })
+                };
+                let subscribe_key = match resolved {
+                    Some((stable_id, is_mls, withdrawn)) => {
+                        if is_mls || withdrawn {
+                            tracing::warn!(
+                                webhook = %target.config.name,
+                                group_id = %raw_gid,
+                                stable_group_id = %stable_id,
+                                "webhook group selector targets an MLS-encrypted or withdrawn group; public messages will not be delivered"
+                            );
+                        } else if !groups_to_reconcile.contains(&stable_id) {
+                            groups_to_reconcile.push(stable_id.clone());
+                        }
+                        stable_id
+                    }
+                    None => {
+                        tracing::warn!(
+                            webhook = %target.config.name,
+                            group_id = %raw_gid,
+                            "webhook group selector does not match any currently known named group"
+                        );
+                        raw_gid
+                    }
+                };
+                group_subscribers
+                    .entry(subscribe_key)
+                    .or_default()
+                    .push(make_sub());
             }
             for topic in target.config.topics() {
-                topic_subscribers.entry(topic).or_default().push((
-                    Arc::clone(&target.config),
-                    Arc::clone(&target.stats),
-                    target.item_tx.clone(),
-                ));
+                topic_subscribers.entry(topic).or_default().push(make_sub());
             }
 
             if let Some(item_rx) = target.item_rx.take() {
@@ -1509,7 +1775,7 @@ impl WebhookService {
                 let worker_client = target.client.clone();
                 let worker_dedupe = Arc::clone(&dedupe);
                 let worker_cancel = self.cancel.clone();
-                spawned.push(tokio::spawn(async move {
+                tasks.spawn(async move {
                     run_webhook_worker(
                         worker_state,
                         worker_cfg,
@@ -1520,17 +1786,24 @@ impl WebhookService {
                         worker_cancel,
                     )
                     .await;
-                }));
+                });
             }
+        }
+
+        for stable_id in groups_to_reconcile {
+            crate::server::routes::named_groups::reconcile_public_message_listener(
+                &state, &stable_id,
+            )
+            .await;
         }
 
         if !dm_subscribers.is_empty() {
             let dm_state = Arc::clone(&state);
             let dm_dedupe = Arc::clone(&dedupe);
             let dm_cancel = self.cancel.clone();
-            spawned.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 run_dm_source(dm_state, dm_subscribers, dm_dedupe, dm_cancel).await;
-            }));
+            });
         }
 
         if !mention_subscribers.is_empty() {
@@ -1538,52 +1811,54 @@ impl WebhookService {
                 let m_state = Arc::clone(&state);
                 let m_dedupe = Arc::clone(&dedupe);
                 let m_cancel = self.cancel.clone();
-                spawned.push(tokio::spawn(async move {
+                tasks.spawn(async move {
                     run_mention_source(m_state, mention_subscribers, m_dedupe, rx, m_cancel).await;
-                }));
+                });
             }
         }
 
-        for (group_id, subs) in group_subscribers {
-            let g_state = Arc::clone(&state);
-            let g_dedupe = Arc::clone(&dedupe);
-            let g_cancel = self.cancel.clone();
-            spawned.push(tokio::spawn(async move {
-                run_group_source(g_state, group_id, subs, g_dedupe, g_cancel).await;
-            }));
+        if !group_subscribers.is_empty() {
+            if let Some(rx) = self.public_msg_rx.lock().await.take() {
+                let g_state = Arc::clone(&state);
+                let g_dedupe = Arc::clone(&dedupe);
+                let g_cancel = self.cancel.clone();
+                tasks.spawn(async move {
+                    run_group_source(g_state, group_subscribers, g_dedupe, rx, g_cancel).await;
+                });
+            }
         }
 
         for (topic, subs) in topic_subscribers {
             let t_state = Arc::clone(&state);
             let t_dedupe = Arc::clone(&dedupe);
             let t_cancel = self.cancel.clone();
-            spawned.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 run_topic_source(t_state, topic, subs, t_dedupe, t_cancel).await;
-            }));
+            });
         }
-
-        self.tasks.lock().await.extend(spawned);
     }
 
     /// Cancel in-flight HTTP and source tasks and wait within the shutdown drain grace.
     pub(crate) async fn shutdown_and_wait(&self) {
         self.cancel.cancel();
-        let handles = {
+        let mut set = {
             let mut guard = self.tasks.lock().await;
             std::mem::take(&mut *guard)
         };
-        if handles.is_empty() {
+        if set.is_empty() {
             return;
         }
-        let aborts: Vec<_> = handles.iter().map(JoinHandle::abort_handle).collect();
-        let join_all = futures::future::join_all(handles);
-        if tokio::time::timeout(SHUTDOWN_DRAIN_GRACE, join_all)
-            .await
-            .is_err()
-        {
-            for abort in aborts {
-                abort.abort();
-            }
+        let timed_out = tokio::time::timeout(SHUTDOWN_DRAIN_GRACE, async {
+            while set.join_next().await.is_some() {}
+        })
+        .await
+        .is_err();
+        if timed_out {
+            set.abort_all();
+            let _ = tokio::time::timeout(ABORT_DRAIN_GRACE, async {
+                while set.join_next().await.is_some() {}
+            })
+            .await;
         }
     }
 
@@ -1655,6 +1930,67 @@ async fn resolve_from_name(state: &AppState, agent_hex: &str) -> Option<String> 
         .filter(|l| !l.is_empty())
 }
 
+async fn dedupe_init_or_get_cursor(
+    dedupe: &Arc<StdMutex<WebhookDedupeStore>>,
+    webhook_name: String,
+    now_ms: i64,
+) -> Option<(i64, bool)> {
+    let store = Arc::clone(dedupe);
+    tokio::task::spawn_blocking(move || match store.lock() {
+        Ok(mut guard) => match guard.init_or_get_cursor_ms(&webhook_name, now_ms) {
+            Ok(res) => Some(res),
+            Err(err) => {
+                tracing::warn!(
+                    webhook = %webhook_name,
+                    error = %err,
+                    "failed to initialize webhook backfill cursor"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn dedupe_load_sent_timestamps(
+    dedupe: &Arc<StdMutex<WebhookDedupeStore>>,
+    webhook_name: String,
+    now_ms: i64,
+) -> Vec<u64> {
+    let store = Arc::clone(dedupe);
+    tokio::task::spawn_blocking(move || match store.lock() {
+        Ok(guard) => guard
+            .load_sent_timestamps(&webhook_name, now_ms)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn dedupe_record_sent(
+    dedupe: &Arc<StdMutex<WebhookDedupeStore>>,
+    webhook_name: String,
+    sent_at_ms: i64,
+) {
+    let store = Arc::clone(dedupe);
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(mut guard) = store.lock() {
+            if let Err(err) = guard.record_sent(&webhook_name, sent_at_ms) {
+                tracing::warn!(
+                    webhook = %webhook_name,
+                    error = %err,
+                    "failed to persist webhook sent timestamp"
+                );
+            }
+        }
+    })
+    .await;
+}
+
 async fn dedupe_already_delivered(
     dedupe: &Arc<StdMutex<WebhookDedupeStore>>,
     webhook_name: String,
@@ -1676,12 +2012,15 @@ async fn dedupe_commit(
     dedupe: &Arc<StdMutex<WebhookDedupeStore>>,
     webhook_name: String,
     keys: Vec<String>,
+    advance_cursor_ms: Option<i64>,
 ) {
     let store = Arc::clone(dedupe);
     let now_secs = unix_now_secs() as i64;
     let _ = tokio::task::spawn_blocking(move || {
         if let Ok(mut guard) = store.lock() {
-            if let Err(err) = guard.mark_delivered(&webhook_name, &keys, now_secs) {
+            if let Err(err) =
+                guard.mark_delivered_and_advance(&webhook_name, &keys, now_secs, advance_cursor_ms)
+            {
                 tracing::warn!(
                     webhook = %webhook_name,
                     error = %err,
@@ -1710,26 +2049,20 @@ fn build_dm_queued_item(
     received_at: u64,
     payload: &[u8],
     verified: bool,
-) -> QueuedWebhookItem {
-    let sender_lower = sender_hex.to_ascii_lowercase();
-    let allowlisted = cfg.dm_allowlist.is_empty() || cfg.dm_allowlist.contains(&sender_lower);
-    let mut flags = Vec::new();
+) -> Option<QueuedWebhookItem> {
     if !verified {
-        flags.push("unverified".to_string());
+        return None;
     }
-    if !allowlisted {
-        flags.push("unknown_sender".to_string());
+    let sender_lower = sender_hex.to_ascii_lowercase();
+    if !cfg.dm_allowlist.is_empty() && !cfg.dm_allowlist.contains(&sender_lower) {
+        return None;
     }
-    let lane = if verified && allowlisted {
-        Lane::Fast
-    } else {
-        Lane::Batch
-    };
     let text_raw = String::from_utf8_lossy(payload);
     let text = format_item_text(&text_raw, cfg.body_mode, cfg.max_text_chars);
-    QueuedWebhookItem {
-        dedupe_key: dm_dedupe_key(&sender_lower, received_at, payload),
-        lane,
+    Some(QueuedWebhookItem {
+        dedupe_key: dm_dedupe_key(&sender_lower, payload),
+        lane: Lane::Fast,
+        enqueued_at_ms: received_at,
         item: WebhookPayloadItem {
             kind: "dm".to_string(),
             from: sender_lower,
@@ -1739,18 +2072,14 @@ fn build_dm_queued_item(
             ts: received_at,
             text,
             msg_id: None,
-            flags,
+            flags: Vec::new(),
         },
-    }
+    })
 }
 
 async fn run_dm_source(
     state: Arc<AppState>,
-    subscribers: Vec<(
-        Arc<ValidatedWebhook>,
-        Arc<WebhookStats>,
-        mpsc::Sender<QueuedWebhookItem>,
-    )>,
+    subscribers: Vec<TargetSubscriber>,
     dedupe: Arc<StdMutex<WebhookDedupeStore>>,
     cancel: CancellationToken,
 ) {
@@ -1758,10 +2087,13 @@ async fn run_dm_source(
     let mut rx = state.agent.subscribe_direct();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
 
-    if let Some(history) = state.agent.history() {
+    let min_since_ms = subscribers.iter().filter_map(|s| s.backfill_since_ms).min();
+
+    if let (Some(since_ms), Some(history)) = (min_since_ms, state.agent.history()) {
         let store = Arc::clone(history.store());
         let query = HistoryQuery {
             scope_kind: Some(0),
+            since_ms: Some(since_ms),
             limit: DM_BACKFILL_LIMIT,
             ..Default::default()
         };
@@ -1773,6 +2105,9 @@ async fn run_dm_source(
                 }
                 let record = row.record;
                 if record.direction != Direction::Inbound {
+                    continue;
+                }
+                if !matches!(record.provenance, Provenance::VerifiedEnvelope) {
                     continue;
                 }
                 if delivery_gate::stored_dm_delivery_refused(
@@ -1791,33 +2126,30 @@ async fn run_dm_source(
                     continue;
                 }
                 let received_at = u64::try_from(record.seen_at_ms).unwrap_or(0);
-                let verified = matches!(record.provenance, Provenance::VerifiedEnvelope);
                 let from_name = resolve_from_name(&state, sender_hex).await;
-                for (cfg, stats, tx) in &subscribers {
-                    let mut already = false;
-                    for delta in 0..=2u64 {
-                        let key = dm_dedupe_key(
-                            sender_hex,
-                            received_at.saturating_add(delta),
-                            &record.payload,
-                        );
-                        if dedupe_already_delivered(&dedupe, cfg.name.clone(), key).await {
-                            already = true;
-                            break;
-                        }
-                    }
-                    if already {
+                let key = dm_dedupe_key(sender_hex, &record.payload);
+                for sub in &subscribers {
+                    let Some(sub_since_ms) = sub.backfill_since_ms else {
+                        continue;
+                    };
+                    if record.seen_at_ms < sub_since_ms {
                         continue;
                     }
-                    let queued = build_dm_queued_item(
-                        cfg,
+                    let Some(queued) = build_dm_queued_item(
+                        &sub.config,
                         sender_hex,
                         from_name.clone(),
                         received_at,
                         &record.payload,
-                        verified,
-                    );
-                    try_enqueue_to_target(stats, tx, queued);
+                        true,
+                    ) else {
+                        continue;
+                    };
+                    if dedupe_already_delivered(&dedupe, sub.config.name.clone(), key.clone()).await
+                    {
+                        continue;
+                    }
+                    try_enqueue_to_target(&sub.stats, &sub.tx, queued);
                 }
             }
         }
@@ -1833,6 +2165,9 @@ async fn run_dm_source(
                 let Some(msg) = maybe_msg else {
                     break;
                 };
+                if !msg.verified {
+                    continue;
+                }
                 if !matches!(
                     x0x::history::classify::classify_dm_payload(&msg.payload),
                     DmPayloadClass::Durable(_)
@@ -1854,23 +2189,25 @@ async fn run_dm_source(
                     continue;
                 }
                 let from_name = resolve_from_name(&state, &sender_hex).await;
-                for (cfg, stats, tx) in &subscribers {
-                    let queued = build_dm_queued_item(
-                        cfg,
+                for sub in &subscribers {
+                    let Some(queued) = build_dm_queued_item(
+                        &sub.config,
                         &sender_hex,
                         from_name.clone(),
                         msg.received_at,
                         &msg.payload,
-                        msg.verified,
-                    );
+                        true,
+                    ) else {
+                        continue;
+                    };
                     if !dedupe_already_delivered(
                         &dedupe,
-                        cfg.name.clone(),
+                        sub.config.name.clone(),
                         queued.dedupe_key.clone(),
                     )
                     .await
                     {
-                        try_enqueue_to_target(stats, tx, queued);
+                        try_enqueue_to_target(&sub.stats, &sub.tx, queued);
                     }
                 }
             }
@@ -1880,11 +2217,7 @@ async fn run_dm_source(
 
 async fn run_mention_source(
     state: Arc<AppState>,
-    subscribers: Vec<(
-        Arc<ValidatedWebhook>,
-        Arc<WebhookStats>,
-        mpsc::Sender<QueuedWebhookItem>,
-    )>,
+    subscribers: Vec<TargetSubscriber>,
     dedupe: Arc<StdMutex<WebhookDedupeStore>>,
     mut rx: mpsc::Receiver<MentionTeeEvent>,
     cancel: CancellationToken,
@@ -1911,17 +2244,19 @@ async fn run_mention_source(
                 }
                 let from_name = resolve_from_name(&state, &ev.author_agent_id).await;
                 let dedupe_key = mention_dedupe_key(&ev.msg_id);
-                for (cfg, stats, tx) in &subscribers {
-                    if dedupe_already_delivered(&dedupe, cfg.name.clone(), dedupe_key.clone()).await {
+                let now_ms = unix_now_ms();
+                for sub in &subscribers {
+                    if dedupe_already_delivered(&dedupe, sub.config.name.clone(), dedupe_key.clone()).await {
                         continue;
                     }
                     let text = ev
                         .body
                         .as_deref()
-                        .and_then(|b| format_item_text(b, cfg.body_mode, cfg.max_text_chars));
+                        .and_then(|b| format_item_text(b, sub.config.body_mode, sub.config.max_text_chars));
                     let queued = QueuedWebhookItem {
                         dedupe_key: dedupe_key.clone(),
                         lane: Lane::Fast,
+                        enqueued_at_ms: now_ms,
                         item: WebhookPayloadItem {
                             kind: "mention".to_string(),
                             from: ev.author_agent_id.to_ascii_lowercase(),
@@ -1934,7 +2269,7 @@ async fn run_mention_source(
                             flags: Vec::new(),
                         },
                     };
-                    try_enqueue_to_target(stats, tx, queued);
+                    try_enqueue_to_target(&sub.stats, &sub.tx, queued);
                 }
             }
         }
@@ -1943,13 +2278,11 @@ async fn run_mention_source(
 
 async fn emit_group_public_message(
     state: &AppState,
-    topic: &str,
+    stable_group_id: &str,
     pm: &GroupPublicMessage,
-    subscribers: &[(
-        Arc<ValidatedWebhook>,
-        Arc<WebhookStats>,
-        mpsc::Sender<QueuedWebhookItem>,
-    )],
+    enqueued_at_ms: u64,
+    backfill_row_seen_ms: Option<i64>,
+    subscribers: &[TargetSubscriber],
     dedupe: &Arc<StdMutex<WebhookDedupeStore>>,
 ) {
     if !matches!(pm.kind, GroupPublicMessageKind::Chat) {
@@ -1965,103 +2298,134 @@ async fn emit_group_public_message(
     if is_echo_author(state, &pm.author_agent_id, rider_sub).await {
         return;
     }
+    let topic = public_topic_for(stable_group_id);
     let from_name = resolve_from_name(state, &pm.author_agent_id).await;
     let dedupe_key = group_dedupe_key(&pm.author_agent_id, pm.timestamp, &pm.signature);
     let msg_id = pm.msg_id();
-    for (cfg, stats, tx) in subscribers {
-        if dedupe_already_delivered(dedupe, cfg.name.clone(), dedupe_key.clone()).await {
+    for sub in subscribers {
+        if let Some(seen_ms) = backfill_row_seen_ms {
+            let Some(sub_since_ms) = sub.backfill_since_ms else {
+                continue;
+            };
+            if seen_ms < sub_since_ms {
+                continue;
+            }
+        }
+        if dedupe_already_delivered(dedupe, sub.config.name.clone(), dedupe_key.clone()).await {
             continue;
         }
-        let text = format_item_text(&pm.body, cfg.body_mode, cfg.max_text_chars);
+        let text = format_item_text(&pm.body, sub.config.body_mode, sub.config.max_text_chars);
         let queued = QueuedWebhookItem {
             dedupe_key: dedupe_key.clone(),
             lane: Lane::Batch,
+            enqueued_at_ms,
             item: WebhookPayloadItem {
                 kind: "group".to_string(),
                 from: pm.author_agent_id.to_ascii_lowercase(),
                 from_name: from_name.clone(),
-                group_id: Some(pm.group_id.clone()),
-                topic: Some(topic.to_string()),
+                group_id: Some(stable_group_id.to_string()),
+                topic: Some(topic.clone()),
                 ts: pm.timestamp,
                 text,
                 msg_id: Some(msg_id.clone()),
                 flags: Vec::new(),
             },
         };
-        try_enqueue_to_target(stats, tx, queued);
+        try_enqueue_to_target(&sub.stats, &sub.tx, queued);
     }
 }
 
 async fn run_group_source(
     state: Arc<AppState>,
-    group_id: String,
-    subscribers: Vec<(
-        Arc<ValidatedWebhook>,
-        Arc<WebhookStats>,
-        mpsc::Sender<QueuedWebhookItem>,
-    )>,
+    group_subscribers: std::collections::HashMap<String, Vec<TargetSubscriber>>,
     dedupe: Arc<StdMutex<WebhookDedupeStore>>,
+    mut rx: mpsc::Receiver<PublicMessageTeeEvent>,
     cancel: CancellationToken,
 ) {
-    let topic = public_topic_for(&group_id);
-    let mut sub = match state.agent.subscribe(&topic).await {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(group_id = %group_id, error = %err, "webhook group subscribe failed");
-            return;
-        }
-    };
     let mut shutdown_rx = state.shutdown_notify.subscribe();
 
-    // GET /groups/:id/messages equivalent backfill from cache + durable history.
-    let cached = state
-        .public_messages
-        .read()
-        .await
-        .get(&group_id)
-        .cloned()
-        .unwrap_or_default();
-    let backfill_msgs = match state.agent.history() {
-        Some(history) => {
-            let store = Arc::clone(history.store());
-            let gid = group_id.clone();
-            match tokio::task::spawn_blocking(move || {
-                let q = HistoryQuery {
-                    scope: Some(Scope::Group(gid)),
-                    limit: GROUP_BACKFILL_LIMIT,
-                    ..Default::default()
-                };
-                store.query(&q)
-            })
+    // Bounded backfill for returning webhooks only; first-enable webhooks skip pre-enable history.
+    for (group_id, subs) in &group_subscribers {
+        let Some(min_since_ms) = subs.iter().filter_map(|s| s.backfill_since_ms).min() else {
+            continue;
+        };
+        let cached = state
+            .public_messages
+            .read()
             .await
-            {
-                Ok(Ok(rows)) => {
-                    let mut merged: Vec<GroupPublicMessage> = rows
-                        .iter()
-                        .filter_map(|r| r.record.signed_artifact.as_deref())
-                        .filter_map(|a| serde_json::from_slice(a).ok())
-                        .collect();
-                    let mut seen: HashSet<String> =
-                        merged.iter().map(|m| m.signature.clone()).collect();
-                    for m in cached {
-                        if seen.insert(m.signature.clone()) {
-                            merged.push(m);
+            .get(group_id)
+            .cloned()
+            .unwrap_or_default();
+        let backfill_msgs: Vec<(GroupPublicMessage, i64)> = match state.agent.history() {
+            Some(history) => {
+                let store = Arc::clone(history.store());
+                let gid = group_id.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let q = HistoryQuery {
+                        scope: Some(Scope::Group(gid)),
+                        since_ms: Some(min_since_ms),
+                        limit: GROUP_BACKFILL_LIMIT,
+                        ..Default::default()
+                    };
+                    store.query(&q)
+                })
+                .await
+                {
+                    Ok(Ok(rows)) => {
+                        let mut merged: Vec<(GroupPublicMessage, i64)> = rows
+                            .iter()
+                            .filter_map(|r| {
+                                let artifact = r.record.signed_artifact.as_deref()?;
+                                let pm =
+                                    serde_json::from_slice::<GroupPublicMessage>(artifact).ok()?;
+                                Some((pm, r.record.seen_at_ms))
+                            })
+                            .collect();
+                        let mut seen: HashSet<String> =
+                            merged.iter().map(|(m, _)| m.signature.clone()).collect();
+                        for m in cached {
+                            let ts_i64 = i64::try_from(m.timestamp).unwrap_or(i64::MAX);
+                            if ts_i64 >= min_since_ms && seen.insert(m.signature.clone()) {
+                                merged.push((m, ts_i64));
+                            }
                         }
+                        merged.sort_by_key(|(m, _)| m.timestamp);
+                        merged
                     }
-                    merged.sort_by_key(|m| m.timestamp);
-                    merged
+                    _ => cached
+                        .into_iter()
+                        .filter_map(|m| {
+                            let ts_i64 = i64::try_from(m.timestamp).unwrap_or(i64::MAX);
+                            (ts_i64 >= min_since_ms).then_some((m, ts_i64))
+                        })
+                        .collect(),
                 }
-                _ => cached,
             }
-        }
-        None => cached,
-    };
+            None => cached
+                .into_iter()
+                .filter_map(|m| {
+                    let ts_i64 = i64::try_from(m.timestamp).unwrap_or(i64::MAX);
+                    (ts_i64 >= min_since_ms).then_some((m, ts_i64))
+                })
+                .collect(),
+        };
 
-    for pm in backfill_msgs {
-        if cancel.is_cancelled() || state.shutdown_started.is_cancelled() {
-            return;
+        for (pm, seen_ms) in backfill_msgs {
+            if cancel.is_cancelled() || state.shutdown_started.is_cancelled() {
+                return;
+            }
+            let enqueued_ms = u64::try_from(seen_ms).unwrap_or_else(|_| unix_now_ms());
+            emit_group_public_message(
+                &state,
+                group_id,
+                &pm,
+                enqueued_ms,
+                Some(seen_ms),
+                subs,
+                &dedupe,
+            )
+            .await;
         }
-        emit_group_public_message(&state, &topic, &pm, &subscribers, &dedupe).await;
     }
 
     loop {
@@ -2070,14 +2434,37 @@ async fn run_group_source(
             () = cancel.cancelled() => break,
             () = state.shutdown_started.cancelled() => break,
             _ = shutdown_rx.changed() => break,
-            maybe_msg = sub.recv() => {
-                let Some(msg) = maybe_msg else {
+            maybe_ev = rx.recv() => {
+                let Some(ev) = maybe_ev else {
                     break;
                 };
-                let Ok(pm) = serde_json::from_slice::<GroupPublicMessage>(&msg.payload) else {
-                    continue;
-                };
-                emit_group_public_message(&state, &topic, &pm, &subscribers, &dedupe).await;
+                let now_ms = unix_now_ms();
+                if let Some(subs) = group_subscribers.get(&ev.stable_group_id) {
+                    emit_group_public_message(
+                        &state,
+                        &ev.stable_group_id,
+                        &ev.msg,
+                        now_ms,
+                        None,
+                        subs,
+                        &dedupe,
+                    )
+                    .await;
+                }
+                if ev.msg.group_id != ev.stable_group_id {
+                    if let Some(subs) = group_subscribers.get(&ev.msg.group_id) {
+                        emit_group_public_message(
+                            &state,
+                            &ev.stable_group_id,
+                            &ev.msg,
+                            now_ms,
+                            None,
+                            subs,
+                            &dedupe,
+                        )
+                        .await;
+                    }
+                }
             }
         }
     }
@@ -2086,22 +2473,25 @@ async fn run_group_source(
 async fn run_topic_source(
     state: Arc<AppState>,
     topic: String,
-    subscribers: Vec<(
-        Arc<ValidatedWebhook>,
-        Arc<WebhookStats>,
-        mpsc::Sender<QueuedWebhookItem>,
-    )>,
+    subscribers: Vec<TargetSubscriber>,
     dedupe: Arc<StdMutex<WebhookDedupeStore>>,
     cancel: CancellationToken,
 ) {
-    let mut sub = match state.agent.subscribe(&topic).await {
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    let sub_res = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        () = state.shutdown_started.cancelled() => return,
+        _ = shutdown_rx.changed() => return,
+        res = state.agent.subscribe(&topic) => res,
+    };
+    let mut sub = match sub_res {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(topic = %topic, error = %err, "webhook topic subscribe failed");
             return;
         }
     };
-    let mut shutdown_rx = state.shutdown_notify.subscribe();
 
     loop {
         tokio::select! {
@@ -2113,41 +2503,38 @@ async fn run_topic_source(
                 let Some(msg) = maybe_msg else {
                     break;
                 };
-                if let Ok(pm) = serde_json::from_slice::<GroupPublicMessage>(&msg.payload) {
-                    emit_group_public_message(&state, &topic, &pm, &subscribers, &dedupe).await;
+                if !msg.verified {
                     continue;
                 }
-                let origin = msg
-                    .sender
-                    .as_ref()
-                    .map(|id| hex::encode(id.as_bytes()))
-                    .unwrap_or_default();
-                if !origin.is_empty()
-                    && delivery_gate::stored_sender_delivery_refused(&state, &origin).await
-                {
+                let Some(sender) = msg.sender.as_ref() else {
                     continue;
-                }
-                if !origin.is_empty() && is_echo_author(&state, &origin, None).await {
-                    continue;
-                }
-                let from_name = if origin.is_empty() {
-                    None
-                } else {
-                    resolve_from_name(&state, &origin).await
                 };
+                let origin = hex::encode(sender.as_bytes());
+                if delivery_gate::stored_sender_delivery_refused(&state, &origin).await {
+                    continue;
+                }
+                if is_echo_author(&state, &origin, None).await {
+                    continue;
+                }
+                let from_name = resolve_from_name(&state, &origin).await;
                 let dedupe_key = topic_dedupe_key(&topic, &origin, &msg.payload);
                 let now_ms = unix_now_ms();
                 let payload_text = String::from_utf8_lossy(&msg.payload);
-                for (cfg, stats, tx) in &subscribers {
-                    if dedupe_already_delivered(&dedupe, cfg.name.clone(), dedupe_key.clone()).await {
+                for sub in &subscribers {
+                    if dedupe_already_delivered(&dedupe, sub.config.name.clone(), dedupe_key.clone()).await {
                         continue;
                     }
-                    let text = format_item_text(&payload_text, cfg.body_mode, cfg.max_text_chars);
+                    let text = format_item_text(
+                        &payload_text,
+                        sub.config.body_mode,
+                        sub.config.max_text_chars,
+                    );
                     let queued = QueuedWebhookItem {
                         dedupe_key: dedupe_key.clone(),
                         lane: Lane::Batch,
+                        enqueued_at_ms: now_ms,
                         item: WebhookPayloadItem {
-                            kind: "group".to_string(),
+                            kind: "topic".to_string(),
                             from: origin.clone(),
                             from_name: from_name.clone(),
                             group_id: None,
@@ -2158,7 +2545,7 @@ async fn run_topic_source(
                             flags: Vec::new(),
                         },
                     };
-                    try_enqueue_to_target(stats, tx, queued);
+                    try_enqueue_to_target(&sub.stats, &sub.tx, queued);
                 }
             }
         }
@@ -2182,6 +2569,14 @@ async fn run_webhook_worker(
         cfg.max_per_day,
         MAX_QUEUE_ITEMS,
     );
+    let startup_ms = unix_now_ms();
+    let persisted_sent = dedupe_load_sent_timestamps(
+        &dedupe,
+        cfg.name.clone(),
+        i64::try_from(startup_ms).unwrap_or(i64::MAX),
+    )
+    .await;
+    scheduler.seed_sent_timestamps(persisted_sent, startup_ms);
     let mut shutdown_rx = state.shutdown_notify.subscribe();
 
     loop {
@@ -2195,6 +2590,12 @@ async fn run_webhook_worker(
             .store(scheduler.queue_depth(), Ordering::Relaxed);
 
         if let Some(batch) = ready_batch {
+            dedupe_record_sent(
+                &dedupe,
+                cfg.name.clone(),
+                i64::try_from(now_ms).unwrap_or(i64::MAX),
+            )
+            .await;
             let outcome = tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
@@ -2206,7 +2607,11 @@ async fn run_webhook_worker(
             let jitter: f64 = rand::thread_rng().gen_range(0.0..=1.0);
             if let Some(disp) = scheduler.record_outcome(outcome, done_ms, jitter) {
                 match disp {
-                    BatchDisposition::Committed { keys, status } => {
+                    BatchDisposition::Committed {
+                        keys,
+                        status,
+                        max_enqueued_ms,
+                    } => {
                         stats.sent.fetch_add(1, Ordering::Relaxed);
                         stats
                             .last_status
@@ -2214,7 +2619,12 @@ async fn run_webhook_worker(
                         stats
                             .last_success_at
                             .store((done_ms / 1_000) as i64, Ordering::Relaxed);
-                        dedupe_commit(&dedupe, cfg.name.clone(), keys).await;
+                        let advance_cursor = max_enqueued_ms.map(|ts| {
+                            i64::try_from(ts)
+                                .unwrap_or(i64::MAX)
+                                .saturating_sub(BACKFILL_OVERLAP_MS)
+                        });
+                        dedupe_commit(&dedupe, cfg.name.clone(), keys, advance_cursor).await;
                     }
                     BatchDisposition::RetryScheduled { attempts, .. } => {
                         stats.failed.fetch_add(1, Ordering::Relaxed);
@@ -2249,6 +2659,28 @@ async fn run_webhook_worker(
                             status,
                             dropped_items = item_count,
                             "webhook batch dropped after 4xx retry limit"
+                        );
+                    }
+                    BatchDisposition::DroppedExpired {
+                        batch_id,
+                        last_status,
+                        attempts,
+                        item_count,
+                    } => {
+                        stats.failed.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .dropped
+                            .fetch_add(item_count as u64, Ordering::Relaxed);
+                        if let Some(code) = last_status {
+                            stats.last_status.store(u32::from(code), Ordering::Relaxed);
+                        }
+                        tracing::warn!(
+                            webhook = %cfg.name,
+                            host = %cfg.url_host,
+                            batch_id = %batch_id,
+                            attempts,
+                            dropped_items = item_count,
+                            "webhook batch dropped after retry limit exceeded"
                         );
                     }
                 }
@@ -2334,7 +2766,8 @@ async fn post_webhook_batch(
     if let Some(ref bearer) = cfg.bearer_token {
         if let Ok(token_str) = std::str::from_utf8(bearer.as_bytes()) {
             let header_val = Zeroizing::new(format!("Bearer {token_str}"));
-            if let Ok(hv) = HeaderValue::from_str(&header_val) {
+            if let Ok(mut hv) = HeaderValue::from_str(&header_val) {
+                hv.set_sensitive(true);
                 req = req.header(AUTHORIZATION, hv);
             }
         }
@@ -2352,6 +2785,8 @@ async fn post_webhook_batch(
             let status = resp.status().as_u16();
             if resp.status().is_success() {
                 DeliveryOutcome::Success(status)
+            } else if status == 408 || status == 429 || status >= 500 {
+                DeliveryOutcome::RetryableError(Some(status))
             } else if (400..500).contains(&status) {
                 DeliveryOutcome::ClientError(status)
             } else {

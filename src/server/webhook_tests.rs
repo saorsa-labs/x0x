@@ -24,7 +24,7 @@ use crate::server::webhook::{
     is_ip_ssrf_blocked, mention_dedupe_key, sign_payload, BatchDisposition, DeliveryOutcome, Lane,
     NotifyConfig, QueuedWebhookItem, ValidatedWebhook, WebhookBodyMode, WebhookConfig,
     WebhookConfigError, WebhookDedupeStore, WebhookPayloadItem, WebhookPostBody, WebhookScheduler,
-    WebhookService,
+    WebhookService, MAX_RETRYABLE_ATTEMPTS,
 };
 use crate::server::ws::{emit_mention_event, MentionFrame};
 use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
@@ -50,6 +50,7 @@ fn sample_item(key: &str, lane: Lane, kind: &str, text: Option<&str>) -> QueuedW
     QueuedWebhookItem {
         dedupe_key: key.to_string(),
         lane,
+        enqueued_at_ms: 1_700_000_000_000,
         item: WebhookPayloadItem {
             kind: kind.to_string(),
             from: "aa".repeat(32),
@@ -187,6 +188,18 @@ fn ssrf_ip_classifier_blocks_non_public_and_allows_public() {
         IpAddr::V6("::ffff:127.0.0.1".parse().expect("ipv6")),
         IpAddr::V6("::ffff:10.0.0.1".parse().expect("ipv6")),
         IpAddr::V6("64:ff9b::127.0.0.1".parse().expect("ipv6")),
+        IpAddr::V6("2002:7f00:0001::1".parse().expect("ipv6")),
+        IpAddr::V6("2002:0a00:0001::1".parse().expect("ipv6")),
+        IpAddr::V6(
+            "2001:0000:0101:0101:0000:0000:80ff:fffe"
+                .parse()
+                .expect("ipv6"),
+        ),
+        IpAddr::V6(
+            "2001:0000:0a00:0001:0000:0000:fefe:fefe"
+                .parse()
+                .expect("ipv6"),
+        ),
     ];
     for &ip in blocked {
         assert!(is_ip_ssrf_blocked(ip), "expected SSRF block for {ip}");
@@ -199,6 +212,7 @@ fn ssrf_ip_classifier_blocks_non_public_and_allows_public() {
         IpAddr::V4(Ipv4Addr::new(100, 63, 255, 254)),
         IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1)),
         IpAddr::V6("2606:4700:4700::1111".parse().expect("ipv6")),
+        IpAddr::V6("2002:0101:0101::1".parse().expect("ipv6")),
     ];
     for &ip in allowed {
         assert!(!is_ip_ssrf_blocked(ip), "expected public IP allowed: {ip}");
@@ -349,7 +363,7 @@ fn echo_filtering_drops_self_and_riders_but_keeps_acp_and_external() {
 fn dedupe_store_persists_across_reopen_isolates_webhooks_and_expires_after_7_days() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("webhook_state.db");
-    let dm_key = dm_dedupe_key(&"aa".repeat(32), 1_700_000_000_000, b"hello");
+    let dm_key = dm_dedupe_key(&"aa".repeat(32), b"hello");
     let grp_key = group_dedupe_key(&"bb".repeat(32), 1_700_000_000_123, "0123456789abcdef9999");
     let m_key = mention_dedupe_key("msg-42");
 
@@ -882,4 +896,327 @@ async fn webhook_diagnostics_enforces_owner_auth_and_redacts_secrets() {
 
     drop(state);
     handle.shutdown_and_wait().await.expect("shutdown");
+}
+
+#[test]
+fn scheduler_expires_retryable_batch_and_persists_rate_cap_and_cursor() {
+    let mut sched = WebhookScheduler::new(100, 1_000, 100, 100, 8);
+    assert!(sched.enqueue(sample_item("r1", Lane::Fast, "dm", Some("retry")), 0));
+    let mut t = 100u64;
+    for attempt in 1..MAX_RETRYABLE_ATTEMPTS {
+        let (batch, _) = sched.poll_ready(t);
+        assert!(batch.is_some(), "attempt {attempt} should poll");
+        let disp = sched.record_outcome(DeliveryOutcome::RetryableError(Some(429)), t, 0.5);
+        assert!(matches!(
+            disp,
+            Some(BatchDisposition::RetryScheduled { attempts, .. }) if attempts == attempt
+        ));
+        t = sched.next_wakeup_ms(t).expect("next retry wakeup");
+    }
+    let (final_batch, _) = sched.poll_ready(t);
+    assert!(final_batch.is_some());
+    let disp = sched.record_outcome(DeliveryOutcome::RetryableError(Some(503)), t, 0.5);
+    assert!(matches!(
+        disp,
+        Some(BatchDisposition::DroppedExpired {
+            last_status: Some(503),
+            attempts,
+            item_count: 1,
+            ..
+        }) if attempts == MAX_RETRYABLE_ATTEMPTS
+    ));
+    assert_eq!(sched.queue_depth(), 0);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("webhook_state.db");
+    let now_ms = (unix_now_secs() as i64) * 1_000;
+    {
+        let mut store = WebhookDedupeStore::open(&db_path).expect("open");
+        assert_eq!(
+            store.init_or_get_cursor_ms("hook-a", now_ms).expect("init"),
+            (now_ms, true)
+        );
+        store
+            .mark_delivered_and_advance(
+                "hook-a",
+                &["k1".to_string()],
+                now_ms / 1_000,
+                Some(now_ms + 5_000),
+            )
+            .expect("advance");
+        store.record_sent("hook-a", now_ms + 1_000).expect("sent 1");
+        store.record_sent("hook-a", now_ms + 2_000).expect("sent 2");
+    }
+
+    let mut reopened = WebhookDedupeStore::open(&db_path).expect("reopen");
+    assert_eq!(
+        reopened
+            .init_or_get_cursor_ms("hook-a", now_ms + 10_000)
+            .expect("existing"),
+        (now_ms + 5_000, false)
+    );
+    let persisted_sent = reopened
+        .load_sent_timestamps("hook-a", now_ms + 10_000)
+        .expect("load sent");
+    assert_eq!(persisted_sent.len(), 2);
+
+    let mut restarted = WebhookScheduler::new(100, 1_000, 2, 10, 8);
+    restarted.seed_sent_timestamps(persisted_sent, (now_ms + 10_000) as u64);
+    assert!(restarted.enqueue(
+        sample_item("after-restart", Lane::Fast, "dm", Some("hi")),
+        (now_ms + 10_000) as u64
+    ));
+    let (held, newly_rl) = restarted.poll_ready((now_ms + 10_200) as u64);
+    assert!(
+        held.is_none(),
+        "persisted hourly cap must hold after restart"
+    );
+    assert!(newly_rl);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_first_enable_skips_preexisting_history_and_filters_dms() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (recv_addr, mut posts, recv_task) = start_capture_receiver().await;
+    let allowed_agent = AgentId([0x41; 32]);
+    let allowed_machine = MachineId([0x42; 32]);
+    let allowed_hex = hex::encode(allowed_agent.as_bytes());
+    let stranger_agent = AgentId([0x51; 32]);
+    let stranger_machine = MachineId([0x52; 32]);
+    let plane = format!("x0x.test.webhook.filter.{}", std::process::id());
+
+    // Pre-seed a historical DM before the webhook is ever enabled.
+    let cfg_no_wh = hermetic_daemon_config(tmp.path(), &plane, Vec::new());
+    let handle0 = serve_with_options(cfg_no_wh, test_serve_options())
+        .await
+        .expect("serve daemon 0");
+    let state0 = handle0.test_state.upgrade().expect("state0");
+    let old_ts = (unix_now_secs() as i64 - 30) * 1_000;
+    if let Some(history) = state0.agent.history() {
+        let old_payload = b"pre-enable historical dm".to_vec();
+        history
+            .record_committed(HistoryRecord {
+                msg_id: HistoryRecord::compute_msg_id(None, &old_payload),
+                scope: Scope::Dm(allowed_hex.clone()),
+                author_agent: Some(allowed_hex.clone()),
+                author_machine: Some(hex::encode(allowed_machine.as_bytes())),
+                author_pubkey: None,
+                sent_at_ms: old_ts,
+                seen_at_ms: old_ts,
+                direction: Direction::Inbound,
+                content_type: "text/plain".to_string(),
+                payload: old_payload,
+                signed_artifact: None,
+                signature: None,
+                sig_context: None,
+                provenance: Provenance::VerifiedEnvelope,
+                replace_key: None,
+                thread_root: None,
+                thread_parent: None,
+                ingress_sender_agent: None,
+                logical_request_id: None,
+            })
+            .await
+            .expect("commit historical dm");
+    }
+    drop(state0);
+    handle0.shutdown_and_wait().await.expect("shutdown 0");
+
+    let wh = WebhookConfig {
+        name: "filtered".to_string(),
+        url: format!("http://{recv_addr}/hook/secret-path-id"),
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        events: vec!["dm".to_string()],
+        dm_allowlist: vec![allowed_hex.clone()],
+        fast_window_ms: 60,
+        batch_window_ms: 200,
+        max_per_hour: 20,
+        max_per_day: 100,
+        allow_insecure_loopback_for_test: true,
+        ..WebhookConfig::default()
+    };
+    let cfg1 = hermetic_daemon_config(tmp.path(), &plane, vec![wh]);
+    let handle1 = serve_with_options(cfg1, test_serve_options())
+        .await
+        .expect("serve daemon 1");
+    let state1 = handle1.test_state.upgrade().expect("state1");
+
+    // Pre-enable history must NOT be replayed on first enable.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), posts.recv())
+            .await
+            .is_err(),
+        "first enable must not backfill pre-enable history"
+    );
+
+    // Unverified DM from allowlisted sender must be dropped.
+    state1
+        .agent
+        .direct_messaging_for_test()
+        .handle_incoming(
+            allowed_machine,
+            allowed_agent,
+            b"unverified dm".to_vec(),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+    // Verified DM from non-allowlisted stranger must be dropped.
+    state1
+        .agent
+        .direct_messaging_for_test()
+        .handle_incoming(
+            stranger_machine,
+            stranger_agent,
+            b"stranger dm".to_vec(),
+            true,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), posts.recv())
+            .await
+            .is_err(),
+        "unverified and non-allowlisted DMs must be dropped"
+    );
+
+    // Verified DM from allowlisted sender must be delivered.
+    state1
+        .agent
+        .direct_messaging_for_test()
+        .handle_incoming(
+            allowed_machine,
+            allowed_agent,
+            b"allowed verified dm".to_vec(),
+            true,
+            None,
+            None,
+        )
+        .await;
+
+    let delivered = tokio::time::timeout(Duration::from_secs(3), posts.recv())
+        .await
+        .expect("allowed dm timeout")
+        .expect("allowed dm post");
+    let body: WebhookPostBody = serde_json::from_slice(&delivered.body).expect("json");
+    assert_eq!(body.items.len(), 1);
+    assert_eq!(body.items[0].from, allowed_hex);
+    assert_eq!(body.items[0].text.as_deref(), Some("allowed verified dm"));
+
+    drop(state1);
+    handle1.shutdown_and_wait().await.expect("shutdown 1");
+    recv_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_retries_429_and_408_and_drops_forged_group_messages() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_route = Arc::clone(&attempts);
+    let (tx, mut posts) = mpsc::unbounded_channel::<CapturedPost>();
+
+    let app = Router::new().route(
+        "/flaky",
+        post(move |headers: HeaderMap, body: Bytes| {
+            let attempts = Arc::clone(&attempts_route);
+            let tx = tx.clone();
+            async move {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else if n == 1 {
+                    StatusCode::REQUEST_TIMEOUT
+                } else {
+                    let _ = tx.send(CapturedPost { headers, body });
+                    StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind flaky receiver");
+    let addr = listener.local_addr().expect("flaky addr");
+    let srv = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let forged_group_id = "forged-group-test-id".to_string();
+    let wh = WebhookConfig {
+        name: "retry-and-forged".to_string(),
+        url: format!("http://{addr}/flaky"),
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        events: vec!["mention".to_string(), format!("group:{forged_group_id}")],
+        fast_window_ms: 40,
+        batch_window_ms: 40,
+        max_per_hour: 20,
+        max_per_day: 100,
+        allow_insecure_loopback_for_test: true,
+        ..WebhookConfig::default()
+    };
+
+    let plane = format!("x0x.test.webhook.retry.{}", std::process::id());
+    let cfg = hermetic_daemon_config(tmp.path(), &plane, vec![wh]);
+    let handle = serve_with_options(cfg, test_serve_options())
+        .await
+        .expect("serve daemon");
+    let state = handle.test_state.upgrade().expect("live state");
+
+    // Publish a forged GroupPublicMessage directly on the raw public topic;
+    // webhooks consume the post-validation ingest tee, so it must never fire.
+    let forged = serde_json::json!({
+        "group_id": forged_group_id,
+        "author_agent_id": "cc".repeat(32),
+        "author_public_key": "",
+        "body": "spoofed author message",
+        "timestamp": unix_now_secs() * 1_000,
+        "signature": "00".repeat(64),
+        "kind": "chat"
+    });
+    let _ = state
+        .agent
+        .publish(
+            &crate::groups::public_topic_for(&forged_group_id),
+            serde_json::to_vec(&forged).expect("forged json"),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "forged group message must never trigger webhook delivery"
+    );
+
+    // Emit a valid mention and verify 429 + 408 are retried until 200 succeeds.
+    emit_mention_event(
+        &state,
+        MentionFrame {
+            topic: "x0x.groups.public.g1".to_string(),
+            group_id: "g1".to_string(),
+            msg_id: "retry-mention-1".to_string(),
+            author_agent_id: "66".repeat(32),
+            reason: "mention".to_string(),
+            mentions: vec![hex::encode(state.agent.agent_id().as_bytes())],
+            timestamp: unix_now_secs() * 1_000,
+            body: Some("please retry 429/408".to_string()),
+        },
+    )
+    .await;
+
+    let delivered = tokio::time::timeout(Duration::from_secs(12), posts.recv())
+        .await
+        .expect("429/408 retry must eventually succeed")
+        .expect("delivered post");
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    let body: WebhookPostBody = serde_json::from_slice(&delivered.body).expect("json");
+    assert_eq!(body.items.len(), 1);
+    assert_eq!(body.items[0].msg_id.as_deref(), Some("retry-mention-1"));
+
+    drop(state);
+    handle.shutdown_and_wait().await.expect("shutdown");
+    srv.abort();
 }

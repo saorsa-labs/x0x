@@ -1541,7 +1541,7 @@ pub(super) struct AppState {
     /// or connect/forward is disabled (SOCKS needs ForwardV2).
     pub(super) socks_service: Option<x0x::socks::SocksService>,
     /// Opt-in outbound webhook push service (`[[notify.webhook]]`).
-    pub(super) webhook_service: Option<Arc<super::webhook::WebhookService>>,
+    pub(in crate::server) webhook_service: Option<Arc<super::webhook::WebhookService>>,
     /// ADR-0041 Tier-1 owner-state sync service: owns the `SyncV1` stream
     /// acceptor, the owner device set, and the winning versioned records.
     /// `None` when the install has no owner key (ownerless installs sync

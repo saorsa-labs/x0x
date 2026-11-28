@@ -4805,6 +4805,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/relay` | `x0x diagnostics relay` | ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence |
 | GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023), including the ADR-0068 D1 quarantine-pin pair |
 | GET | `/diagnostics/sidecar-quarantine` | `x0x diagnostics sidecar-quarantine` | Read-only list of the ADR 0108 §5a quarantined sidecar copies, with their sizes (D148); see [below](#get-diagnosticssidecar-quarantine) |
+| GET | `/diagnostics/webhooks` | `x0x diagnostics webhooks` | Opt-in outbound webhook push status (`[[notify.webhook]]`), secret SHA-256 prefixes (never secrets), queue depth, and delivery counters (durable owner token only; riders and session tokens `403`) |
 
 The inner-envelope verification fields are independent lock-free samples.
 Derived failure ratios and mean durations are approximate, especially over

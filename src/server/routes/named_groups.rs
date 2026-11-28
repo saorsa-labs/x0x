@@ -26017,6 +26017,9 @@ pub(in crate::server) async fn ingest_public_message(
                 }
             }
             cache_public_message(state, msg.clone()).await;
+            if let Some(ref webhook) = state.webhook_service {
+                webhook.try_send_public_message(&stable_id, &msg);
+            }
             // Delegate-side registration + mention/delegation routing to
             // local WS subscribers (ADR-0040 structured mentions).
             route_delegation_and_mentions(state, &msg, &stable_id).await;
