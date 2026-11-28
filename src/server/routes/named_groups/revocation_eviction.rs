@@ -11018,6 +11018,92 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn treekem_page_bookkeeping_is_isolated_per_daemon_state() -> anyhow::Result<()> {
+        let (state_a, _dir_a) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let (state_b, _dir_b) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "2231c3".repeat(5) + "03";
+        let peer_hex = hex::encode([0x82; 32]);
+        let machine = x0x::identity::MachineId([0x83; 32]);
+        let fence_ids = [group_id.clone()];
+        let cursor_a = (3, 2, "hash-a".to_string());
+        let cursor_other = (4, 3, "hash-other".to_string());
+
+        super::super::treekem_page_stopped_peers_note(&state_a, &fence_ids, &peer_hex, &machine);
+        super::super::treekem_page_ask_cursor_note(
+            &state_a,
+            &fence_ids,
+            &peer_hex,
+            cursor_a.clone(),
+        );
+        super::super::treekem_page_rearm_baseline_note(&state_a, &fence_ids, cursor_a.clone());
+        assert!(super::super::treekem_page_rearm_claim(
+            &state_a, &group_id, &peer_hex
+        ));
+
+        assert_eq!(
+            super::super::treekem_page_stopped_peers(&state_a, &fence_ids),
+            vec![peer_hex.clone()]
+        );
+        assert!(
+            super::super::treekem_page_stopped_peers(&state_b, &fence_ids).is_empty(),
+            "daemon A's stopped peers must not leak into daemon B"
+        );
+        assert!(
+            !super::super::treekem_page_ask_cursor_permits_stop(
+                &state_a,
+                &fence_ids,
+                &peer_hex,
+                &cursor_other
+            ),
+            "daemon A's recorded ask cursor blocks stop on a different cursor"
+        );
+        assert!(
+            super::super::treekem_page_ask_cursor_permits_stop(
+                &state_b,
+                &fence_ids,
+                &peer_hex,
+                &cursor_other
+            ),
+            "daemon B has no recorded ask cursor for this peer"
+        );
+        assert!(
+            !super::super::treekem_page_rearm_inflight(&state_b, &group_id, &peer_hex),
+            "daemon A's in-flight re-arm slot must not block daemon B"
+        );
+        assert!(super::super::treekem_page_rearm_claim(
+            &state_b, &group_id, &peer_hex
+        ));
+
+        super::super::treekem_page_stopped_peers_drop_group(&state_a, &fence_ids);
+        assert!(super::super::treekem_page_stopped_peers(&state_a, &fence_ids).is_empty());
+        assert!(
+            super::super::treekem_page_ask_cursor_permits_stop(
+                &state_a,
+                &fence_ids,
+                &peer_hex,
+                &cursor_other
+            ),
+            "withdrawing a group must clear its ask cursors"
+        );
+        assert!(
+            state_a
+                .treekem_page_bookkeeping
+                .rearm_baselines
+                .lock()
+                .expect("baselines lock")
+                .is_empty(),
+            "withdrawing a group must clear its rearm baselines"
+        );
+        assert!(
+            super::super::treekem_page_rearm_inflight(&state_b, &group_id, &peer_hex),
+            "daemon A withdrawing the group must not touch daemon B's state"
+        );
+        Ok(())
+    }
+
     /// #1660 (Claude review): a report the completion step refuses still
     /// counts for the §2 head round. The sender was removed mid-send, so
     /// its report closes no delivery seat. But the report itself is a

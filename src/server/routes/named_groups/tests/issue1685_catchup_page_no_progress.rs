@@ -1190,7 +1190,7 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
         "CONTROL: the stopped peer's page fence is open before the removal"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the stopped peer's row is armed before the removal"
     );
@@ -1211,7 +1211,7 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
     let mut stopped_before = vec![helper_hex.clone(), responder_hex.clone()];
     stopped_before.sort();
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         stopped_before,
         "both responders stopped while their gaps are outstanding"
     );
@@ -1300,7 +1300,7 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
         "no page fence of the group stays open: the helper's terminal page closed its own, the responder's was retired"
     );
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "no stopped-loop row is left: the helper's terminal page cleared its own, the responder's retirement cleared the other"
     );
     Ok(())
@@ -1493,7 +1493,7 @@ async fn an_unreachable_stopped_peer_does_not_block_the_listener_or_hold_the_fen
     .await;
     assert_eq!(page_requests(&state), 0, "the stopped loop asks nobody");
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -1529,7 +1529,7 @@ async fn an_unreachable_stopped_peer_does_not_block_the_listener_or_hold_the_fen
         "the detached re-arm really asked the stopped peer — that ask is the parked send"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "the parked ask has not left, so the row stays armed (clear-on-success)"
     );
@@ -1544,7 +1544,7 @@ async fn an_unreachable_stopped_peer_does_not_block_the_listener_or_hold_the_fen
         "exactly one ask went out: the released re-arm"
     );
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "the successful re-arm cleared the row"
     );
     Ok(())
@@ -1659,7 +1659,7 @@ async fn a_next_page_ask_that_cannot_leave_keeps_the_stopped_row_armed() -> Resu
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -1687,7 +1687,7 @@ async fn a_next_page_ask_that_cannot_leave_keeps_the_stopped_row_armed() -> Resu
         "the handler's own next-page ask is the parked send"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "#1685 round 5, finding 2: the row stays armed while the ask has not left (at \
          5319f206 it was cleared before the send)"
@@ -1695,7 +1695,7 @@ async fn a_next_page_ask_that_cannot_leave_keeps_the_stopped_row_armed() -> Resu
     drop(parked);
     handler.await.expect("page handler task");
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "the ask that went out cleared the row"
     );
     assert_eq!(
@@ -1757,7 +1757,7 @@ async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_with_the
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -1833,7 +1833,7 @@ async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_with_the
          answer; only the agent's valid page from a clean machine closes it"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "the stopped row stays armed, so the next cursor-moving replay retries"
     );
@@ -1881,7 +1881,7 @@ async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_with_its
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -1954,7 +1954,7 @@ async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_with_its
          terminal page from a clean machine, never on the pairing's retirement"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "the stopped row stays armed"
     );
@@ -2008,7 +2008,7 @@ async fn a_resync_pending_stopped_peer_with_an_active_seat_is_deferred_not_retir
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -2079,7 +2079,7 @@ async fn a_resync_pending_stopped_peer_with_an_active_seat_is_deferred_not_retir
          temporary hold, never a fence exit"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "the stopped row stays armed for the replay after the resync clears"
     );
@@ -2186,7 +2186,7 @@ async fn an_agent_revoked_stopped_peer_is_retired_and_its_fence_closes() -> Resu
         "the revoked peer's page fence is closed, never left open"
     );
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "the retirement dropped the stopped row"
     );
     Ok(())
@@ -2368,7 +2368,7 @@ async fn the_rearm_does_not_duplicate_the_page_senders_own_next_page_ask() -> Re
         "the sender is never re-armed by its own page's replay"
     );
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "the ask that went out cleared the row"
     );
     // Settle: no late re-arm lands after the synchronous asserts.
@@ -2422,7 +2422,7 @@ async fn an_accepted_replay_that_moves_no_cursor_does_not_rearm() -> Result<()> 
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![hex::encode(responder.agent_id().as_bytes())],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -2483,7 +2483,7 @@ async fn an_accepted_replay_that_moves_no_cursor_does_not_rearm() -> Result<()> 
         "no typed re-arm was recorded"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![hex::encode(responder.agent_id().as_bytes())],
         "the row stays armed: only a moved cursor can falsify the stop's premise"
     );
@@ -2537,7 +2537,7 @@ async fn a_machine_held_stopped_peer_is_asked_anyway_and_its_clean_answer_closes
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -2608,7 +2608,7 @@ async fn a_machine_held_stopped_peer_is_asked_anyway_and_its_clean_answer_closes
         "no typed re-arm: a hold defers, it is not a replay re-arm"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "#1685 round 9: the row STAYS ARMED after the ask — an answer from the \
          held machine dies at the page gate, so a row cleared on this send would \
@@ -2632,7 +2632,7 @@ async fn a_machine_held_stopped_peer_is_asked_anyway_and_its_clean_answer_closes
     )
     .await;
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "the clean machine's terminal page cleared the armed row"
     );
     assert!(
@@ -2686,7 +2686,7 @@ async fn a_page_from_the_held_machine_itself_dies_at_the_page_gate() -> Result<(
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -2734,7 +2734,7 @@ async fn a_page_from_the_held_machine_itself_dies_at_the_page_gate() -> Result<(
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "the gate-refused page left the armed row exactly as it was"
     );
@@ -2820,7 +2820,7 @@ async fn a_key_package_reply_no_longer_skips_the_armed_sender_in_the_rearm_pass(
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -2907,7 +2907,7 @@ async fn a_key_package_reply_no_longer_skips_the_armed_sender_in_the_rearm_pass(
         "exactly one ask went out: the sender's own re-arm"
     );
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "the ask that went out cleared the sender's row"
     );
     assert!(
@@ -2956,7 +2956,7 @@ async fn a_fresh_stop_survives_the_parked_rearms_clear_on_send() -> Result<()> {
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -2978,7 +2978,7 @@ async fn a_fresh_stop_survives_the_parked_rearms_clear_on_send() -> Result<()> {
         "the detached re-arm's ask is the parked send"
     );
     assert!(
-        treekem_page_rearm_inflight(&group_id, &responder_hex),
+        treekem_page_rearm_inflight(&state, &group_id, &responder_hex),
         "CONTROL: the (group, peer) re-arm claim is held while the send is parked"
     );
 
@@ -2998,7 +2998,7 @@ async fn a_fresh_stop_survives_the_parked_rearms_clear_on_send() -> Result<()> {
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "the racing page armed a FRESH row for the same peer"
     );
@@ -3008,11 +3008,11 @@ async fn a_fresh_stop_survives_the_parked_rearms_clear_on_send() -> Result<()> {
     //    clear-on-send.
     drop(parked);
     assert!(
-        eventually(|| !treekem_page_rearm_inflight(&group_id, &responder_hex)).await,
+        eventually(|| !treekem_page_rearm_inflight(&state, &group_id, &responder_hex)).await,
         "the released re-arm task finished and released its claim"
     );
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "#1685 round 8, finding 3: the clear-on-send matched the old stop instant \
          and did not wipe the fresh row the racing page armed"
@@ -3067,7 +3067,7 @@ async fn one_rearm_task_per_peer_across_both_group_id_spellings() -> Result<()> 
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -3088,7 +3088,7 @@ async fn one_rearm_task_per_peer_across_both_group_id_spellings() -> Result<()> 
         "the detached re-arm's ask is the parked send"
     );
     assert!(
-        treekem_page_rearm_inflight(&group_id, &responder_hex),
+        treekem_page_rearm_inflight(&state, &group_id, &responder_hex),
         "CONTROL: the register-keyed claim is held while the send is parked"
     );
 
@@ -3099,7 +3099,7 @@ async fn one_rearm_task_per_peer_across_both_group_id_spellings() -> Result<()> 
     spawn_stopped_treekem_catchup_rearms(&state, &fence_ids[2], None);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(
-        treekem_page_rearm_inflight(&group_id, &responder_hex),
+        treekem_page_rearm_inflight(&state, &group_id, &responder_hex),
         "CONTROL: the first task still holds its claim (its send is still parked)"
     );
 
@@ -3107,7 +3107,7 @@ async fn one_rearm_task_per_peer_across_both_group_id_spellings() -> Result<()> 
     //    stable-id pass never started a second send.
     drop(parked);
     assert!(
-        eventually(|| !treekem_page_rearm_inflight(&group_id, &responder_hex)).await,
+        eventually(|| !treekem_page_rearm_inflight(&state, &group_id, &responder_hex)).await,
         "the released re-arm task finished and released its claim"
     );
     assert_eq!(
@@ -3122,7 +3122,7 @@ async fn one_rearm_task_per_peer_across_both_group_id_spellings() -> Result<()> 
         "exactly one typed re-arm"
     );
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "the one ask that went out cleared the row"
     );
     Ok(())
@@ -3164,7 +3164,7 @@ async fn a_detached_rearm_that_cannot_send_keeps_the_row_armed_and_records_nothi
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -3192,13 +3192,13 @@ async fn a_detached_rearm_that_cannot_send_keeps_the_row_armed_and_records_nothi
         "CONTROL: the replay really applied the retained E2"
     );
     assert!(
-        eventually(|| !treekem_page_rearm_inflight(&group_id, &responder_hex)).await,
+        eventually(|| !treekem_page_rearm_inflight(&state, &group_id, &responder_hex)).await,
         "the failed re-arm task finished and released its claim"
     );
     // Settle: nothing may land after the task's exit either.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "#1685 round 5, finding 2: a re-arm whose every send failed keeps the row \
          armed, so the next cursor-moving replay retries the peer"
@@ -3297,7 +3297,7 @@ async fn an_inline_next_page_ask_that_cannot_send_leaves_no_trace() -> Result<()
         "a progressing page records no stop"
     );
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "no row armed: nothing stopped, and the failed inline ask clears nothing"
     );
     assert!(
@@ -3476,7 +3476,7 @@ async fn a_truncated_page_answering_a_pre_advance_ask_pages_on_from_the_moved_cu
         "a page answering a pre-advance ask records no stop"
     );
     assert!(
-        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        treekem_page_stopped_peers(&state, &fence_ids).is_empty(),
         "no row armed: the peer's stream never stopped"
     );
 
@@ -3540,7 +3540,7 @@ async fn a_listener_applied_advance_rearms_the_stopped_peer() -> Result<()> {
     )
     .await;
     assert_eq!(
-        treekem_page_stopped_peers(&fence_ids),
+        treekem_page_stopped_peers(&state, &fence_ids),
         vec![responder_hex.clone()],
         "CONTROL: the responder's stopped row is armed"
     );
@@ -3584,7 +3584,7 @@ async fn a_listener_applied_advance_rearms_the_stopped_peer() -> Result<()> {
         "the re-arm names the group, the stopped peer and the typed reason"
     );
     assert!(
-        eventually(|| treekem_page_stopped_peers(&fence_ids).is_empty()).await,
+        eventually(|| treekem_page_stopped_peers(&state, &fence_ids).is_empty()).await,
         "the successful re-arm ask cleared the stopped row"
     );
 

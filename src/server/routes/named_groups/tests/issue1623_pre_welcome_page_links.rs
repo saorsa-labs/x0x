@@ -946,8 +946,10 @@ fn treekem_catchup_cursor_epoch_maps_the_head_binding() {
 
 /// The cursor the joiner's last page ask to `peer` left from, as the
 /// production page loop recorded it at ask initiation.
-fn recorded_page_ask_cursor(key: &str, peer: &str) -> Option<(u64, u64, String)> {
-    let guard = TREEKEM_PAGE_ASK_CURSORS
+fn recorded_page_ask_cursor(state: &AppState, key: &str, peer: &str) -> Option<(u64, u64, String)> {
+    let guard = state
+        .treekem_page_bookkeeping
+        .ask_cursors
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard
@@ -1046,7 +1048,7 @@ async fn page_from_responder(
             .clone();
         assert!(stops.is_empty(), "the page loop did not stop: {stops:?}");
         let head = head_of(joiner, key).await?;
-        let asked = recorded_page_ask_cursor(key, &responder_hex)
+        let asked = recorded_page_ask_cursor(joiner, key, &responder_hex)
             .expect("the joiner recorded its next-page ask cursor");
         assert_eq!(
             (asked.0, &asked.2),

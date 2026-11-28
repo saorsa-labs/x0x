@@ -12424,6 +12424,7 @@ async fn request_treekem_catchup_for_gap(
             .await
         {
             Ok(_) => treekem_page_ask_cursor_note(
+                state,
                 &fence_aliases,
                 &peer_hex,
                 (from_revision, from_epoch, current_state_hash.clone()),
@@ -14812,6 +14813,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 if cursor == cursor_before
                     && page_served_ahead
                     && treekem_page_ask_cursor_permits_stop(
+                        state,
                         &fence_ids,
                         &sender_hex,
                         &cursor_before,
@@ -14832,7 +14834,9 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 // Poisoned locks are recovered like every other gate in
                 // this file (review round 5 nit): a poisoned dedupe map
                 // must not silence the warn path.
-                let mut last = TREEKEM_PAGE_STOP_REWARN
+                let mut last = state
+                    .treekem_page_bookkeeping
+                    .stop_rewarn
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if last.len() > TREEKEM_PAGE_STOP_REWARN_CAP {
@@ -14893,7 +14897,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 // came from, so the re-arm pre-check can run the same
                 // machine-aware revocation gate a page from this peer
                 // must pass.
-                treekem_page_stopped_peers_note(&fence_ids, &sender_hex, machine_id);
+                treekem_page_stopped_peers_note(state, &fence_ids, &sender_hex, machine_id);
                 // #1685 round 10 (P1 review thread 3): the stop SCHEDULES
                 // its own resumption. The premise breaks wherever the
                 // cursor next moves — a replay's drain, another peer's
@@ -14902,7 +14906,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 // [`maybe_rearm_stopped_treekem_pages`] compares every
                 // post-apply seam against it: the first movement resumes
                 // this armed row (and any other) from the moved cursor.
-                treekem_page_rearm_baseline_note(&fence_ids, cursor_before.clone());
+                treekem_page_rearm_baseline_note(state, &fence_ids, cursor_before.clone());
             }
         } else {
             // The page moved the cursor, so this peer's stream is live
@@ -14930,7 +14934,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                      its page fence stays open"
                 );
             } else {
-                treekem_page_stopped_peers_clear(&fence_ids, &sender_hex);
+                treekem_page_stopped_peers_clear(state, &fence_ids, &sender_hex);
                 tracing::debug!(
                     target: "treekem.trace",
                     group_id = %response.group_id,
@@ -14975,7 +14979,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             // page also retires this peer's stopped-loop accounting: the
             // stream reached its head, so nothing is left to re-arm.
             self_leave_rekey_fence_catchup_peer(state, &fence_ids, &sender_hex, false);
-            treekem_page_stopped_peers_clear(&fence_ids, &sender_hex);
+            treekem_page_stopped_peers_clear(state, &fence_ids, &sender_hex);
         }
         if peer_open || !any_open {
             // No known page is outstanding, or this page closed one.
@@ -15025,10 +15029,20 @@ const TREEKEM_PAGE_STOP_REWARN_AFTER: std::time::Duration = std::time::Duration:
 /// first, so the map stays O(live groups × active peers).
 const TREEKEM_PAGE_STOP_REWARN_CAP: usize = 1024;
 
-/// #1685: the last typed page-loop stop warn per `{group}:{peer}`.
-static TREEKEM_PAGE_STOP_REWARN: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Per-daemon TreeKEM catch-up page bookkeeping (#1685, #2231).
+///
+/// Lives on [`AppState`] rather than process-global statics so independent
+/// daemons in one process never share or clobber stopped-page state, ask
+/// cursors, re-warn windows, or in-flight re-arm slots, and restarting a
+/// daemon always starts clean.
+#[derive(Default)]
+pub(in crate::server) struct TreeKemPageBookkeeping {
+    pub(super) stop_rewarn: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    pub(super) stopped_peers: std::sync::Mutex<TreekemPageStoppedPeersByGroup>,
+    pub(super) ask_cursors: std::sync::Mutex<TreekemPageAskCursorsByGroup>,
+    pub(super) rearm_baselines: std::sync::Mutex<TreekemPageRearmBaselinesByGroup>,
+    pub(super) rearm_inflight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+}
 
 /// #1685 round 3 (review 5712505625): the typed re-arm reason recorded
 /// when a replay moved the catch-up cursor and a peer stopped with
@@ -15078,19 +15092,20 @@ const TREEKEM_PAGE_STOP_DEFERRED_PEER_REASON: &str = "revocation_hold";
 const TREEKEM_PAGE_STOP_DEFERRED_ASK_REASON: &str = "revocation_hold_ask_sent";
 
 /// #1685 round 3: how long one armed row of
-/// [`TREEKEM_PAGE_STOPPED_PEERS`] survives. Rows are pruned by age only
-/// when the map passes [`TREEKEM_PAGE_STOPPED_PEERS_CAP`], so the bound
+/// `TreeKemPageBookkeeping::stopped_peers` survives. Rows are pruned by age
+/// only when the map passes [`TREEKEM_PAGE_STOPPED_PEERS_CAP`], so the bound
 /// never touches a map inside its budget.
 const TREEKEM_PAGE_STOPPED_PEERS_TTL: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
-/// #1685 round 3: the armed-row budget of [`TREEKEM_PAGE_STOPPED_PEERS`]
-/// across every group. Past-TTL rows go first; if that is not enough,
-/// the oldest rows go, so the map stays O(live groups × stopped peers).
+/// #1685 round 3: the armed-row budget of
+/// `TreeKemPageBookkeeping::stopped_peers` across every group. Past-TTL rows
+/// go first; if that is not enough, the oldest rows go, so the map stays
+/// O(live groups × stopped peers).
 const TREEKEM_PAGE_STOPPED_PEERS_CAP: usize = 1024;
 
 /// #1685 round 6 (CI clippy, `clippy::type_complexity`): the value of
-/// [`TREEKEM_PAGE_STOPPED_PEERS`] — per group, each stopped peer's
+/// `TreeKemPageBookkeeping::stopped_peers` — per group, each stopped peer's
 /// armed row: the authenticated machine its stopped page came
 /// from and the stop instant. A named alias, not a new type; the
 /// map's shape is unchanged.
@@ -15137,16 +15152,19 @@ type TreekemPageStoppedPeersByGroup = std::collections::HashMap<
 /// has an exit (the re-arm ask, the terminal page that closes the peer
 /// fence, or the round 4/8 retirement of a peer that is revoked or has
 /// no Active seat).
-static TREEKEM_PAGE_STOPPED_PEERS: std::sync::LazyLock<
-    std::sync::Mutex<TreekemPageStoppedPeersByGroup>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 /// #1685 round 3: arm one peer's stopped-loop row under the fence
 /// aliases, with the machine its stopped page came from. Over budget,
 /// past-TTL rows are pruned first, then the oldest rows until the map
 /// is inside its cap.
-fn treekem_page_stopped_peers_note(group_ids: &[String], peer: &str, machine: &MachineId) {
-    let mut guard = TREEKEM_PAGE_STOPPED_PEERS
+fn treekem_page_stopped_peers_note(
+    state: &AppState,
+    group_ids: &[String],
+    peer: &str,
+    machine: &MachineId,
+) {
+    let mut guard = state
+        .treekem_page_bookkeeping
+        .stopped_peers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
@@ -15183,8 +15201,10 @@ fn treekem_page_stopped_peers_note(group_ids: &[String], peer: &str, machine: &M
 
 /// #1685 round 3: retire one peer's stopped-loop row (its page stream
 /// moved again, or its terminal page closed the peer fence).
-fn treekem_page_stopped_peers_clear(group_ids: &[String], peer: &str) {
-    let mut guard = TREEKEM_PAGE_STOPPED_PEERS
+fn treekem_page_stopped_peers_clear(state: &AppState, group_ids: &[String], peer: &str) {
+    let mut guard = state
+        .treekem_page_bookkeeping
+        .stopped_peers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
@@ -15203,12 +15223,15 @@ fn treekem_page_stopped_peers_clear(group_ids: &[String], peer: &str) {
 /// with no row — nothing would re-ask or retire it. The row a racing
 /// reply re-armed carries a different stop instant, so it survives.
 fn treekem_page_stopped_peers_clear_if(
+    state: &AppState,
     group_ids: &[String],
     peer: &str,
     machine: &MachineId,
     stopped_at: &std::time::Instant,
 ) {
-    let mut guard = TREEKEM_PAGE_STOPPED_PEERS
+    let mut guard = state
+        .treekem_page_bookkeeping
+        .stopped_peers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
@@ -15254,12 +15277,14 @@ async fn treekem_page_stopped_peers_drop_departed(
     group_ids: &[String],
     peer: &str,
 ) {
-    treekem_page_stopped_peers_clear(group_ids, peer);
+    treekem_page_stopped_peers_clear(state, group_ids, peer);
     self_leave_rekey_fence_catchup_peer(state, group_ids, peer, false);
     // The re-warn guard stays in its own block: a std MutexGuard must
     // not live across the await below (the future has to stay Send).
     {
-        let mut rewarn = TREEKEM_PAGE_STOP_REWARN
+        let mut rewarn = state
+            .treekem_page_bookkeeping
+            .stop_rewarn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for group_id in group_ids {
@@ -15282,7 +15307,9 @@ async fn treekem_page_stopped_peers_drop_departed(
 /// rekey again, so an open fence for it has no exit.
 fn treekem_page_stopped_peers_drop_group(state: &AppState, group_ids: &[String]) {
     {
-        let mut guard = TREEKEM_PAGE_STOPPED_PEERS
+        let mut guard = state
+            .treekem_page_bookkeeping
+            .stopped_peers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for group_id in group_ids {
@@ -15304,7 +15331,29 @@ fn treekem_page_stopped_peers_drop_group(state: &AppState, group_ids: &[String])
             }
         }
     }
-    let mut rewarn = TREEKEM_PAGE_STOP_REWARN
+    {
+        let mut cursors = state
+            .treekem_page_bookkeeping
+            .ask_cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for group_id in group_ids {
+            cursors.remove(group_id);
+        }
+    }
+    {
+        let mut baselines = state
+            .treekem_page_bookkeeping
+            .rearm_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for group_id in group_ids {
+            baselines.remove(group_id);
+        }
+    }
+    let mut rewarn = state
+        .treekem_page_bookkeeping
+        .stop_rewarn
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
@@ -15323,8 +15372,8 @@ fn treekem_page_stopped_peers_drop_group(state: &AppState, group_ids: &[String])
 /// [`treekem_page_stopped_peer_rows`] (the row also carries the peer's
 /// machine); this view is the tests'.
 #[cfg(test)]
-fn treekem_page_stopped_peers(group_ids: &[String]) -> Vec<String> {
-    treekem_page_stopped_peer_rows(group_ids)
+fn treekem_page_stopped_peers(state: &AppState, group_ids: &[String]) -> Vec<String> {
+    treekem_page_stopped_peer_rows(state, group_ids)
         .into_iter()
         .map(|(peer, _, _)| peer)
         .collect()
@@ -15338,9 +15387,12 @@ fn treekem_page_stopped_peers(group_ids: &[String]) -> Vec<String> {
 /// survives the clear). Sorted by peer, one row per peer across the
 /// aliases.
 fn treekem_page_stopped_peer_rows(
+    state: &AppState,
     group_ids: &[String],
 ) -> Vec<(String, MachineId, std::time::Instant)> {
-    let guard = TREEKEM_PAGE_STOPPED_PEERS
+    let guard = state
+        .treekem_page_bookkeeping
+        .stopped_peers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut rows: Vec<(String, MachineId, std::time::Instant)> = guard
@@ -15358,14 +15410,14 @@ fn treekem_page_stopped_peer_rows(
 }
 
 /// #1685 round 10: how long one row of
-/// [`TREEKEM_PAGE_ASK_CURSORS`] stays meaningful. A row answers one
+/// `TreeKemPageBookkeeping::ask_cursors` stays meaningful. A row answers one
 /// in-flight ask, so an hour bounds even a slow peer's round trip;
 /// past it the row is worthless (the response either landed or never
 /// will), and a page that arrives with no row is judged by the
 /// pre-round-10 rule instead.
 const TREEKEM_PAGE_ASK_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// #1685 round 10: the row budget of [`TREEKEM_PAGE_ASK_CURSORS`]
+/// #1685 round 10: the row budget of `TreeKemPageBookkeeping::ask_cursors`
 /// across every group. Past-TTL rows go first; if that is not enough,
 /// the oldest rows go, so the map stays O(live groups × asked peers).
 const TREEKEM_PAGE_ASK_CURSOR_CAP: usize = 4096;
@@ -15388,12 +15440,8 @@ const TREEKEM_PAGE_ASK_CURSOR_CAP: usize = 4096;
 /// the map. A missing row (an unsolicited page, or a pruned row)
 /// keeps the pre-round-10 verdict: the stop may fire, and the armed
 /// row plus the round 10 resumption baseline still gives it an exit.
-static TREEKEM_PAGE_ASK_CURSORS: std::sync::LazyLock<
-    std::sync::Mutex<TreekemPageAskCursorsByGroup>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 /// #1685 round 10 (CI clippy, `clippy::type_complexity` — the round 6
-/// precedent): the value of [`TREEKEM_PAGE_ASK_CURSORS`] — per group
+/// precedent): the value of `TreeKemPageBookkeeping::ask_cursors` — per group
 /// alias, each asked peer's ask cursor and the instant it left. A
 /// named alias, not a new type; the map's shape is a plain HashMap.
 type TreekemPageAskCursorsByGroup = std::collections::HashMap<
@@ -15405,8 +15453,15 @@ type TreekemPageAskCursorsByGroup = std::collections::HashMap<
 /// the fence aliases, at ask initiation. Over budget, past-TTL rows
 /// are pruned first, then the oldest rows until the map is inside its
 /// cap.
-fn treekem_page_ask_cursor_note(group_ids: &[String], peer: &str, cursor: (u64, u64, String)) {
-    let mut guard = TREEKEM_PAGE_ASK_CURSORS
+fn treekem_page_ask_cursor_note(
+    state: &AppState,
+    group_ids: &[String],
+    peer: &str,
+    cursor: (u64, u64, String),
+) {
+    let mut guard = state
+        .treekem_page_bookkeeping
+        .ask_cursors
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
@@ -15454,11 +15509,14 @@ fn treekem_page_ask_cursor_note(group_ids: &[String], peer: &str, cursor: (u64, 
 /// live stream should close. No row at all (an unsolicited page, or a
 /// pruned row) keeps the pre-round-10 verdict: the stop may fire.
 fn treekem_page_ask_cursor_permits_stop(
+    state: &AppState,
     group_ids: &[String],
     peer: &str,
     cursor: &(u64, u64, String),
 ) -> bool {
-    let guard = TREEKEM_PAGE_ASK_CURSORS
+    let guard = state
+        .treekem_page_bookkeeping
+        .ask_cursors
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut newest: Option<&(u64, u64, String, std::time::Instant)> = None;
@@ -15478,14 +15536,14 @@ fn treekem_page_ask_cursor_permits_stop(
 }
 
 /// #1685 round 10: how long one row of
-/// [`TREEKEM_PAGE_REARM_BASELINES`] survives. Rows pair with the
+/// `TreeKemPageBookkeeping::rearm_baselines` survives. Rows pair with the
 /// 24 h stopped-loop rows; the same window keeps a baseline from
 /// outliving the row it was armed with.
 const TREEKEM_PAGE_REARM_BASELINE_TTL: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
 /// #1685 round 10: the baseline budget of
-/// [`TREEKEM_PAGE_REARM_BASELINES`] across every group, pruned
+/// `TreeKemPageBookkeeping::rearm_baselines` across every group, pruned
 /// past-TTL-first like the stopped-loop rows.
 const TREEKEM_PAGE_REARM_BASELINE_CAP: usize = 1024;
 
@@ -15503,12 +15561,8 @@ const TREEKEM_PAGE_REARM_BASELINE_CAP: usize = 1024;
 /// against this baseline at every post-apply seam and resumes the
 /// armed rows on movement. A pruned baseline with live rows only
 /// re-baselines (no ask), so pruning can never spam re-arms.
-static TREEKEM_PAGE_REARM_BASELINES: std::sync::LazyLock<
-    std::sync::Mutex<TreekemPageRearmBaselinesByGroup>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 /// #1685 round 10 (CI clippy, `clippy::type_complexity` — the round 6
-/// precedent): the value of [`TREEKEM_PAGE_REARM_BASELINES`] — per
+/// precedent): the value of `TreeKemPageBookkeeping::rearm_baselines` — per
 /// group alias, the cursor the group's stops were armed at and the
 /// instant it was recorded. A named alias, not a new type.
 type TreekemPageRearmBaselinesByGroup =
@@ -15517,8 +15571,14 @@ type TreekemPageRearmBaselinesByGroup =
 /// #1685 round 10: arm one group's resumption baseline under the
 /// fence aliases, at the cursor a no-progress stop decided on. Over
 /// budget, past-TTL rows are pruned first, then the oldest.
-fn treekem_page_rearm_baseline_note(group_ids: &[String], cursor: (u64, u64, String)) {
-    let mut guard = TREEKEM_PAGE_REARM_BASELINES
+fn treekem_page_rearm_baseline_note(
+    state: &AppState,
+    group_ids: &[String],
+    cursor: (u64, u64, String),
+) {
+    let mut guard = state
+        .treekem_page_bookkeeping
+        .rearm_baselines
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
@@ -15597,11 +15657,13 @@ async fn maybe_rearm_stopped_treekem_pages(
         treekem_catchup_cursor_epoch(state, &aliases, head_epoch).await,
         hash,
     );
-    if treekem_page_stopped_peer_rows(&aliases).is_empty() {
+    if treekem_page_stopped_peer_rows(state, &aliases).is_empty() {
         return;
     }
     let should_spawn = {
-        let mut guard = TREEKEM_PAGE_REARM_BASELINES
+        let mut guard = state
+            .treekem_page_bookkeeping
+            .rearm_baselines
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard
@@ -15646,14 +15708,12 @@ async fn maybe_rearm_stopped_treekem_pages(
 /// armed, so the next replay that moves the cursor asks again. Claims
 /// are released by [`TreeKemPageRearmSlot`]'s `Drop`, so a finished or
 /// panicked task never leaks its slot.
-static TREEKEM_PAGE_REARM_INFLIGHT: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-
 /// Claim one (group, peer) re-arm slot. `false` means a re-arm for
 /// that pair is already in flight.
-fn treekem_page_rearm_claim(group_key: &str, peer_hex: &str) -> bool {
-    let mut guard = TREEKEM_PAGE_REARM_INFLIGHT
+fn treekem_page_rearm_claim(state: &AppState, group_key: &str, peer_hex: &str) -> bool {
+    let mut guard = state
+        .treekem_page_bookkeeping
+        .rearm_inflight
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.insert((group_key.to_string(), peer_hex.to_string()))
@@ -15663,8 +15723,10 @@ fn treekem_page_rearm_claim(group_key: &str, peer_hex: &str) -> bool {
 /// peer)? Tests await the task's exit with this when no recorder fires
 /// (the every-send-fails branch records nothing).
 #[cfg(test)]
-fn treekem_page_rearm_inflight(group_key: &str, peer_hex: &str) -> bool {
-    let guard = TREEKEM_PAGE_REARM_INFLIGHT
+fn treekem_page_rearm_inflight(state: &AppState, group_key: &str, peer_hex: &str) -> bool {
+    let guard = state
+        .treekem_page_bookkeeping
+        .rearm_inflight
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.contains(&(group_key.to_string(), peer_hex.to_string()))
@@ -15673,13 +15735,15 @@ fn treekem_page_rearm_inflight(group_key: &str, peer_hex: &str) -> bool {
 /// Releases the (group, peer) re-arm claim when the task holding it
 /// finishes or unwinds.
 struct TreeKemPageRearmSlot {
+    inflight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     group_key: String,
     peer_hex: String,
 }
 
 impl Drop for TreeKemPageRearmSlot {
     fn drop(&mut self) {
-        let mut guard = TREEKEM_PAGE_REARM_INFLIGHT
+        let mut guard = self
+            .inflight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.remove(&(self.group_key.clone(), self.peer_hex.clone()));
@@ -15699,7 +15763,7 @@ impl Drop for TreeKemPageRearmSlot {
 /// group and hold the replay fence for the whole send budget. One
 /// detached coordinator resolves the roster once and spawns one task
 /// per (group, peer), single-flighted through
-/// [`TREEKEM_PAGE_REARM_INFLIGHT`] — keyed by the group's REGISTER KEY
+/// `TreeKemPageBookkeeping::rearm_inflight` — keyed by the group's REGISTER KEY
 /// once the group is live (round 8, Claude review at e756545d, finding
 /// 4: the caller may pass either the register key or the stable id, and
 /// two spellings must not run two parallel page streams for one peer;
@@ -15764,7 +15828,7 @@ fn spawn_stopped_treekem_catchup_rearms(
             aliases.dedup();
             (aliases, live, claim_key)
         };
-        let peers = treekem_page_stopped_peer_rows(&aliases);
+        let peers = treekem_page_stopped_peer_rows(&state, &aliases);
         if peers.is_empty() {
             return;
         }
@@ -15772,10 +15836,11 @@ fn spawn_stopped_treekem_catchup_rearms(
             if live.is_some() && Some(&peer_hex) == skip_peer.as_ref() {
                 continue;
             }
-            if !treekem_page_rearm_claim(&claim_key, &peer_hex) {
+            if !treekem_page_rearm_claim(&state, &claim_key, &peer_hex) {
                 continue;
             }
             let slot = TreeKemPageRearmSlot {
+                inflight: Arc::clone(&state.treekem_page_bookkeeping.rearm_inflight),
                 group_key: claim_key.clone(),
                 peer_hex: peer_hex.clone(),
             };
@@ -15858,7 +15923,7 @@ async fn rearm_one_stopped_treekem_catchup_page(
     stopped_at: std::time::Instant,
 ) {
     let Ok(peer) = parse_agent_id_hex(&peer_hex) else {
-        treekem_page_stopped_peers_clear(aliases, &peer_hex);
+        treekem_page_stopped_peers_clear(state, aliases, &peer_hex);
         return;
     };
     // #1685 round 8 (Engineer ruling, 31 Oct 2026): only an agent
@@ -16008,7 +16073,7 @@ async fn rearm_one_stopped_treekem_catchup_page(
         );
         return;
     }
-    treekem_page_stopped_peers_clear_if(aliases, &peer_hex, &machine, &stopped_at);
+    treekem_page_stopped_peers_clear_if(state, aliases, &peer_hex, &machine, &stopped_at);
     tracing::info!(
         group_id = %LogHexId::group(group_id),
         sender = %LogHexId::agent(&peer_hex),
@@ -16148,6 +16213,7 @@ async fn request_treekem_catchup_page(
     };
     let from_epoch = treekem_catchup_cursor_epoch(state, &fence_aliases, head_epoch).await;
     treekem_page_ask_cursor_note(
+        state,
         &fence_aliases,
         &hex::encode(peer.as_bytes()),
         (from_revision, from_epoch, current_state_hash.clone()),
@@ -58481,6 +58547,7 @@ pub(in crate::server) mod tests {
             ),
             startup_catchup_obligations: std::sync::Mutex::new(HashMap::new()),
             self_leave_rekey_fences: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            treekem_page_bookkeeping: TreeKemPageBookkeeping::default(),
             startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
             startup_catchup_backoff_owner: AtomicU64::new(0),
             startup_catchup_backoff_abort: std::sync::Mutex::new(None),

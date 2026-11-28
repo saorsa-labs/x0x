@@ -26,7 +26,7 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
 use super::routes::named_groups::{
-    RequesterOfferObligation, SelfLeaveFence, StartupCatchupObligation,
+    RequesterOfferObligation, SelfLeaveFence, StartupCatchupObligation, TreeKemPageBookkeeping,
 };
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
@@ -1591,6 +1591,11 @@ pub(super) struct AppState {
     /// independent daemons in the same process never clobber each other and
     /// restarting a daemon starts with empty fences (#2231).
     pub(in crate::server) self_leave_rekey_fences: Arc<StdMutex<HashMap<String, SelfLeaveFence>>>,
+    /// Per-daemon TreeKEM catch-up page bookkeeping (stopped peers, stop
+    /// re-warn timestamps, ask cursors, re-arm baselines, and in-flight re-arm
+    /// slots). Kept on `AppState` so independent daemons in one process never
+    /// share or clobber stopped-page state and restarts start clean (#2231).
+    pub(in crate::server) treekem_page_bookkeeping: TreeKemPageBookkeeping,
     /// True after this daemon has installed its startup self-leave gates.
     /// It starts true, so a test that never takes the hold can seal.
     /// Production sets it false before the direct metadata listener and
