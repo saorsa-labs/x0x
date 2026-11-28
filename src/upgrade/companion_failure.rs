@@ -139,23 +139,58 @@ pub(crate) fn current_for(data_root: &Path, running: &str) -> Read {
     }
 }
 
+/// Outcome of writing the companion failure record. When `dir_sync_error` is
+/// `Some`, the atomic rename succeeded and the record is in place on disk,
+/// while syncing the parent directory failed.
+pub(crate) struct RecordWrite {
+    pub record: CompanionFailure,
+    pub dir_sync_error: Option<io::Error>,
+}
+
 /// Record a failed apply of `version`: mode 0600, the file synced, renamed
 /// over the record, the directory synced. A failure of the same release
 /// counts up; another release starts at 1.
+#[cfg(test)]
 pub(crate) fn record(
     data_root: &Path,
     version: &str,
     detail: &str,
 ) -> io::Result<CompanionFailure> {
-    record_at(data_root, version, detail, now_unix())
+    let outcome = record_at_with_sync(data_root, version, detail, now_unix())?;
+    if let Some(err) = outcome.dir_sync_error {
+        return Err(err);
+    }
+    Ok(outcome.record)
 }
 
+pub(crate) fn record_with_sync_status(
+    data_root: &Path,
+    version: &str,
+    detail: &str,
+) -> io::Result<RecordWrite> {
+    record_at_with_sync(data_root, version, detail, now_unix())
+}
+
+#[cfg(test)]
 pub(crate) fn record_at(
     data_root: &Path,
     version: &str,
     detail: &str,
     now: u64,
 ) -> io::Result<CompanionFailure> {
+    let outcome = record_at_with_sync(data_root, version, detail, now)?;
+    if let Some(err) = outcome.dir_sync_error {
+        return Err(err);
+    }
+    Ok(outcome.record)
+}
+
+fn record_at_with_sync(
+    data_root: &Path,
+    version: &str,
+    detail: &str,
+    now: u64,
+) -> io::Result<RecordWrite> {
     use std::io::Write;
     let failures = record_of(data_root)
         .filter(|record| record.version == version)
@@ -169,7 +204,7 @@ pub(crate) fn record_at(
     };
     let path = data_root.join(RECORD);
     let temporary = data_root.join(format!(".{RECORD}.{}.tmp", uuid::Uuid::new_v4()));
-    let written = (|| {
+    let renamed = (|| {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -180,13 +215,19 @@ pub(crate) fn record_at(
         let mut file = options.open(&temporary)?;
         file.write_all(&serde_json::to_vec(&record).map_err(io::Error::other)?)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, &path)?;
-        super::journal::open_for_sync(data_root, true)?.sync_all()
+        std::fs::rename(&temporary, &path)
     })();
-    if written.is_err() {
+    if let Err(err) = renamed {
         let _ = std::fs::remove_file(&temporary);
+        return Err(err);
     }
-    written.map(|()| record)
+    let dir_sync_error = super::journal::open_for_sync(data_root, true)
+        .and_then(|dir| dir.sync_all())
+        .err();
+    Ok(RecordWrite {
+        record,
+        dir_sync_error,
+    })
 }
 
 /// Remove the record after a successful apply. A missing record is fine.

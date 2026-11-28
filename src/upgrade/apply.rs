@@ -876,30 +876,35 @@ fn refuse_backed_off(data_root: &Path, version: &str) -> Result<(), UpgradeError
     )))
 }
 
-/// A restart continuation that first removes the companion failure record:
-/// the apply succeeded, so its release no longer needs the backoff.
-fn clearing_companion_record(data_root: PathBuf, cont: RestartContinuation) -> RestartContinuation {
-    Box::new(move |swapped, locks| {
-        super::companion_failure::clear(&data_root);
-        cont(swapped, locks)
-    })
-}
-
 /// Record a companion failure (`error` starting with [`COMPANION_FAILURE`])
 /// for `/health`, `/diagnostics/upgrade`, `x0x doctor` and the backoff.
 /// Any other error passes through unrecorded.
 fn note_companion_failure(data_root: &Path, version: &str, error: UpgradeError) -> UpgradeError {
     let detail = error.to_string();
     if detail.starts_with(COMPANION_FAILURE) {
-        match super::companion_failure::record(data_root, version, &detail) {
-            Ok(record) => error!(
-                version,
-                failures = record.failures,
-                retry_at_unix = record.retry_at_unix(),
-                %detail,
-                "the apply failed on the sibling x0x CLI; recorded for x0x doctor, and this \
-                 release is not tried again until its backoff passes"
-            ),
+        match super::companion_failure::record_with_sync_status(data_root, version, &detail) {
+            Ok(outcome) => {
+                if let Some(sync_error) = outcome.dir_sync_error {
+                    warn!(
+                        version,
+                        failures = outcome.record.failures,
+                        retry_at_unix = outcome.record.retry_at_unix(),
+                        %detail,
+                        %sync_error,
+                        "the apply failed on the sibling x0x CLI; the failure record is in place, \
+                         but syncing its directory failed"
+                    );
+                } else {
+                    error!(
+                        version,
+                        failures = outcome.record.failures,
+                        retry_at_unix = outcome.record.retry_at_unix(),
+                        %detail,
+                        "the apply failed on the sibling x0x CLI; recorded for x0x doctor, and \
+                         this release is not tried again until its backoff passes"
+                    );
+                }
+            }
             Err(write) => error!(
                 version,
                 %detail,
@@ -977,6 +982,7 @@ async fn apply_replacements_with_permit(
         probe_admission,
         permit,
         flush_reservation,
+        None,
         #[cfg(unix)]
         None,
     )
@@ -996,6 +1002,7 @@ async fn apply_replacements_with_producer(
     probe_admission: Option<ProbeAdmission>,
     permit: Option<&ReleasePermit>,
     flush_reservation: Option<super::shutdown_flush::Reservation>,
+    companion_clear_root: Option<PathBuf>,
     #[cfg(unix)] producer: Option<super::producer::Transaction>,
 ) -> Result<UpgradeResult, UpgradeError> {
     let caller_alive = Arc::new(AtomicBool::new(true));
@@ -1137,6 +1144,11 @@ async fn apply_replacements_with_producer(
             } => (result, swapped, locks),
             Swapped::RolledBack(result) => return Ok(result),
         };
+        if matches!(result, UpgradeResult::Success { .. }) {
+            if let Some(ref data_root) = companion_clear_root {
+                super::companion_failure::clear(data_root);
+            }
+        }
         if let Some(cont) = on_success.take() {
             // Clean temp before a continuation that may `_exit` / `exit`
             // without running Drop (#1447 RC4 P2).
@@ -2060,8 +2072,6 @@ impl AutoApplyUpgrader {
             None
         };
 
-        let on_success =
-            on_success.map(|cont| clearing_companion_record(restart_plan.data_root.clone(), cont));
         self.check_release()?;
         super::monitor::validate_manifest_timestamp(manifest)?;
         let result = apply_replacements_with_producer(
@@ -2074,6 +2084,7 @@ impl AutoApplyUpgrader {
             probe_admission,
             self.release_permit.as_ref(),
             flush_reservation,
+            Some(restart_plan.data_root.clone()),
             #[cfg(unix)]
             producer,
         )
@@ -2083,7 +2094,6 @@ impl AutoApplyUpgrader {
         })?;
 
         if matches!(result, UpgradeResult::Success { .. }) {
-            super::companion_failure::clear(&restart_plan.data_root);
             // ADR-0061 §6 — report honestly. Installed bytes, a pending
             // restart, observed readiness and recovery are four distinct
             // facts; only the first is established at this point. Immediate

@@ -1625,4 +1625,50 @@ mod tests {
             Some("prior child still exists")
         );
     }
+
+    /// #2012 review: a crash after writing a Committed trial and before
+    /// writing Idle leaves the journal HostCommitted; the next start retries
+    /// retire, settling the journal to Idle without rewriting trial.json.
+    #[test]
+    fn a_committed_trial_start_settles_host_committed_to_idle_without_rewriting_trial() {
+        use std::os::unix::fs::MetadataExt;
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let participant = &host.plan().participants[0];
+        let path = coordinator::trial_path(participant);
+        let mut trial = provisional(&host, &path, gone_child());
+        trial.phase = Phase::Committed;
+        trial.save(&path).unwrap();
+        set_journal_phase(&root, journal::Phase::HostCommitted);
+
+        let before = (
+            std::fs::metadata(&path).unwrap().ino(),
+            std::fs::read(&path).unwrap(),
+        );
+        let boot = trial.boot.clone();
+        let outcome = run::run_trial(
+            &host,
+            &path,
+            &mut trial,
+            || {
+                Ok(Clock {
+                    boot: boot.clone(),
+                    ms: 3_000,
+                })
+            },
+            |_| Ok(false),
+            || false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, run::Outcome::Committed));
+        assert_eq!(
+            journal_phase(&root),
+            journal::Phase::Idle,
+            "committed trial start must settle HostCommitted to Idle"
+        );
+        let after = (
+            std::fs::metadata(&path).unwrap().ino(),
+            std::fs::read(&path).unwrap(),
+        );
+        assert_eq!(after, before, "trial.json must not be rewritten");
+    }
 }

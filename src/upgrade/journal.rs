@@ -384,18 +384,34 @@ impl BootRecords {
     /// Existing legacy intent is diagnostic and keeps the pre-M2 planner
     /// contract. Any M2, unknown or corrupt record prevents a new apply.
     ///
-    /// A settled journal alone (Idle or Superseded, #2012) does not: it is
-    /// history that the next transaction replaces. Every other phase, and a
-    /// corrupt or unknown journal, still does.
+    /// A settled journal (Idle or Superseded, #2012) does not block apply,
+    /// nor does a boot record belonging to that same settled transaction.
+    /// Every other phase, mismatched boot record, or corrupt/unknown record
+    /// still blocks apply.
     pub(crate) fn blocks_apply(&self) -> bool {
-        let settled_journal = matches!(
-            &self.journal,
-            RecordRead::Journal(record) if matches!(record.phase, Phase::Idle | Phase::Superseded)
+        let settled = match &self.journal {
+            RecordRead::Journal(record)
+                if matches!(record.phase, Phase::Idle | Phase::Superseded) =>
+            {
+                Some((record.transaction_id.as_str(), record.generation))
+            }
+            _ => None,
+        };
+        let journal_blocks = settled.is_none() && !matches!(self.journal, RecordRead::Missing);
+        let handoff_blocks = !matches!(
+            self.handoff,
+            RecordRead::Missing | RecordRead::LegacyHandoff(_)
         );
-        (!settled_journal && !matches!(self.journal, RecordRead::Missing))
-            || [&self.handoff, &self.boot]
-                .iter()
-                .any(|record| !matches!(record, RecordRead::Missing | RecordRead::LegacyHandoff(_)))
+        let boot_blocks = match (&self.boot, settled) {
+            (RecordRead::Missing | RecordRead::LegacyHandoff(_), _) => false,
+            (RecordRead::Boot(boot), Some((tx_id, generation)))
+                if boot.transaction_id == tx_id && boot.generation == generation =>
+            {
+                false
+            }
+            _ => true,
+        };
+        journal_blocks || handoff_blocks || boot_blocks
     }
 
     pub(crate) fn diagnostic(&self) -> Option<String> {
@@ -1302,6 +1318,103 @@ mod refusal_diagnostics_tests {
             .unwrap()
             .contains("M2 recovery is not active"));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn settled_journal_allows_its_own_boot_record_but_blocks_mismatched_or_unsettled() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_boot = |tx: &str, generation: u64| {
+            RecordRead::Boot(BootRecord {
+                schema_version: SCHEMA_VERSION,
+                record_kind: "boot".into(),
+                transaction_id: tx.into(),
+                generation,
+                instance_id: "alice".into(),
+                attempt: 1,
+                pid: 42,
+                process_start: 1,
+                boot_id: "boot-a".into(),
+                started_at_ns: 1,
+                deadline_ns: 2,
+            })
+        };
+        let make_journal = |tx: &str, generation: u64, phase: Phase| {
+            let root = dir.path();
+            RecordRead::Journal(Box::new(JournalRecord {
+                schema_version: SCHEMA_VERSION,
+                record_kind: "journal".into(),
+                transaction_id: tx.into(),
+                sequence: 1,
+                generation,
+                plan: FrozenPlan {
+                    previous_version: "0.50.0".into(),
+                    candidate_version: "0.51.0".into(),
+                    manifest_sha256: [0x11; 32],
+                    daemon: ArtifactPlan {
+                        target_path: root.join("x0xd"),
+                        staged_path: root.join("x0xd.staged"),
+                        backup_path: root.join("x0xd.backup"),
+                        previous_sha256: [0x22; 32],
+                        candidate_sha256: [0x33; 32],
+                    },
+                    cli: ArtifactPlan {
+                        target_path: root.join("x0x"),
+                        staged_path: root.join("x0x.staged"),
+                        backup_path: root.join("x0x.backup"),
+                        previous_sha256: [0x44; 32],
+                        candidate_sha256: [0x55; 32],
+                    },
+                    participants: Vec::new(),
+                },
+                phase,
+                cause: None,
+                daemon_progress: ArtifactProgress {
+                    swapped: true,
+                    restored: false,
+                    observed_sha256: None,
+                },
+                cli_progress: ArtifactProgress {
+                    swapped: true,
+                    restored: false,
+                    observed_sha256: None,
+                },
+            }))
+        };
+
+        let settled_matching = BootRecords {
+            journal: make_journal("tx-1", 3, Phase::Idle),
+            handoff: RecordRead::Missing,
+            boot: make_boot("tx-1", 3),
+        };
+        assert!(!settled_matching.blocks_apply());
+
+        let superseded_matching = BootRecords {
+            journal: make_journal("tx-1", 3, Phase::Superseded),
+            handoff: RecordRead::Missing,
+            boot: make_boot("tx-1", 3),
+        };
+        assert!(!superseded_matching.blocks_apply());
+
+        let mismatched_tx = BootRecords {
+            journal: make_journal("tx-1", 3, Phase::Idle),
+            handoff: RecordRead::Missing,
+            boot: make_boot("tx-other", 3),
+        };
+        assert!(mismatched_tx.blocks_apply());
+
+        let mismatched_gen = BootRecords {
+            journal: make_journal("tx-1", 3, Phase::Idle),
+            handoff: RecordRead::Missing,
+            boot: make_boot("tx-1", 4),
+        };
+        assert!(mismatched_gen.blocks_apply());
+
+        let unsettled_matching = BootRecords {
+            journal: make_journal("tx-1", 3, Phase::HostCommitted),
+            handoff: RecordRead::Missing,
+            boot: make_boot("tx-1", 3),
+        };
+        assert!(unsettled_matching.blocks_apply());
     }
 }
 

@@ -463,15 +463,7 @@ fn a_companion_failure_is_recorded_and_backs_off_until_cleared() {
     );
     assert!(refused.to_string().contains(record::RECORD), "{refused}");
     assert!(refuse_backed_off(root, "9.0.1").is_ok(), "a newer release");
-    let ran = Arc::new(AtomicBool::new(false));
-    let seen = Arc::clone(&ran);
-    let cont = clearing_companion_record(
-        root.to_path_buf(),
-        Box::new(move |_, _| seen.store(true, Ordering::SeqCst)),
-    );
-    let lock = super::super::acquire_install_lock(&root.join("x0xd")).unwrap();
-    cont(&[], HeldInstallLocks::files(&[], None, lock.into_file()));
-    assert!(ran.load(Ordering::SeqCst));
+    record::clear(root);
     assert_eq!(record::read(root), Read::Missing);
     assert!(refuse_backed_off(root, "9.0.0").is_ok());
     let mixed = companion_failure(
@@ -484,4 +476,87 @@ fn a_companion_failure_is_recorded_and_backs_off_until_cleared() {
     );
     note_companion_failure(root, "9.0.0", mixed);
     assert!(matches!(record::read(root), Read::Record(r) if r.pair_mixed));
+}
+
+#[tokio::test]
+async fn apply_upgrade_from_manifest_refuses_backed_off_release() {
+    use super::super::companion_failure::{self as record, Read};
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let target = root.join("x0xd");
+    std::fs::write(&target, b"old-daemon").unwrap();
+    let version = "99.9.9";
+    let failure = companion_failure(Path::new("/opt/x0x/x0x"), "denied", "nothing was replaced");
+    note_companion_failure(root, version, failure);
+    assert!(matches!(record::read(root), Read::Record(_)));
+
+    let target_triple = current_platform_target().expect("supported test platform");
+    let manifest = ReleaseManifest {
+        schema_version: super::super::manifest::SCHEMA_VERSION,
+        version: version.to_string(),
+        channel: "stable".to_string(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        assets: vec![super::super::manifest::PlatformAsset {
+            target: target_triple.to_string(),
+            archive_url: "https://example.invalid/x0x.tar.gz".to_string(),
+            archive_sha256: [0x11; 32],
+            signature_url: "https://example.invalid/x0x.tar.gz.sig".to_string(),
+        }],
+        skill_url: "https://example.invalid/SKILL.md".to_string(),
+        skill_sha256: [0x22; 32],
+    };
+
+    let upgrader = AutoApplyUpgrader::new("x0xd")
+        .with_restart_on_success(false)
+        .with_restart_context(RestartContext {
+            data_dir: Some(root.to_path_buf()),
+            api_addr: None,
+            shutdown: None,
+        });
+    let err = upgrader
+        .apply_upgrade_from_manifest(&manifest)
+        .await
+        .expect_err("backed-off release must be refused by apply_upgrade_from_manifest");
+    assert!(
+        err.to_string().starts_with(record::BACKOFF),
+        "expected companion backoff refusal, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn no_restart_success_clears_companion_failure_record_under_locks() {
+    use super::super::companion_failure::{self as record, Read};
+    let pair = Pair::new();
+    let root = pair.root.path();
+    let failure = companion_failure(&pair.cli, "denied", "nothing was replaced");
+    note_companion_failure(root, "2.0.0", failure);
+    assert!(matches!(record::read(root), Read::Record(_)));
+
+    let result = apply_replacements_with_producer(
+        Upgrader::new(pair.daemon.clone(), semver::Version::new(1, 0, 0)),
+        pair.scratch.join("daemon"),
+        semver::Version::new(2, 0, 0),
+        pair.companion(semver::Version::new(1, 0, 0)),
+        TempDirGuard {
+            path: pair.scratch.clone(),
+        },
+        None,
+        None,
+        None,
+        None,
+        Some(root.to_path_buf()),
+        #[cfg(unix)]
+        None,
+    )
+    .await
+    .expect("apply without restart owner succeeds");
+    assert!(matches!(result, UpgradeResult::Success { .. }));
+    assert_eq!(
+        record::read(root),
+        Read::Missing,
+        "companion failure record must be cleared on no-restart success"
+    );
 }

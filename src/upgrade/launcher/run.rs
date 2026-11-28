@@ -42,7 +42,14 @@ pub(super) fn run_trial(
         if stop() {
             return Ok(Outcome::Stopped);
         }
-        return Ok(Outcome::Committed);
+        // A crash between saving Committed and writing Idle leaves the journal
+        // HostCommitted (#2012): retry retire so the journal settles once every
+        // participant is Committed (no-op if already Idle).
+        match retire(host, path, trial)? {
+            Retire::Retired => return Ok(Outcome::Committed),
+            Retire::Uncommitted => return Err(uncommitted()),
+            Retire::NotCommitted => return Err(invalid("committed trial on uncommitted host")),
+        }
     }
     if trial.phase == Phase::Restored {
         // An intentional stop starts no restored child; the trial stays
