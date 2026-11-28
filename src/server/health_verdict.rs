@@ -500,15 +500,25 @@ fn companion_sample(
     bool,
 ) {
     use crate::upgrade::companion_failure::{current, Read};
+    static UNREADABLE_COMPANION_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     match current(data_dir) {
-        Read::Record(record) => (Some(record), false),
+        Read::Record(record) => {
+            UNREADABLE_COMPANION_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+            (Some(record), false)
+        }
         Read::Unreadable => {
-            tracing::warn!(
-                "the companion failure record cannot be read; it is reported and ignored"
-            );
+            if !UNREADABLE_COMPANION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "the companion failure record cannot be read; it is reported and ignored"
+                );
+            }
             (None, true)
         }
-        Read::Missing => (None, false),
+        Read::Missing => {
+            UNREADABLE_COMPANION_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+            (None, false)
+        }
     }
 }
 
