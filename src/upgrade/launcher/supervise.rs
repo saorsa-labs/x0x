@@ -1671,4 +1671,95 @@ mod tests {
         );
         assert_eq!(after, before, "trial.json must not be rewritten");
     }
+
+    #[test]
+    fn retire_settles_host_committed_to_idle_when_another_participant_was_not_running() {
+        let (_dir, root, host, record) = fixture_with(journal::Phase::SwappedCli, |record| {
+            let mut idle = record.plan.participants[0].clone();
+            idle.instance_id = "bob".into();
+            idle.data_root = record.plan.participants[0].data_root.join("bob");
+            std::fs::create_dir(&idle.data_root).unwrap();
+            idle.identity_root = idle.data_root.clone();
+            idle.old_pid = None;
+            idle.process_start = None;
+            idle.was_running = false;
+            record.plan.participants.push(idle);
+        });
+        let alice = &host.plan().participants[0];
+        let path = coordinator::trial_path(alice);
+        let mut trial = provisional(&host, &path, gone_child());
+        let boot_path = root.join(journal::BOOT_FILE_NAME);
+        let matching_boot = journal::BootRecord {
+            schema_version: 1,
+            record_kind: "boot".into(),
+            transaction_id: record.transaction_id.clone(),
+            generation: record.generation,
+            instance_id: "alice".into(),
+            attempt: 1,
+            pid: 4300,
+            process_start: 1,
+            boot_id: "fixture-boot".into(),
+            started_at_ns: 1,
+            deadline_ns: 2,
+        };
+        journal::write_record(&boot_path, &matching_boot).unwrap();
+        set_journal_phase(&root, journal::Phase::HostCommitted);
+
+        assert_eq!(
+            run::retire(&host, &path, &mut trial).unwrap(),
+            run::Retire::Retired
+        );
+        assert_eq!(trial.phase, Phase::Committed);
+        assert_eq!(
+            journal_phase(&root),
+            journal::Phase::Idle,
+            "a stopped participant (was_running=false) has no trial and must not block Idle"
+        );
+        assert!(
+            !boot_path.exists(),
+            "settle_idle must remove the transaction's matching upgrade-boot.json"
+        );
+        assert!(
+            !journal::read_boot_records(&root).blocks_apply(),
+            "settled Idle host must not block subsequent applies"
+        );
+    }
+
+    #[test]
+    fn settle_idle_preserves_foreign_boot_record() {
+        let (_dir, root, host, record) = fixture(journal::Phase::SwappedCli);
+        let alice = &host.plan().participants[0];
+        let path = coordinator::trial_path(alice);
+        let mut trial = provisional(&host, &path, gone_child());
+        let boot_path = root.join(journal::BOOT_FILE_NAME);
+        let foreign_boot = journal::BootRecord {
+            schema_version: 1,
+            record_kind: "boot".into(),
+            transaction_id: "tx-foreign".into(),
+            generation: record.generation,
+            instance_id: "alice".into(),
+            attempt: 1,
+            pid: 4300,
+            process_start: 1,
+            boot_id: "fixture-boot".into(),
+            started_at_ns: 1,
+            deadline_ns: 2,
+        };
+        journal::write_record(&boot_path, &foreign_boot).unwrap();
+        set_journal_phase(&root, journal::Phase::HostCommitted);
+
+        assert_eq!(
+            run::retire(&host, &path, &mut trial).unwrap(),
+            run::Retire::Retired
+        );
+        assert_eq!(journal_phase(&root), journal::Phase::Idle);
+        assert!(
+            boot_path.exists(),
+            "settle_idle must leave a foreign transaction's boot record intact"
+        );
+        assert!(
+            journal::read_boot_records(&root).blocks_apply(),
+            "a foreign boot record beside Idle must keep blocking apply"
+        );
+    }
 }
