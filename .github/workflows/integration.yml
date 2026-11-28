@@ -176,7 +176,8 @@ jobs:
       - name: Run doctor bundle redaction proof
         run: bash scripts/ci/nextest-isolated.sh --all-features --test doctor_bundle -- -- --ignored
       - name: Run bound-port forwarding regression
-        run: bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
+        timeout-minutes: 10
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test forward_bound_port -- --run-ignored ignored-only --no-tests=fail -E 'test(=port_zero_forwards_are_listed_and_removed_by_bound_address)'
 
   # Agent-usability eval (#1174): a fresh agent driven only by `x0x onboard`
   # output plus the core SKILL.md must send a DM, join a group and write a
