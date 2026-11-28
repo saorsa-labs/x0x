@@ -14,6 +14,7 @@ use axum::Router;
 use tokio::sync::{mpsc, Notify};
 use tower::ServiceExt as _;
 
+use crate::groups::{GroupPublicMessage, GroupPublicMessageKind};
 use crate::history::{Direction, HistoryRecord, Provenance, Scope};
 use crate::identity::{AgentId, MachineId};
 use crate::profile::CertMode;
@@ -21,10 +22,10 @@ use crate::server::config::analyze;
 use crate::server::rider_auth::unix_now_secs;
 use crate::server::webhook::{
     compute_backoff_ms, dm_dedupe_key, group_dedupe_key, hmac_sha256, is_echo_author_with_roster,
-    is_ip_ssrf_blocked, mention_dedupe_key, sign_payload, BatchDisposition, DeliveryOutcome, Lane,
-    NotifyConfig, QueuedWebhookItem, ValidatedWebhook, WebhookBodyMode, WebhookConfig,
-    WebhookConfigError, WebhookDedupeStore, WebhookPayloadItem, WebhookPostBody, WebhookScheduler,
-    WebhookService, MAX_RETRYABLE_ATTEMPTS,
+    is_ip_ssrf_blocked, mention_dedupe_key, sign_payload, test_ssrf_resolver, BatchDisposition,
+    DeliveryOutcome, Lane, NotifyConfig, QueuedWebhookItem, ValidatedWebhook, WebhookBodyMode,
+    WebhookConfig, WebhookConfigError, WebhookDedupeStore, WebhookPayloadItem, WebhookPostBody,
+    WebhookScheduler, WebhookService, MAX_RETRYABLE_ATTEMPTS,
 };
 use crate::server::ws::{emit_mention_event, MentionFrame};
 use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
@@ -178,6 +179,7 @@ fn ssrf_ip_classifier_blocks_non_public_and_allows_public() {
         IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254)),
         IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(192, 88, 99, 1)),
         IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
         IpAddr::V6(Ipv6Addr::LOCALHOST),
         IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -185,9 +187,12 @@ fn ssrf_ip_classifier_blocks_non_public_and_allows_public() {
         IpAddr::V6("fc00::1".parse().expect("ipv6")),
         IpAddr::V6("fd12:3456:789a::1".parse().expect("ipv6")),
         IpAddr::V6("ff02::1".parse().expect("ipv6")),
+        IpAddr::V6("::127.0.0.1".parse().expect("ipv6")),
         IpAddr::V6("::ffff:127.0.0.1".parse().expect("ipv6")),
         IpAddr::V6("::ffff:10.0.0.1".parse().expect("ipv6")),
         IpAddr::V6("64:ff9b::127.0.0.1".parse().expect("ipv6")),
+        IpAddr::V6("64:ff9b:1::1".parse().expect("ipv6")),
+        IpAddr::V6("2001:2::1".parse().expect("ipv6")),
         IpAddr::V6("2002:7f00:0001::1".parse().expect("ipv6")),
         IpAddr::V6("2002:0a00:0001::1".parse().expect("ipv6")),
         IpAddr::V6(
@@ -363,7 +368,7 @@ fn echo_filtering_drops_self_and_riders_but_keeps_acp_and_external() {
 fn dedupe_store_persists_across_reopen_isolates_webhooks_and_expires_after_7_days() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("webhook_state.db");
-    let dm_key = dm_dedupe_key(&"aa".repeat(32), b"hello");
+    let dm_key = dm_dedupe_key(&"aa".repeat(32), 1_700_000_000_000, b"hello");
     let grp_key = group_dedupe_key(&"bb".repeat(32), 1_700_000_000_123, "0123456789abcdef9999");
     let m_key = mention_dedupe_key("msg-42");
 
@@ -675,12 +680,38 @@ async fn webhook_dm_mention_restart_dedupe_end_to_end() {
     let handle2 = serve_with_options(cfg2, test_serve_options())
         .await
         .expect("serve daemon 2");
+    let state2 = handle2.test_state.upgrade().expect("live state 2");
     let replay = tokio::time::timeout(Duration::from_millis(400), posts.recv()).await;
     assert!(
         replay.is_err(),
         "restart must not replay already delivered DM"
     );
 
+    // Positive control: a new DM after restart IS delivered (proves daemon 2 pipeline is live).
+    state2
+        .agent
+        .direct_messaging_for_test()
+        .handle_incoming(
+            sender_machine,
+            sender_agent,
+            b"post-restart fresh dm".to_vec(),
+            true,
+            None,
+            None,
+        )
+        .await;
+    let post_restart = tokio::time::timeout(Duration::from_secs(3), posts.recv())
+        .await
+        .expect("post-restart fresh dm timeout")
+        .expect("post-restart fresh dm post");
+    let post_body = verify_signed_post(&post_restart, bearer_val, signing_val.as_bytes());
+    assert_eq!(post_body.items.len(), 1);
+    assert_eq!(
+        post_body.items[0].text.as_deref(),
+        Some("post-restart fresh dm")
+    );
+
+    drop(state2);
     handle2.shutdown_and_wait().await.expect("shutdown 2");
     recv_task.abort();
 }
@@ -1219,4 +1250,264 @@ async fn webhook_retries_429_and_408_and_drops_forged_group_messages() {
     drop(state);
     handle.shutdown_and_wait().await.expect("shutdown");
     srv.abort();
+}
+
+#[test]
+fn dm_dedupe_dedupes_within_window_and_allows_identical_repeat_after_window() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("webhook_state.db");
+    let sender = "aa".repeat(32);
+    let now_secs = unix_now_secs() as i64;
+    let t0_ms = (now_secs as u64) * 1_000;
+    let k_initial = dm_dedupe_key(&sender, t0_ms, b"ok");
+    let k_skewed = dm_dedupe_key(&sender, t0_ms + 750, b"ok");
+    let k_later = dm_dedupe_key(&sender, t0_ms + 120_000, b"ok");
+
+    let mut store = WebhookDedupeStore::open(&db_path).expect("open");
+    store
+        .mark_delivered("hook-a", std::slice::from_ref(&k_initial), now_secs)
+        .expect("mark");
+    assert!(
+        store
+            .is_delivered("hook-a", &k_skewed, now_secs)
+            .expect("skewed"),
+        "same DM with 750 ms clock skew must be deduped"
+    );
+    assert!(
+        !store
+            .is_delivered("hook-a", &k_later, now_secs + 120)
+            .expect("later"),
+        "identical DM 2 minutes later must not be suppressed"
+    );
+
+    let mut sched = WebhookScheduler::new(100, 1_000, 100, 100, 16);
+    assert!(sched.enqueue(sample_item(&k_initial, Lane::Fast, "dm", Some("ok")), t0_ms));
+    // Skewed live/backfill overlap within 60s coalesces into a single queued item.
+    assert!(sched.enqueue(
+        sample_item(&k_skewed, Lane::Fast, "dm", Some("ok")),
+        t0_ms + 750
+    ));
+    assert_eq!(sched.queue_depth(), 1);
+    // Repeat 2 minutes later enqueues as a distinct item.
+    assert!(sched.enqueue(
+        sample_item(&k_later, Lane::Fast, "dm", Some("ok")),
+        t0_ms + 120_000
+    ));
+    assert_eq!(sched.queue_depth(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_ssrf_resolver_blocks_localhost_and_client_refuses_redirects() {
+    use reqwest::dns::{Name, Resolve};
+    let resolver = test_ssrf_resolver(false);
+    let name: Name = "localhost".parse().expect("dns name");
+    let resolved = resolver.resolve(name).await;
+    assert!(
+        resolved.is_err(),
+        "SsrfCheckedResolver must reject loopback resolution when test bypass is off"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let redirect_target_hits = Arc::new(AtomicUsize::new(0));
+    let target_hits_route = Arc::clone(&redirect_target_hits);
+    let source_hits = Arc::new(AtomicUsize::new(0));
+    let source_hits_route = Arc::clone(&source_hits);
+    let source_notified = Arc::new(Notify::new());
+    let source_notified_route = Arc::clone(&source_notified);
+
+    let app = Router::new()
+        .route(
+            "/redirect",
+            post(move || {
+                let hits = Arc::clone(&source_hits_route);
+                let notify = Arc::clone(&source_notified_route);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    notify.notify_waiters();
+                    (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/secret-target")],
+                    )
+                }
+            }),
+        )
+        .route(
+            "/secret-target",
+            post(move || {
+                let hits = Arc::clone(&target_hits_route);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind redirect server");
+    let addr = listener.local_addr().expect("redirect addr");
+    let srv = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let wh = WebhookConfig {
+        name: "no-redirect".to_string(),
+        url: format!("http://{addr}/redirect"),
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        events: vec!["mention".to_string()],
+        fast_window_ms: 30,
+        batch_window_ms: 200,
+        max_per_hour: 10,
+        max_per_day: 100,
+        allow_insecure_loopback_for_test: true,
+        ..WebhookConfig::default()
+    };
+    let plane = format!("x0x.test.webhook.redir.{}", std::process::id());
+    let cfg = hermetic_daemon_config(tmp.path(), &plane, vec![wh]);
+    let handle = serve_with_options(cfg, test_serve_options())
+        .await
+        .expect("serve daemon");
+    let state = handle.test_state.upgrade().expect("state");
+
+    emit_mention_event(
+        &state,
+        MentionFrame {
+            topic: "x0x.groups.public.g1".to_string(),
+            group_id: "g1".to_string(),
+            msg_id: "redir-msg-1".to_string(),
+            author_agent_id: "88".repeat(32),
+            reason: "mention".to_string(),
+            mentions: vec![hex::encode(state.agent.agent_id().as_bytes())],
+            timestamp: unix_now_secs() * 1_000,
+            body: Some("redirect check".to_string()),
+        },
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(3), source_notified.notified())
+        .await
+        .expect("redirect endpoint hit");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        redirect_target_hits.load(Ordering::SeqCst),
+        0,
+        "webhook HTTP client must never follow 3xx redirects"
+    );
+
+    drop(state);
+    handle.shutdown_and_wait().await.expect("shutdown");
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_metadata_truncation_and_validated_group_delivery_end_to_end() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (recv_addr, mut posts, recv_task) = start_capture_receiver().await;
+    let sender_agent = AgentId([0x31; 32]);
+    let sender_machine = MachineId([0x32; 32]);
+    let sender_hex = hex::encode(sender_agent.as_bytes());
+    let group_id = "validated-group-1".to_string();
+
+    let meta_wh = WebhookConfig {
+        name: "meta-hook".to_string(),
+        url: format!("http://{recv_addr}/hook/secret-path-id"),
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        events: vec!["dm".to_string()],
+        fast_window_ms: 40,
+        batch_window_ms: 40,
+        max_per_hour: 20,
+        max_per_day: 100,
+        body_mode: WebhookBodyMode::Metadata,
+        allow_insecure_loopback_for_test: true,
+        ..WebhookConfig::default()
+    };
+    let trunc_group_wh = WebhookConfig {
+        name: "group-trunc-hook".to_string(),
+        url: format!("http://{recv_addr}/hook/secret-path-id"),
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        events: vec![format!("group:{group_id}")],
+        fast_window_ms: 40,
+        batch_window_ms: 40,
+        max_per_hour: 20,
+        max_per_day: 100,
+        body_mode: WebhookBodyMode::Full,
+        max_text_chars: 5,
+        allow_insecure_loopback_for_test: true,
+        ..WebhookConfig::default()
+    };
+
+    let plane = format!("x0x.test.webhook.meta.{}", std::process::id());
+    let cfg = hermetic_daemon_config(tmp.path(), &plane, vec![meta_wh, trunc_group_wh]);
+    let handle = serve_with_options(cfg, test_serve_options())
+        .await
+        .expect("serve daemon");
+    let state = handle.test_state.upgrade().expect("state");
+
+    // 1. Metadata-mode DM must omit `text` completely on the wire.
+    state
+        .agent
+        .direct_messaging_for_test()
+        .handle_incoming(
+            sender_machine,
+            sender_agent,
+            b"secret body must not egress".to_vec(),
+            true,
+            None,
+            None,
+        )
+        .await;
+
+    // 2. Validated public group message via post-validation tee must deliver truncated text.
+    let pm = GroupPublicMessage {
+        group_id: group_id.clone(),
+        state_hash_at_send: "00".repeat(32),
+        revision_at_send: 1,
+        author_agent_id: sender_hex.clone(),
+        author_public_key: String::new(),
+        author_user_id: None,
+        body: "Hello🌍world".to_string(),
+        timestamp: unix_now_secs() * 1_000,
+        signature: "ab".repeat(32),
+        kind: GroupPublicMessageKind::Chat,
+        thread_root: None,
+        thread_parent: None,
+        mentions: Vec::new(),
+        rider_provenance: None,
+        delegation_digest: None,
+    };
+    state
+        .webhook_service
+        .as_ref()
+        .expect("webhook service active")
+        .try_send_public_message(&group_id, &pm);
+
+    let mut seen_meta = false;
+    let mut seen_group = false;
+    for _ in 0..2 {
+        let post = tokio::time::timeout(Duration::from_secs(3), posts.recv())
+            .await
+            .expect("webhook post timeout")
+            .expect("webhook post");
+        let val: serde_json::Value = serde_json::from_slice(&post.body).expect("json");
+        match val["webhook"].as_str() {
+            Some("meta-hook") => {
+                let item = val["items"][0].as_object().expect("item");
+                assert_eq!(item["kind"], "dm");
+                assert!(!item.contains_key("text"), "metadata mode must omit text");
+                seen_meta = true;
+            }
+            Some("group-trunc-hook") => {
+                let item = val["items"][0].as_object().expect("item");
+                assert_eq!(item["kind"], "group");
+                assert_eq!(item["group_id"], group_id);
+                assert_eq!(item["text"], "Hello");
+                seen_group = true;
+            }
+            other => panic!("unexpected webhook {other:?}"),
+        }
+    }
+    assert!(seen_meta && seen_group);
+
+    drop(state);
+    handle.shutdown_and_wait().await.expect("shutdown");
+    recv_task.abort();
 }

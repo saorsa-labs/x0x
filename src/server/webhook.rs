@@ -35,6 +35,7 @@ use super::ws::MentionFrame;
 
 const WEBHOOK_STATE_DB_NAME: &str = "webhook_state.db";
 const DEDUPE_TTL_SECS: i64 = 7 * 86_400;
+const DM_DEDUPE_WINDOW_MS: i64 = 60_000;
 const DEDUPE_BACKFILL_MARGIN_MS: i64 = 60_000;
 const BACKFILL_OVERLAP_MS: i64 = 2_000;
 const DEDUPE_PRUNE_INTERVAL_SECS: i64 = 3_600;
@@ -363,6 +364,7 @@ fn is_ipv4_ssrf_blocked(ip: Ipv4Addr) -> bool {
         || (a == 100 && (b & 0xc0) == 64)
         || (a == 192 && b == 0 && c == 0)
         || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
         || (a == 198 && (b == 18 || b == 19))
         || (a == 198 && b == 51 && c == 100)
         || (a == 203 && b == 0 && c == 113)
@@ -431,6 +433,8 @@ fn is_ipv6_ssrf_blocked(ip: Ipv6Addr) -> bool {
         || (segs[0] & 0xffc0) == 0xfe80
         || (segs[0] & 0xffc0) == 0xfec0
         || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+        || (segs[0] == 0x2001 && segs[1] == 0x0002 && segs[2] == 0)
+        || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001)
         || (segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0)
 }
 
@@ -450,6 +454,13 @@ fn check_ip_allowed(ip: IpAddr, allow_loopback_for_test: bool) -> Result<(), Web
         return Err(WebhookConfigError::BlockedIp(ip));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn test_ssrf_resolver(allow_loopback_for_test: bool) -> impl Resolve {
+    SsrfCheckedResolver {
+        allow_loopback_for_test,
+    }
 }
 
 struct SsrfCheckedResolver {
@@ -722,7 +733,16 @@ impl WebhookDedupeStore {
                  sent_at_ms INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_webhook_sent_log
-                 ON sent_log (webhook_name, sent_at_ms);",
+                 ON sent_log (webhook_name, sent_at_ms);
+             CREATE TABLE IF NOT EXISTS dm_deliveries (
+                 webhook_name TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 receipt_ms INTEGER NOT NULL,
+                 delivered_at INTEGER NOT NULL,
+                 PRIMARY KEY (webhook_name, content_hash, receipt_ms)
+             );
+             CREATE INDEX IF NOT EXISTS idx_webhook_dm_delivered_at
+                 ON dm_deliveries (delivered_at);",
         )?;
         let now_secs = unix_now_secs() as i64;
         let mut store = Self {
@@ -735,8 +755,12 @@ impl WebhookDedupeStore {
 
     pub(crate) fn prune_expired(&mut self, now_secs: i64) -> Result<usize, rusqlite::Error> {
         let cutoff = now_secs.saturating_sub(DEDUPE_TTL_SECS);
-        let deleted = self.conn.execute(
+        let deleted_keys = self.conn.execute(
             "DELETE FROM delivered_keys WHERE delivered_at < ?1",
+            rusqlite::params![cutoff],
+        )?;
+        let deleted_dms = self.conn.execute(
+            "DELETE FROM dm_deliveries WHERE delivered_at < ?1",
             rusqlite::params![cutoff],
         )?;
         let sent_cutoff_ms = now_secs.saturating_mul(1_000).saturating_sub(DAY_MS as i64);
@@ -745,7 +769,7 @@ impl WebhookDedupeStore {
             rusqlite::params![sent_cutoff_ms],
         )?;
         self.last_prune_secs = now_secs;
-        Ok(deleted)
+        Ok(deleted_keys + deleted_dms)
     }
 
     /// Return `(cursor_ms, is_first_enable)` for `webhook_name`.
@@ -817,12 +841,42 @@ impl WebhookDedupeStore {
         Ok(())
     }
 
+    pub(crate) fn is_dm_delivered(
+        &self,
+        webhook_name: &str,
+        content_hash: &str,
+        receipt_ms: i64,
+        now_secs: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let cutoff = now_secs.saturating_sub(DEDUPE_TTL_SECS);
+        let lo = receipt_ms.saturating_sub(DM_DEDUPE_WINDOW_MS);
+        let hi = receipt_ms.saturating_add(DM_DEDUPE_WINDOW_MS);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT 1 FROM dm_deliveries
+             WHERE webhook_name = ?1
+               AND content_hash = ?2
+               AND receipt_ms BETWEEN ?3 AND ?4
+               AND delivered_at >= ?5
+             LIMIT 1",
+        )?;
+        stmt.exists(rusqlite::params![
+            webhook_name,
+            content_hash,
+            lo,
+            hi,
+            cutoff
+        ])
+    }
+
     pub(crate) fn is_delivered(
         &self,
         webhook_name: &str,
         dedupe_key: &str,
         now_secs: i64,
     ) -> Result<bool, rusqlite::Error> {
+        if let Some((content_hash, receipt_ms)) = parse_dm_dedupe_key(dedupe_key) {
+            return self.is_dm_delivered(webhook_name, content_hash, receipt_ms, now_secs);
+        }
         let cutoff = now_secs.saturating_sub(DEDUPE_TTL_SECS);
         let mut stmt = self.conn.prepare_cached(
             "SELECT 1 FROM delivered_keys
@@ -855,12 +909,26 @@ impl WebhookDedupeStore {
         }
         let tx = self.conn.transaction()?;
         if !keys.is_empty() {
-            let mut stmt = tx.prepare_cached(
+            let mut key_stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO delivered_keys (webhook_name, dedupe_key, delivered_at)
                  VALUES (?1, ?2, ?3)",
             )?;
+            let mut dm_stmt = tx.prepare_cached(
+                "INSERT OR REPLACE INTO dm_deliveries
+                 (webhook_name, content_hash, receipt_ms, delivered_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
             for key in keys {
-                stmt.execute(rusqlite::params![webhook_name, key, now_secs])?;
+                if let Some((content_hash, receipt_ms)) = parse_dm_dedupe_key(key) {
+                    dm_stmt.execute(rusqlite::params![
+                        webhook_name,
+                        content_hash,
+                        receipt_ms,
+                        now_secs
+                    ])?;
+                } else {
+                    key_stmt.execute(rusqlite::params![webhook_name, key, now_secs])?;
+                }
             }
         }
         if let Some(cursor_ms) = advance_cursor_ms {
@@ -879,12 +947,26 @@ impl WebhookDedupeStore {
     }
 }
 
-pub(crate) fn dm_dedupe_key(sender_hex: &str, payload: &[u8]) -> String {
+fn dm_content_hash(sender_hex: &str, payload: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(sender_hex.to_ascii_lowercase().as_bytes());
     hasher.update(b"|");
     hasher.update(payload);
-    format!("dm:{}", hex::encode(hasher.finalize()))
+    hex::encode(hasher.finalize())
+}
+
+pub(crate) fn dm_dedupe_key(sender_hex: &str, receipt_ms: u64, payload: &[u8]) -> String {
+    format!("dm:{}:{receipt_ms}", dm_content_hash(sender_hex, payload))
+}
+
+fn parse_dm_dedupe_key(key: &str) -> Option<(&str, i64)> {
+    let rest = key.strip_prefix("dm:")?;
+    let (content_hash, ts_str) = rest.split_once(':')?;
+    if content_hash.len() != 64 {
+        return None;
+    }
+    let receipt_ms = ts_str.parse::<i64>().ok()?;
+    Some((content_hash, receipt_ms))
 }
 
 pub(crate) fn group_dedupe_key(author: &str, timestamp: u64, signature: &str) -> String {
@@ -1081,6 +1163,17 @@ impl WebhookScheduler {
     pub(crate) fn enqueue(&mut self, item: QueuedWebhookItem, now_ms: u64) -> bool {
         if self.queued_keys.contains(&item.dedupe_key) {
             return true;
+        }
+        if let Some((content_hash, receipt_ms)) = parse_dm_dedupe_key(&item.dedupe_key) {
+            let dup_dm = self.queued_keys.iter().any(|existing| {
+                parse_dm_dedupe_key(existing).is_some_and(|(h, existing_ms)| {
+                    h == content_hash
+                        && existing_ms.abs_diff(receipt_ms) <= DM_DEDUPE_WINDOW_MS as u64
+                })
+            });
+            if dup_dm {
+                return true;
+            }
         }
         let current_queued = self.fast_queue.len() + self.batch_queue.len();
         if current_queued >= self.max_queue_items {
@@ -1698,6 +1791,8 @@ impl WebhookService {
         let mut mention_subscribers: Vec<TargetSubscriber> = Vec::new();
         let mut group_subscribers: std::collections::HashMap<String, Vec<TargetSubscriber>> =
             std::collections::HashMap::new();
+        let mut group_query_aliases: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         let mut topic_subscribers: std::collections::HashMap<String, Vec<TargetSubscriber>> =
             std::collections::HashMap::new();
         let mut groups_to_reconcile: Vec<String> = Vec::new();
@@ -1728,16 +1823,19 @@ impl WebhookService {
             for raw_gid in target.config.group_ids() {
                 let resolved = {
                     let groups = state.named_groups.read().await;
-                    crate::server::resolve_group_entry_locked(&groups, &raw_gid).map(|(_, info)| {
-                        (
-                            info.stable_group_id().to_string(),
-                            info.policy.confidentiality == GroupConfidentiality::MlsEncrypted,
-                            info.withdrawn,
-                        )
-                    })
+                    crate::server::resolve_group_entry_locked(&groups, &raw_gid).map(
+                        |(local_key, info)| {
+                            (
+                                local_key.to_string(),
+                                info.stable_group_id().to_string(),
+                                info.policy.confidentiality == GroupConfidentiality::MlsEncrypted,
+                                info.withdrawn,
+                            )
+                        },
+                    )
                 };
-                let subscribe_key = match resolved {
-                    Some((stable_id, is_mls, withdrawn)) => {
+                let (subscribe_key, aliases) = match resolved {
+                    Some((local_key, stable_id, is_mls, withdrawn)) => {
                         if is_mls || withdrawn {
                             tracing::warn!(
                                 webhook = %target.config.name,
@@ -1748,7 +1846,10 @@ impl WebhookService {
                         } else if !groups_to_reconcile.contains(&stable_id) {
                             groups_to_reconcile.push(stable_id.clone());
                         }
-                        stable_id
+                        let mut aliases = vec![stable_id.clone(), local_key, raw_gid];
+                        aliases.sort();
+                        aliases.dedup();
+                        (stable_id, aliases)
                     }
                     None => {
                         tracing::warn!(
@@ -1756,9 +1857,17 @@ impl WebhookService {
                             group_id = %raw_gid,
                             "webhook group selector does not match any currently known named group"
                         );
-                        raw_gid
+                        (raw_gid.clone(), vec![raw_gid])
                     }
                 };
+                let entry_aliases = group_query_aliases
+                    .entry(subscribe_key.clone())
+                    .or_default();
+                for alias in aliases {
+                    if !entry_aliases.contains(&alias) {
+                        entry_aliases.push(alias);
+                    }
+                }
                 group_subscribers
                     .entry(subscribe_key)
                     .or_default()
@@ -1823,7 +1932,15 @@ impl WebhookService {
                 let g_dedupe = Arc::clone(&dedupe);
                 let g_cancel = self.cancel.clone();
                 tasks.spawn(async move {
-                    run_group_source(g_state, group_subscribers, g_dedupe, rx, g_cancel).await;
+                    run_group_source(
+                        g_state,
+                        group_subscribers,
+                        group_query_aliases,
+                        g_dedupe,
+                        rx,
+                        g_cancel,
+                    )
+                    .await;
                 });
             }
         }
@@ -2060,7 +2177,7 @@ fn build_dm_queued_item(
     let text_raw = String::from_utf8_lossy(payload);
     let text = format_item_text(&text_raw, cfg.body_mode, cfg.max_text_chars);
     Some(QueuedWebhookItem {
-        dedupe_key: dm_dedupe_key(&sender_lower, payload),
+        dedupe_key: dm_dedupe_key(&sender_lower, received_at, payload),
         lane: Lane::Fast,
         enqueued_at_ms: received_at,
         item: WebhookPayloadItem {
@@ -2083,7 +2200,7 @@ async fn run_dm_source(
     dedupe: Arc<StdMutex<WebhookDedupeStore>>,
     cancel: CancellationToken,
 ) {
-    // Live tap before history backfill (same seam as sse.rs:175).
+    // Live tap before history backfill (same seam as sse.rs).
     let mut rx = state.agent.subscribe_direct();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
 
@@ -2127,7 +2244,7 @@ async fn run_dm_source(
                 }
                 let received_at = u64::try_from(record.seen_at_ms).unwrap_or(0);
                 let from_name = resolve_from_name(&state, sender_hex).await;
-                let key = dm_dedupe_key(sender_hex, &record.payload);
+                let key = dm_dedupe_key(sender_hex, received_at, &record.payload);
                 for sub in &subscribers {
                     let Some(sub_since_ms) = sub.backfill_since_ms else {
                         continue;
@@ -2338,6 +2455,7 @@ async fn emit_group_public_message(
 async fn run_group_source(
     state: Arc<AppState>,
     group_subscribers: std::collections::HashMap<String, Vec<TargetSubscriber>>,
+    group_query_aliases: std::collections::HashMap<String, Vec<String>>,
     dedupe: Arc<StdMutex<WebhookDedupeStore>>,
     mut rx: mpsc::Receiver<PublicMessageTeeEvent>,
     cancel: CancellationToken,
@@ -2349,42 +2467,63 @@ async fn run_group_source(
         let Some(min_since_ms) = subs.iter().filter_map(|s| s.backfill_since_ms).min() else {
             continue;
         };
-        let cached = state
-            .public_messages
-            .read()
-            .await
+        let aliases: Vec<String> = group_query_aliases
             .get(group_id)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| vec![group_id.clone()]);
+        let cached: Vec<GroupPublicMessage> = {
+            let guard = state.public_messages.read().await;
+            let mut out = Vec::new();
+            let mut seen_sig = HashSet::new();
+            for alias in &aliases {
+                if let Some(msgs) = guard.get(alias) {
+                    for m in msgs {
+                        if seen_sig.insert(m.signature.clone()) {
+                            out.push(m.clone());
+                        }
+                    }
+                }
+            }
+            out
+        };
         let backfill_msgs: Vec<(GroupPublicMessage, i64)> = match state.agent.history() {
             Some(history) => {
                 let store = Arc::clone(history.store());
-                let gid = group_id.clone();
+                let query_aliases = aliases.clone();
                 match tokio::task::spawn_blocking(move || {
-                    let q = HistoryQuery {
-                        scope: Some(Scope::Group(gid)),
-                        since_ms: Some(min_since_ms),
-                        limit: GROUP_BACKFILL_LIMIT,
-                        ..Default::default()
-                    };
-                    store.query(&q)
+                    let mut all_rows = Vec::new();
+                    for gid in query_aliases {
+                        let q = HistoryQuery {
+                            scope: Some(Scope::Group(gid)),
+                            since_ms: Some(min_since_ms),
+                            limit: GROUP_BACKFILL_LIMIT,
+                            ..Default::default()
+                        };
+                        if let Ok(rows) = store.query(&q) {
+                            all_rows.extend(rows);
+                        }
+                    }
+                    all_rows
                 })
                 .await
                 {
-                    Ok(Ok(rows)) => {
-                        let mut merged: Vec<(GroupPublicMessage, i64)> = rows
-                            .iter()
-                            .filter_map(|r| {
-                                let artifact = r.record.signed_artifact.as_deref()?;
-                                let pm =
-                                    serde_json::from_slice::<GroupPublicMessage>(artifact).ok()?;
-                                Some((pm, r.record.seen_at_ms))
-                            })
-                            .collect();
-                        let mut seen: HashSet<String> =
-                            merged.iter().map(|(m, _)| m.signature.clone()).collect();
+                    Ok(rows) => {
+                        let mut merged: Vec<(GroupPublicMessage, i64)> = Vec::new();
+                        let mut seen: HashSet<String> = HashSet::new();
+                        for r in &rows {
+                            if let Some(artifact) = r.record.signed_artifact.as_deref() {
+                                if let Ok(pm) =
+                                    serde_json::from_slice::<GroupPublicMessage>(artifact)
+                                {
+                                    if seen.insert(pm.signature.clone()) {
+                                        merged.push((pm, r.record.seen_at_ms));
+                                    }
+                                }
+                            }
+                        }
+                        let now_i64 = i64::try_from(unix_now_ms()).unwrap_or(i64::MAX);
                         for m in cached {
-                            let ts_i64 = i64::try_from(m.timestamp).unwrap_or(i64::MAX);
+                            let ts_i64 = i64::try_from(m.timestamp).unwrap_or(now_i64).min(now_i64);
                             if ts_i64 >= min_since_ms && seen.insert(m.signature.clone()) {
                                 merged.push((m, ts_i64));
                             }
@@ -2392,22 +2531,29 @@ async fn run_group_source(
                         merged.sort_by_key(|(m, _)| m.timestamp);
                         merged
                     }
-                    _ => cached
-                        .into_iter()
-                        .filter_map(|m| {
-                            let ts_i64 = i64::try_from(m.timestamp).unwrap_or(i64::MAX);
-                            (ts_i64 >= min_since_ms).then_some((m, ts_i64))
-                        })
-                        .collect(),
+                    Err(_) => {
+                        let now_i64 = i64::try_from(unix_now_ms()).unwrap_or(i64::MAX);
+                        cached
+                            .into_iter()
+                            .filter_map(|m| {
+                                let ts_i64 =
+                                    i64::try_from(m.timestamp).unwrap_or(now_i64).min(now_i64);
+                                (ts_i64 >= min_since_ms).then_some((m, ts_i64))
+                            })
+                            .collect()
+                    }
                 }
             }
-            None => cached
-                .into_iter()
-                .filter_map(|m| {
-                    let ts_i64 = i64::try_from(m.timestamp).unwrap_or(i64::MAX);
-                    (ts_i64 >= min_since_ms).then_some((m, ts_i64))
-                })
-                .collect(),
+            None => {
+                let now_i64 = i64::try_from(unix_now_ms()).unwrap_or(i64::MAX);
+                cached
+                    .into_iter()
+                    .filter_map(|m| {
+                        let ts_i64 = i64::try_from(m.timestamp).unwrap_or(now_i64).min(now_i64);
+                        (ts_i64 >= min_since_ms).then_some((m, ts_i64))
+                    })
+                    .collect()
+            }
         };
 
         for (pm, seen_ms) in backfill_msgs {
@@ -2620,7 +2766,7 @@ async fn run_webhook_worker(
                             .last_success_at
                             .store((done_ms / 1_000) as i64, Ordering::Relaxed);
                         let advance_cursor = max_enqueued_ms.map(|ts| {
-                            i64::try_from(ts)
+                            i64::try_from(ts.min(done_ms))
                                 .unwrap_or(i64::MAX)
                                 .saturating_sub(BACKFILL_OVERLAP_MS)
                         });
