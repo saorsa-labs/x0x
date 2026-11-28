@@ -2494,13 +2494,20 @@ async fn run_group_source(
                     let mut all_rows = Vec::new();
                     for gid in query_aliases {
                         let q = HistoryQuery {
-                            scope: Some(Scope::Group(gid)),
+                            scope: Some(Scope::Group(gid.clone())),
                             since_ms: Some(min_since_ms),
                             limit: GROUP_BACKFILL_LIMIT,
                             ..Default::default()
                         };
-                        if let Ok(rows) = store.query(&q) {
-                            all_rows.extend(rows);
+                        match store.query(&q) {
+                            Ok(rows) => all_rows.extend(rows),
+                            Err(err) => {
+                                tracing::warn!(
+                                    group_id = %gid,
+                                    error = %err,
+                                    "webhook group backfill history query failed"
+                                );
+                            }
                         }
                     }
                     all_rows

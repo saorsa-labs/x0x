@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::State as AxumState;
 use axum::http::{HeaderMap, Request, StatusCode};
-use axum::routing::post;
+use axum::routing::{any, post};
 use axum::Router;
 use tokio::sync::{mpsc, Notify};
 use tower::ServiceExt as _;
@@ -1301,10 +1301,15 @@ async fn webhook_ssrf_resolver_blocks_localhost_and_client_refuses_redirects() {
     use reqwest::dns::{Name, Resolve};
     let resolver = test_ssrf_resolver(false);
     let name: Name = "localhost".parse().expect("dns name");
-    let resolved = resolver.resolve(name).await;
+    let err = match resolver.resolve(name).await {
+        Ok(_) => {
+            panic!("SsrfCheckedResolver must reject loopback resolution when test bypass is off")
+        }
+        Err(err) => err,
+    };
     assert!(
-        resolved.is_err(),
-        "SsrfCheckedResolver must reject loopback resolution when test bypass is off"
+        err.to_string().contains("blocked by SSRF policy"),
+        "expected SSRF policy block error, got: {err}"
     );
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1323,9 +1328,9 @@ async fn webhook_ssrf_resolver_blocks_localhost_and_client_refuses_redirects() {
                 let notify = Arc::clone(&source_notified_route);
                 async move {
                     hits.fetch_add(1, Ordering::SeqCst);
-                    notify.notify_waiters();
+                    notify.notify_one();
                     (
-                        StatusCode::FOUND,
+                        StatusCode::TEMPORARY_REDIRECT,
                         [(axum::http::header::LOCATION, "/secret-target")],
                     )
                 }
@@ -1333,7 +1338,7 @@ async fn webhook_ssrf_resolver_blocks_localhost_and_client_refuses_redirects() {
         )
         .route(
             "/secret-target",
-            post(move || {
+            any(move || {
                 let hits = Arc::clone(&target_hits_route);
                 async move {
                     hits.fetch_add(1, Ordering::SeqCst);
@@ -1430,7 +1435,7 @@ async fn webhook_metadata_truncation_and_validated_group_delivery_end_to_end() {
         max_per_hour: 20,
         max_per_day: 100,
         body_mode: WebhookBodyMode::Full,
-        max_text_chars: 5,
+        max_text_chars: 6,
         allow_insecure_loopback_for_test: true,
         ..WebhookConfig::default()
     };
@@ -1499,7 +1504,7 @@ async fn webhook_metadata_truncation_and_validated_group_delivery_end_to_end() {
                 let item = val["items"][0].as_object().expect("item");
                 assert_eq!(item["kind"], "group");
                 assert_eq!(item["group_id"], group_id);
-                assert_eq!(item["text"], "Hello");
+                assert_eq!(item["text"], "Hello🌍");
                 seen_group = true;
             }
             other => panic!("unexpected webhook {other:?}"),
