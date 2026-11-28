@@ -214,7 +214,7 @@ async fn a_page_from_a_machine_revoked_responder_is_not_applied() -> Result<()> 
     )
     .await;
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &clean_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &clean_hex),
         "CONTROL: the clean responder's truncated page opens its fence"
     );
 
@@ -241,7 +241,7 @@ async fn a_page_from_a_machine_revoked_responder_is_not_applied() -> Result<()> 
     )
     .await;
     assert!(
-        !self_leave_rekey_fence_peer_open(&fence_ids, &device_hex),
+        !self_leave_rekey_fence_peer_open(&state, &fence_ids, &device_hex),
         "a machine-revoked responder's page must not be applied"
     );
     Ok(())

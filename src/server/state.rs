@@ -25,7 +25,9 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // name private items of its parent, so no `pub(super)` is needed on them —
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
-use super::routes::named_groups::{RequesterOfferObligation, StartupCatchupObligation};
+use super::routes::named_groups::{
+    RequesterOfferObligation, SelfLeaveFence, StartupCatchupObligation,
+};
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
@@ -1583,6 +1585,12 @@ pub(super) struct AppState {
     /// its own map, so that daemon's matching head does not clear this
     /// hold. Dropping the state drops the map.
     pub(super) startup_catchup_obligations: StdMutex<HashMap<String, StartupCatchupObligation>>,
+    /// Per-daemon self-leave rekey fences (active replay depth, open catch-up
+    /// page peers, and pending member-keyed KeyPackage waits), keyed by group
+    /// id / alias. Kept on `AppState` rather than a process-global static so
+    /// independent daemons in the same process never clobber each other and
+    /// restarting a daemon starts with empty fences (#2231).
+    pub(in crate::server) self_leave_rekey_fences: Arc<StdMutex<HashMap<String, SelfLeaveFence>>>,
     /// True after this daemon has installed its startup self-leave gates.
     /// It starts true, so a test that never takes the hold can seal.
     /// Production sets it false before the direct metadata listener and
