@@ -272,6 +272,11 @@ pub async fn diagnostics_sidecar_quarantine(client: &DaemonClient) -> Result<()>
     client.run_get("/diagnostics/sidecar-quarantine").await
 }
 
+/// `x0x diagnostics webhooks` — GET /diagnostics/webhooks
+pub async fn diagnostics_webhooks(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/webhooks").await
+}
+
 /// `x0x diagnostics connect` — GET /diagnostics/connect
 ///
 /// Connect-ACL policy summary (enabled flag, loaded-from path, allow-entry

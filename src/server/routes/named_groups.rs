@@ -26017,6 +26017,9 @@ pub(in crate::server) async fn ingest_public_message(
                 }
             }
             cache_public_message(state, msg.clone()).await;
+            if let Some(ref webhook) = state.webhook_service {
+                webhook.try_send_public_message(&stable_id, &msg);
+            }
             // Delegate-side registration + mention/delegation routing to
             // local WS subscribers (ADR-0040 structured mentions).
             route_delegation_and_mentions(state, &msg, &stable_id).await;
@@ -26089,6 +26092,7 @@ async fn route_delegation_and_mentions(
             reason: reason.to_string(),
             mentions: msg.mentions.clone(),
             timestamp: msg.timestamp,
+            body: Some(msg.body.clone()),
         };
         crate::server::ws::emit_mention_event(state, frame).await;
     }
@@ -58420,6 +58424,7 @@ pub(in crate::server) mod tests {
             )),
             forward_service: None,
             socks_service: None,
+            webhook_service: None,
             owner_sync,
             names: Arc::new(
                 x0x::names::NameStore::load(x0x::names::NameStore::path_in(data_dir)).await,

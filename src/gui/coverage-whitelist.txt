@@ -69,6 +69,10 @@ DELETE /names/owners/*
 POST /names/machines
 DELETE /names/pins/*
 
+# ── Outbound webhook diagnostics — durable API token only; the GUI runs on a
+# session token, which this route refuses by design. ──
+GET /diagnostics/webhooks
+
 # ── Identity card — the GUI calls it via the agentCardPath() helper
 # (share links need the query params), so the first argument is a
 # function call, not a path literal the crawler can statically match.

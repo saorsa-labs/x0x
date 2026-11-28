@@ -645,7 +645,8 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
         Method::DELETE => is_sync_device_path(path) || is_forward_addr_path(path),
         // ADR 0116 §3: the local history policy, with its counters and the
         // fork-quarantine pins, is an owner-only read.
-        Method::GET => path == "/history/policy",
+        // Outbound webhook diagnostics are also durable-owner only.
+        Method::GET => matches!(path, "/history/policy" | "/diagnostics/webhooks"),
         _ => false,
     }
 }
@@ -2698,6 +2699,10 @@ mod tests {
     #[test]
     fn history_policy_requires_durable_owner_and_other_history_reads_do_not() {
         assert!(requires_durable_owner(&Method::GET, "/history/policy"));
+        assert!(requires_durable_owner(
+            &Method::GET,
+            "/diagnostics/webhooks"
+        ));
         for path in [
             "/history",
             "/history/stats",
