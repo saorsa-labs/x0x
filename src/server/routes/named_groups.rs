@@ -12462,7 +12462,7 @@ async fn replay_pending_treekem_events(
         maybe_rearm_stopped_treekem_pages(state, group_id, skip_rearm_peer).await;
         return;
     }
-    let _replay_fence = SelfLeaveReplayFence::enter(group_id);
+    let _replay_fence = SelfLeaveReplayFence::enter(state, group_id);
     // #1685 round 5 (Claude review at 5319f206, finding 5): the re-arm
     // trigger is CURSOR MOVEMENT, not an accepted count. An accepted
     // event that leaves the catch-up cursor (revision, TreeKEM epoch,
@@ -14639,7 +14639,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         response_info.stable_group_id().to_string(),
     ];
     if was_truncated {
-        self_leave_rekey_fence_catchup_peer(&fence_ids, &sender_hex, true);
+        self_leave_rekey_fence_catchup_peer(state, &fence_ids, &sender_hex, true);
     }
     SELF_LEAVE_REKEY_BATCH
         .scope((), async {
@@ -14939,7 +14939,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 );
             }
         }
-    } else if self_leave_key_package_reply(&fence_ids, &sender_hex, key_package_shaped) {
+    } else if self_leave_key_package_reply(
+        state,
+        &fence_ids,
+        &sender_hex,
+        key_package_shaped,
+        reported_head.is_some(),
+    ) {
         // A KeyPackage reply carries no proof that a membership page stream
         // reached its head. Leave every open page stream fenced. It also
         // does not prove the startup catch-up head.
@@ -14962,13 +14968,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         )
         .await;
         treekem_start_catchup_note_head(state, &response_key, reported_head.as_deref()).await;
-        let peer_open = self_leave_rekey_fence_peer_open(&fence_ids, &sender_hex);
-        let any_open = self_leave_rekey_fence_any_open(&fence_ids);
+        let peer_open = self_leave_rekey_fence_peer_open(state, &fence_ids, &sender_hex);
+        let any_open = self_leave_rekey_fence_any_open(state, &fence_ids);
         if peer_open {
             // This peer's last page. Close only this peer. The terminal
             // page also retires this peer's stopped-loop accounting: the
             // stream reached its head, so nothing is left to re-arm.
-            self_leave_rekey_fence_catchup_peer(&fence_ids, &sender_hex, false);
+            self_leave_rekey_fence_catchup_peer(state, &fence_ids, &sender_hex, false);
             treekem_page_stopped_peers_clear(&fence_ids, &sender_hex);
         }
         if peer_open || !any_open {
@@ -15249,7 +15255,7 @@ async fn treekem_page_stopped_peers_drop_departed(
     peer: &str,
 ) {
     treekem_page_stopped_peers_clear(group_ids, peer);
-    self_leave_rekey_fence_catchup_peer(group_ids, peer, false);
+    self_leave_rekey_fence_catchup_peer(state, group_ids, peer, false);
     // The re-warn guard stays in its own block: a std MutexGuard must
     // not live across the await below (the future has to stay Send).
     {
@@ -15274,19 +15280,29 @@ async fn treekem_page_stopped_peers_drop_departed(
 /// rows go, and each dropped row's peer fence closes with the same
 /// call a terminal page makes — a withdrawn group can never page or
 /// rekey again, so an open fence for it has no exit.
-fn treekem_page_stopped_peers_drop_group(group_ids: &[String]) {
-    let mut guard = TREEKEM_PAGE_STOPPED_PEERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut held_peers: Vec<String> = Vec::new();
-    for group_id in group_ids {
-        if let Some(peers) = guard.remove(group_id) {
-            held_peers.extend(peers.into_keys());
+fn treekem_page_stopped_peers_drop_group(state: &AppState, group_ids: &[String]) {
+    {
+        let mut guard = TREEKEM_PAGE_STOPPED_PEERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for group_id in group_ids {
+            guard.remove(group_id);
         }
     }
-    drop(guard);
-    for peer in &held_peers {
-        self_leave_rekey_fence_catchup_peer(group_ids, peer, false);
+    {
+        let mut fences = state
+            .self_leave_rekey_fences
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for group_id in group_ids {
+            if let Some(fence) = fences.get_mut(group_id) {
+                fence.catchup_peers.clear();
+                fence.key_package_peers.clear();
+                if self_leave_fence_idle(fence) {
+                    fences.remove(group_id);
+                }
+            }
+        }
     }
     let mut rewarn = TREEKEM_PAGE_STOP_REWARN
         .lock()
@@ -16064,20 +16080,29 @@ fn catchup_may_apply_removed_as_author(
 }
 
 fn self_leave_key_package_reply(
+    state: &AppState,
     group_ids: &[String],
     peer: &str,
     key_package_shaped: bool,
+    has_reported_head: bool,
 ) -> bool {
     if key_package_shaped {
-        self_leave_rekey_take_key_package_wait(group_ids, peer);
+        self_leave_rekey_take_key_package_wait(state, group_ids, peer);
         return true;
     }
-    // An empty reply is this peer's membership terminal page when a page
-    // stream is open. It retires a key-package wait only when no page is open.
-    if self_leave_rekey_fence_peer_open(group_ids, peer) {
+    // A head-bearing empty reply is a membership catch-up head answer, not a
+    // served member-keyed KeyPackage reply (which omits `responder_state_hash`).
+    // Swallowing it would drop the responder's head report (#2231).
+    if has_reported_head {
         return false;
     }
-    self_leave_rekey_take_key_package_wait(group_ids, peer)
+    // An empty reply without a head is this peer's membership terminal page
+    // when a page stream is open. It retires a key-package wait only when no
+    // page is open.
+    if self_leave_rekey_fence_peer_open(state, group_ids, peer) {
+        return false;
+    }
+    self_leave_rekey_take_key_package_wait(state, group_ids, peer)
 }
 
 async fn request_treekem_catchup_page(
@@ -17422,7 +17447,7 @@ async fn request_member_key_package_catchup(
                 continue;
             }
         };
-        self_leave_rekey_note_key_package_wait(&fence_ids, &candidate_hex);
+        self_leave_rekey_note_key_package_wait(state, &fence_ids, &candidate_hex);
         #[cfg(test)]
         detached_send_test_seam::park(&detached_send_test_seam::key_package_catchup_key(
             group_id,
@@ -20035,8 +20060,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if roster_only_removal && !removed_self && !roster_lock_already_held {
                 install_cached_key_packages_for_removed_members(state, &mut next).await;
                 let queue_clear = !self_leave_rekey_batch_held()
-                    && !self_leave_rekey_fence_open(&resolved_group_key)
-                    && !self_leave_rekey_fence_open(next.stable_group_id())
+                    && !self_leave_rekey_fence_open(state, &resolved_group_key)
+                    && !self_leave_rekey_fence_open(state, next.stable_group_id())
                     && self_leave_rekey_queue_clear(
                         state,
                         &resolved_group_key,
@@ -31127,7 +31152,7 @@ async fn retain_withdrawn_group_tombstone(
     // every alias the page loop ever keyed them.
     let mut page_aliases: Vec<String> = aliases.iter().cloned().collect();
     page_aliases.push(info.mls_group_id.clone());
-    treekem_page_stopped_peers_drop_group(&page_aliases);
+    treekem_page_stopped_peers_drop_group(state, &page_aliases);
     refresh_group_card_cache_from_info(state, group_id, &info).await;
     save_mls_groups(state).await;
     true
@@ -31501,7 +31526,7 @@ fn self_leave_rekey_log_clear_group(group_key: &str) {
     guard.1.retain(|key| !key.contains(group_key));
 }
 
-struct SelfLeaveFence {
+pub(in crate::server) struct SelfLeaveFence {
     replay: u32,
     /// Peers that still owe a membership catch-up page.
     catchup_peers: HashSet<String>,
@@ -31513,14 +31538,9 @@ fn self_leave_fence_idle(fence: &SelfLeaveFence) -> bool {
     fence.replay == 0 && fence.catchup_peers.is_empty() && fence.key_package_peers.is_empty()
 }
 
-fn self_leave_rekey_fences() -> &'static std::sync::Mutex<HashMap<String, SelfLeaveFence>> {
-    use std::sync::OnceLock;
-    static FENCES: OnceLock<std::sync::Mutex<HashMap<String, SelfLeaveFence>>> = OnceLock::new();
-    FENCES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-fn self_leave_rekey_fence_open(group_id: &str) -> bool {
-    let guard = self_leave_rekey_fences()
+fn self_leave_rekey_fence_open(state: &AppState, group_id: &str) -> bool {
+    let guard = state
+        .self_leave_rekey_fences
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard
@@ -31532,15 +31552,20 @@ fn self_leave_rekey_fence_open(group_id: &str) -> bool {
 /// Tests use it to prove a replay that spawned the detached re-arm does
 /// not hold the replay fence while the re-arm sends are in flight.
 #[cfg(test)]
-fn self_leave_rekey_fence_replay_open(group_id: &str) -> bool {
-    let guard = self_leave_rekey_fences()
+fn self_leave_rekey_fence_replay_open(state: &AppState, group_id: &str) -> bool {
+    let guard = state
+        .self_leave_rekey_fences
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.get(group_id).is_some_and(|fence| fence.replay > 0)
 }
 
-fn self_leave_rekey_fence_replay(group_id: &str, enter: bool) {
-    let mut guard = self_leave_rekey_fences()
+fn self_leave_rekey_fence_replay(
+    fences: &std::sync::Mutex<HashMap<String, SelfLeaveFence>>,
+    group_id: &str,
+    enter: bool,
+) {
+    let mut guard = fences
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fence = guard.entry(group_id.to_string()).or_insert(SelfLeaveFence {
@@ -31558,8 +31583,14 @@ fn self_leave_rekey_fence_replay(group_id: &str, enter: bool) {
     }
 }
 
-fn self_leave_rekey_fence_catchup_peer(group_ids: &[String], peer: &str, open: bool) {
-    let mut guard = self_leave_rekey_fences()
+fn self_leave_rekey_fence_catchup_peer(
+    state: &AppState,
+    group_ids: &[String],
+    peer: &str,
+    open: bool,
+) {
+    let mut guard = state
+        .self_leave_rekey_fences
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
@@ -31931,8 +31962,9 @@ async fn self_leave_startup_note_verified_head(
     self_leave_startup_satisfy_peer(state, group_ids, peer);
 }
 
-fn self_leave_rekey_fence_peer_open(group_ids: &[String], peer: &str) -> bool {
-    let guard = self_leave_rekey_fences()
+fn self_leave_rekey_fence_peer_open(state: &AppState, group_ids: &[String], peer: &str) -> bool {
+    let guard = state
+        .self_leave_rekey_fences
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     group_ids.iter().any(|group_id| {
@@ -31942,8 +31974,9 @@ fn self_leave_rekey_fence_peer_open(group_ids: &[String], peer: &str) -> bool {
     })
 }
 
-fn self_leave_rekey_fence_any_open(group_ids: &[String]) -> bool {
-    let guard = self_leave_rekey_fences()
+fn self_leave_rekey_fence_any_open(state: &AppState, group_ids: &[String]) -> bool {
+    let guard = state
+        .self_leave_rekey_fences
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     group_ids.iter().any(|group_id| {
@@ -31953,8 +31986,9 @@ fn self_leave_rekey_fence_any_open(group_ids: &[String]) -> bool {
     })
 }
 
-fn self_leave_rekey_note_key_package_wait(group_ids: &[String], peer: &str) {
-    let mut guard = self_leave_rekey_fences()
+fn self_leave_rekey_note_key_package_wait(state: &AppState, group_ids: &[String], peer: &str) {
+    let mut guard = state
+        .self_leave_rekey_fences
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
@@ -31967,8 +32001,13 @@ fn self_leave_rekey_note_key_package_wait(group_ids: &[String], peer: &str) {
     }
 }
 
-fn self_leave_rekey_take_key_package_wait(group_ids: &[String], peer: &str) -> bool {
-    let mut guard = self_leave_rekey_fences()
+fn self_leave_rekey_take_key_package_wait(
+    state: &AppState,
+    group_ids: &[String],
+    peer: &str,
+) -> bool {
+    let mut guard = state
+        .self_leave_rekey_fences
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut found = false;
@@ -31987,13 +32026,16 @@ fn self_leave_rekey_take_key_package_wait(group_ids: &[String], peer: &str) -> b
 }
 
 struct SelfLeaveReplayFence {
+    fences: Arc<std::sync::Mutex<HashMap<String, SelfLeaveFence>>>,
     group_id: String,
 }
 
 impl SelfLeaveReplayFence {
-    fn enter(group_id: &str) -> Self {
-        self_leave_rekey_fence_replay(group_id, true);
+    fn enter(state: &AppState, group_id: &str) -> Self {
+        let fences = Arc::clone(&state.self_leave_rekey_fences);
+        self_leave_rekey_fence_replay(&fences, group_id, true);
         Self {
+            fences,
             group_id: group_id.to_string(),
         }
     }
@@ -32001,7 +32043,7 @@ impl SelfLeaveReplayFence {
 
 impl Drop for SelfLeaveReplayFence {
     fn drop(&mut self) {
-        self_leave_rekey_fence_replay(&self.group_id, false);
+        self_leave_rekey_fence_replay(&self.fences, &self.group_id, false);
     }
 }
 
@@ -32277,8 +32319,8 @@ async fn install_saved_self_leave_rekey(
         return SelfLeaveRekeyStep::Deferred;
     }
     if self_leave_rekey_batch_held()
-        || self_leave_rekey_fence_open(group_key)
-        || self_leave_rekey_fence_open(info.stable_group_id())
+        || self_leave_rekey_fence_open(state, group_key)
+        || self_leave_rekey_fence_open(state, info.stable_group_id())
         || self_leave_startup_blocks(state, info, group_key)
         || !self_leave_rekey_queue_clear(state, group_key, info.stable_group_id()).await
         || !self_leave_candidate_extends_stored_head(state, group_key, info).await
@@ -33508,8 +33550,8 @@ async fn commit_treekem_self_leave_rekey_from(
         return SelfLeaveRekeyStep::Done;
     }
     if self_leave_rekey_batch_held()
-        || self_leave_rekey_fence_open(group_key)
-        || self_leave_rekey_fence_open(info.stable_group_id())
+        || self_leave_rekey_fence_open(state, group_key)
+        || self_leave_rekey_fence_open(state, info.stable_group_id())
         || self_leave_startup_blocks(state, &info, group_key)
     {
         return SelfLeaveRekeyStep::Deferred;
@@ -33760,8 +33802,8 @@ async fn commit_treekem_self_leave_rekey_from(
     // Re-check under the membership lock, after the awaits above, and
     // before the epoch becomes durable.
     if self_leave_rekey_batch_held()
-        || self_leave_rekey_fence_open(group_key)
-        || self_leave_rekey_fence_open(info.stable_group_id())
+        || self_leave_rekey_fence_open(state, group_key)
+        || self_leave_rekey_fence_open(state, info.stable_group_id())
         || self_leave_startup_blocks(state, &info, group_key)
         || !self_leave_rekey_queue_clear(state, group_key, info.stable_group_id()).await
         || !self_leave_candidate_extends_stored_head(state, group_key, &info).await
@@ -33932,7 +33974,9 @@ async fn rekey_treekem_self_leaves(state: &Arc<AppState>, group_id: &str) {
             .map(|info| info.stable_group_id().to_string())
             .unwrap_or_else(|| group_key.clone())
     };
-    if self_leave_rekey_fence_open(&group_key) || self_leave_rekey_fence_open(&stable_id) {
+    if self_leave_rekey_fence_open(state, &group_key)
+        || self_leave_rekey_fence_open(state, &stable_id)
+    {
         if self_leave_rekey_log_once(&format!("fence:{group_key}")) {
             tracing::info!(
                 group_id = %LogHexId::group(&group_key),
@@ -58436,6 +58480,7 @@ pub(in crate::server) mod tests {
                 .await,
             ),
             startup_catchup_obligations: std::sync::Mutex::new(HashMap::new()),
+            self_leave_rekey_fences: Arc::new(std::sync::Mutex::new(HashMap::new())),
             startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
             startup_catchup_backoff_owner: AtomicU64::new(0),
             startup_catchup_backoff_abort: std::sync::Mutex::new(None),

@@ -837,7 +837,7 @@ async fn an_applied_replay_rearms_the_stopped_page_loop_to_the_terminal_page() -
     );
     assert_eq!(pending_len(&state, &group_id).await, 1, "E2 stays queued");
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the stopped peer's page fence stays open after the stop"
     );
 
@@ -881,7 +881,7 @@ async fn an_applied_replay_rearms_the_stopped_page_loop_to_the_terminal_page() -
         "the re-arm is typed and names the stopped peer"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the re-arm asks; only the peer's own terminal page closes its fence"
     );
 
@@ -896,7 +896,7 @@ async fn an_applied_replay_rearms_the_stopped_page_loop_to_the_terminal_page() -
     )
     .await;
     assert!(
-        !self_leave_rekey_fence_any_open(&fence_ids),
+        !self_leave_rekey_fence_any_open(&state, &fence_ids),
         "the terminal page closed the last open peer fence; the rekey pass is no longer deferred by it"
     );
     assert_eq!(
@@ -1186,7 +1186,7 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
         "the stopped loop asks for no next page at the unmoved cursor"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "CONTROL: the stopped peer's page fence is open before the removal"
     );
     assert_eq!(
@@ -1292,11 +1292,11 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
         "the retirement is typed and names the departed peer"
     );
     assert!(
-        !self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        !self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "#1685 round 4: the departed peer's page fence is closed, never left open"
     );
     assert!(
-        !self_leave_rekey_fence_any_open(&fence_ids),
+        !self_leave_rekey_fence_any_open(&state, &fence_ids),
         "no page fence of the group stays open: the helper's terminal page closed its own, the responder's was retired"
     );
     assert!(
@@ -1521,7 +1521,7 @@ async fn an_unreachable_stopped_peer_does_not_block_the_listener_or_hold_the_fen
          (at 5319f206 the inline re-arm parked inside the handler)"
     );
     assert!(
-        !self_leave_rekey_fence_replay_open(&group_id),
+        !self_leave_rekey_fence_replay_open(&state, &group_id),
         "the replay fence dropped before any re-arm send started; the parked send cannot hold it"
     );
     assert!(
@@ -1762,7 +1762,7 @@ async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_with_the
         "CONTROL: the responder's stopped row is armed"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "CONTROL: the responder's page fence is open"
     );
 
@@ -1828,7 +1828,7 @@ async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_with_the
         "the defer is typed and names the held peer, with the ask-sent reason"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "#1685 round 9: the held member's page fence stays OPEN — the ask is not an \
          answer; only the agent's valid page from a clean machine closes it"
     );
@@ -1949,7 +1949,7 @@ async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_with_its
         "the defer is typed and names the held peer, with the ask-sent reason"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the held member's page fence stays OPEN — it closes on the agent's own \
          terminal page from a clean machine, never on the pairing's retirement"
     );
@@ -2074,7 +2074,7 @@ async fn a_resync_pending_stopped_peer_with_an_active_seat_is_deferred_not_retir
         "no typed re-arm was recorded"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "#1685 round 8: the held member's page fence stays OPEN — a resync is a \
          temporary hold, never a fence exit"
     );
@@ -2123,7 +2123,7 @@ async fn an_agent_revoked_stopped_peer_is_retired_and_its_fence_closes() -> Resu
     )
     .await;
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "CONTROL: the responder's page fence is open"
     );
 
@@ -2182,7 +2182,7 @@ async fn an_agent_revoked_stopped_peer_is_retired_and_its_fence_closes() -> Resu
         "no typed re-arm was recorded"
     );
     assert!(
-        !self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        !self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the revoked peer's page fence is closed, never left open"
     );
     assert!(
@@ -2244,7 +2244,7 @@ async fn a_departed_retire_rechecks_the_self_leave_rekey_its_fence_close_release
     )
     .await;
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "CONTROL: the stopped responder's page fence is open"
     );
 
@@ -2304,7 +2304,7 @@ async fn a_departed_retire_rechecks_the_self_leave_rekey_its_fence_close_release
         "#1685 round 7: the retire's re-check ran the responsive rekey pass its fence close released"
     );
     assert!(
-        !self_leave_rekey_fence_any_open(&fence_ids),
+        !self_leave_rekey_fence_any_open(&state, &fence_ids),
         "the retire closed the group's last open fence"
     );
     Ok(())
@@ -2542,7 +2542,7 @@ async fn a_machine_held_stopped_peer_is_asked_anyway_and_its_clean_answer_closes
         "CONTROL: the responder's stopped row is armed"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "CONTROL: the responder's page fence is open"
     );
 
@@ -2615,7 +2615,7 @@ async fn a_machine_held_stopped_peer_is_asked_anyway_and_its_clean_answer_closes
          strand the peer for ever"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "#1685 round 9: the ask is not an answer — the fence stays open until a \
          valid page closes it"
     );
@@ -2636,7 +2636,7 @@ async fn a_machine_held_stopped_peer_is_asked_anyway_and_its_clean_answer_closes
         "the clean machine's terminal page cleared the armed row"
     );
     assert!(
-        !self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        !self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the clean machine's terminal page closed the peer fence"
     );
     assert_eq!(
@@ -2739,7 +2739,7 @@ async fn a_page_from_the_held_machine_itself_dies_at_the_page_gate() -> Result<(
         "the gate-refused page left the armed row exactly as it was"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the gate-refused page left the fence exactly as it was"
     );
     assert_eq!(
@@ -2911,7 +2911,7 @@ async fn a_key_package_reply_no_longer_skips_the_armed_sender_in_the_rearm_pass(
         "the ask that went out cleared the sender's row"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the re-arm asks; only the responder's own terminal page closes its fence"
     );
     Ok(())
@@ -3305,7 +3305,7 @@ async fn an_inline_next_page_ask_that_cannot_send_leaves_no_trace() -> Result<()
         "no typed re-arm was recorded"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the truncated page opened this peer's fence and the failed ask closes \
          nothing — this peer still owes its terminal page"
     );
@@ -3491,7 +3491,7 @@ async fn a_truncated_page_answering_a_pre_advance_ask_pages_on_from_the_moved_cu
     )
     .await;
     assert!(
-        !self_leave_rekey_fence_peer_open(&fence_ids, &other_hex),
+        !self_leave_rekey_fence_peer_open(&state, &fence_ids, &other_hex),
         "peer B's terminal page closed its page fence"
     );
     Ok(())
@@ -3545,7 +3545,7 @@ async fn a_listener_applied_advance_rearms_the_stopped_peer() -> Result<()> {
         "CONTROL: the responder's stopped row is armed"
     );
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "CONTROL: the responder's page fence is open"
     );
     assert_eq!(pending_len(&state, &group_id).await, 1, "E2 stays queued");
@@ -3599,7 +3599,7 @@ async fn a_listener_applied_advance_rearms_the_stopped_peer() -> Result<()> {
     )
     .await;
     assert!(
-        !self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        !self_leave_rekey_fence_peer_open(&state, &fence_ids, &responder_hex),
         "the resumed stream's terminal page closed the peer fence"
     );
     Ok(())

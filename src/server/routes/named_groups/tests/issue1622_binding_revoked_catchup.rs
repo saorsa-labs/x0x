@@ -199,7 +199,7 @@ async fn a_page_from_a_binding_revoked_responder_is_not_applied() -> Result<()> 
     )
     .await;
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &clean_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &clean_hex),
         "CONTROL: the clean responder's truncated page opens its fence"
     );
 
@@ -228,7 +228,7 @@ async fn a_page_from_a_binding_revoked_responder_is_not_applied() -> Result<()> 
     )
     .await;
     assert!(
-        !self_leave_rekey_fence_peer_open(&fence_ids, &moved_hex),
+        !self_leave_rekey_fence_peer_open(&state, &fence_ids, &moved_hex),
         "a responder with a revoked agent-machine binding must not have its page applied"
     );
 
@@ -243,7 +243,7 @@ async fn a_page_from_a_binding_revoked_responder_is_not_applied() -> Result<()> 
     )
     .await;
     assert!(
-        self_leave_rekey_fence_peer_open(&fence_ids, &moved_hex),
+        self_leave_rekey_fence_peer_open(&state, &fence_ids, &moved_hex),
         "the responder keeps its seat: from a clean machine its page applies"
     );
     Ok(())

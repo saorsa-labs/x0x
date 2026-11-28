@@ -866,7 +866,7 @@ async fn unresolved_head_evidence(
                 .is_some_and(|target| target.is_head_evidence(local_epoch))
         })
     };
-    ahead || super::self_leave_rekey_fence_any_open(&ids)
+    ahead || super::self_leave_rekey_fence_any_open(state, &ids)
 }
 
 /// The local TreeKEM epoch of a group, or its saved secret epoch.
@@ -997,7 +997,7 @@ pub(in crate::server) async fn seal_probe_for_test(
             })
             .max()
     };
-    let fence = super::self_leave_rekey_fence_any_open(&ids);
+    let fence = super::self_leave_rekey_fence_any_open(state, &ids);
     let synced = group_head_synced(state, &key_name).await;
     let key_package =
         super::holds_member_key_package_for_removal(state, &key_name, target_hex).await;
@@ -10886,6 +10886,134 @@ pub(super) mod tests {
         assert!(
             group_head_synced(&state, &group_id).await,
             "the survivor's own on-chain report resolves its entry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn head_bearing_empty_catchup_response_is_not_swallowed_by_key_package_wait(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "2231a1".repeat(5) + "01";
+        let survivor = [0x71; 32];
+        let survivor_agent = x0x::identity::AgentId(survivor);
+        let survivor_machine = x0x::identity::MachineId([0x72; 32]);
+        let survivor_hex = hex::encode(survivor);
+        let mut info = GroupInfo::new(
+            "kp-wait-head-sync".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.add_member(survivor_hex.clone(), GroupRole::Member, None, None);
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        let expected_head = info.state_hash.clone();
+        let fence_ids = [group_id.clone(), info.mls_group_id.clone(), stable.clone()];
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                stable.clone(),
+                HeadRound {
+                    head: expected_head.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::from([survivor]),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+            inner.restart_unconfirmed.insert(stable.clone());
+        }
+
+        super::super::self_leave_rekey_note_key_package_wait(&state, &fence_ids, &survivor_hex);
+
+        super::super::handle_treekem_catchup_response(
+            &state,
+            &survivor_agent,
+            &survivor_machine,
+            true,
+            super::super::TreeKemCatchupResponse {
+                message_type: "treekem_catchup_response".to_string(),
+                group_id: group_id.clone(),
+                events: Vec::new(),
+                truncated: false,
+                responder_state_hash: Some(expected_head),
+                responder_state_revision: Some(0),
+            },
+        )
+        .await;
+
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner
+                    .head_rounds
+                    .get(&stable)
+                    .expect("head round present")
+                    .confirmed,
+                "a head-bearing empty catch-up response must confirm the head round even with a KeyPackage wait"
+            );
+            assert!(
+                inner
+                    .head_round_asks
+                    .get(&stable)
+                    .is_some_and(|asks| asks.answered.contains(&survivor)),
+                "responder must be recorded in head_round_asks.answered"
+            );
+            assert!(
+                !inner.restart_unconfirmed.contains(&stable),
+                "restart_unconfirmed must clear on matching head report"
+            );
+        }
+        tokio::time::pause();
+        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait * 2).await;
+        assert!(group_head_synced(&state, &group_id).await);
+        assert!(
+            super::super::self_leave_rekey_take_key_package_wait(&state, &fence_ids, &survivor_hex),
+            "head-bearing membership response must not consume the unrelated KeyPackage wait"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn self_leave_rekey_fences_are_isolated_per_daemon_state() -> anyhow::Result<()> {
+        let (state_a, _dir_a) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let (state_b, _dir_b) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "2231b2".repeat(5) + "02";
+        let peer_hex = hex::encode([0x81; 32]);
+        let fence_ids = [group_id.clone()];
+
+        super::super::self_leave_rekey_fence_catchup_peer(&state_a, &fence_ids, &peer_hex, true);
+        super::super::self_leave_rekey_note_key_package_wait(&state_a, &fence_ids, &peer_hex);
+
+        assert!(super::super::self_leave_rekey_fence_peer_open(
+            &state_a, &fence_ids, &peer_hex
+        ));
+        assert!(
+            !super::super::self_leave_rekey_fence_peer_open(&state_b, &fence_ids, &peer_hex),
+            "daemon A's open catch-up fence must not leak into daemon B"
+        );
+        assert!(
+            !super::super::self_leave_rekey_take_key_package_wait(&state_b, &fence_ids, &peer_hex),
+            "daemon A's KeyPackage wait must not leak into daemon B"
+        );
+
+        super::super::treekem_page_stopped_peers_drop_group(&state_a, &fence_ids);
+        assert!(!super::super::self_leave_rekey_fence_any_open(
+            &state_a, &fence_ids
+        ));
+        assert!(
+            !super::super::self_leave_rekey_take_key_package_wait(&state_a, &fence_ids, &peer_hex),
+            "withdrawing a group must clear pending KeyPackage waits too"
         );
         Ok(())
     }
