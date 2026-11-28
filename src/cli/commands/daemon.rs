@@ -230,9 +230,10 @@ pub(crate) async fn collect_doctor_report(
 
 /// The upgrade check while the daemon is unreachable: the stable
 /// launcher's refusal, if it left one in the instance's data directory
-/// (#2016 review); else, on macOS, the instance's launchd autostart job
-/// whose daemon path does not exist (#1379), with whether the launcher
-/// waits for it; else skipped.
+/// (#2016 review); else, on macOS, the default launchd autostart plist
+/// (`com.saorsalabs.x0xd.plist`) when it targets this instance and its
+/// daemon path does not exist (#1379), noting whether the launcher waits
+/// for it; else skipped.
 fn down_upgrade_check(instance_dir: Option<&std::path::Path>) -> DoctorCheck {
     instance_dir
         .and_then(launcher_refusal_check)
@@ -2360,6 +2361,21 @@ fn check_plist_file_owner(path: &Path) -> Result<()> {
     check_plist_owner(path, meta.uid(), meta.mode(), current_euid())
 }
 
+/// Quote an argument for POSIX shells only when it contains whitespace or
+/// shell metacharacters.
+#[cfg(any(test, target_os = "macos"))]
+fn shell_quote_posix(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':' | b'@' | b'/')
+        })
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
 /// The doctor finding for a launchd job of `instance` whose x0xd path does
 /// not exist (#1379), for example a Homebrew keg that `brew upgrade`
 /// removed. The launcher then waits for the path without exiting, so
@@ -2389,11 +2405,20 @@ fn missing_daemon_check(
     } else {
         "launchd cannot start the job"
     };
+    let remedy = match (instance, daemon.via_launcher) {
+        (Some(name), true) => format!(
+            "x0x --name {} autostart --launcher",
+            shell_quote_posix(name)
+        ),
+        (Some(name), false) => format!("x0x --name {} autostart", shell_quote_posix(name)),
+        (None, true) => "x0x autostart --launcher".to_string(),
+        (None, false) => "x0x autostart".to_string(),
+    };
     Some(DoctorCheck {
         status: DoctorCheckStatus::Fail,
         detail: format!(
             "the launchd job {label} runs x0xd from {}, which does not exist; {effect}. Run \
-             `x0x autostart` again to point the job at the installed x0xd",
+             `{remedy}` again to point the job at the installed x0xd",
             daemon.executable
         ),
         evidence: Some(serde_json::json!({
@@ -4190,6 +4215,13 @@ mod tests {
         assert_eq!(check.status, DoctorCheckStatus::Fail);
         assert!(check.detail.contains(keg), "{}", check.detail);
         assert!(check.detail.contains("waits"), "{}", check.detail);
+        assert!(
+            check
+                .detail
+                .contains("`x0x --name alice autostart --launcher`"),
+            "{}",
+            check.detail
+        );
         let evidence = check.evidence.expect("evidence");
         assert_eq!(evidence["via_launcher"], true);
         assert_eq!(evidence["missing_daemon"], keg);
@@ -4203,6 +4235,31 @@ mod tests {
         });
         let check = missing_daemon_check(&direct, None, &missing).expect("direct job");
         assert!(check.detail.contains("cannot start"), "{}", check.detail);
+        assert!(check.detail.contains("`x0x autostart`"), "{}", check.detail);
+        let direct_named = serde_json::json!({
+            "Label": "com.saorsalabs.x0xd",
+            "ProgramArguments": [keg, "--name", "alice"],
+        });
+        let check =
+            missing_daemon_check(&direct_named, Some("alice"), &missing).expect("named direct job");
+        assert!(
+            check.detail.contains("`x0x --name alice autostart`"),
+            "{}",
+            check.detail
+        );
+        let quoted_named = serde_json::json!({
+            "Label": "com.saorsalabs.x0xd",
+            "ProgramArguments": [keg, "--name", "alice's node"],
+        });
+        let check = missing_daemon_check(&quoted_named, Some("alice's node"), &missing)
+            .expect("quoted named direct job");
+        assert!(
+            check
+                .detail
+                .contains("`x0x --name 'alice'\\''s node' autostart`"),
+            "{}",
+            check.detail
+        );
         let other = serde_json::json!({ "ProgramArguments": ["/usr/bin/true"] });
         assert!(missing_daemon_check(&other, None, &missing).is_none());
     }

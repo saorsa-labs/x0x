@@ -255,6 +255,29 @@ fn remove_bindings_except(data_root: &Path, keep: &[Option<&str>]) {
     }
 }
 
+/// Best effort: remove a participant's `upgrade-boot.json` when it is a
+/// regular file belonging to the replaced settled transaction
+/// `(tx_id, generation)`. Corrupt, foreign, or symlinked files are left
+/// intact so fail-closed startup checks still detect them.
+#[cfg(unix)]
+fn remove_settled_boot_record(root: &Path, tx_id: &str, generation: u64) {
+    let boot_path = root.join(journal::BOOT_FILE_NAME);
+    let Ok(meta) = std::fs::symlink_metadata(&boot_path) else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
+    let Ok(bytes) = journal::read_auxiliary_record(&boot_path) else {
+        return;
+    };
+    if let journal::RecordRead::Boot(boot) = journal::classify_record(&bytes, "boot") {
+        if boot.transaction_id == tx_id && boot.generation == generation {
+            let _ = std::fs::remove_file(&boot_path);
+        }
+    }
+}
+
 /// The stage lock of a data root: `<data_root>/upgrade-stage.lock`.
 pub(crate) const STAGE_LOCK_NAME: &str = "upgrade-stage.lock";
 
@@ -571,6 +594,7 @@ impl Prepared {
         let _stage = stage_lock(data_root)?;
         let path = data_root.join(journal::JOURNAL_FILE_NAME);
         let mut current = None;
+        let mut replaced_settled: Option<(String, u64, Vec<PathBuf>)> = None;
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -604,6 +628,14 @@ impl Prepared {
                             )));
                         }
                         current = Some(plan_binding::binding_file_name(&earlier.transaction_id));
+                        let roots = earlier
+                            .plan
+                            .participants
+                            .iter()
+                            .map(|p| p.data_root.clone())
+                            .collect();
+                        replaced_settled =
+                            Some((earlier.transaction_id, earlier.generation, roots));
                     }
                     journal::RecordRead::Journal(earlier) => {
                         return Err(refused(format!(
@@ -627,8 +659,24 @@ impl Prepared {
         clear_unusable_binding(&binding_path)?;
         write_binding(&binding_path, &binding)?;
         write_staged_journal(&path, &record)?;
-        // The new journal is durable: the current one's binding is history.
+        // The new journal is durable: the current one's binding and matching
+        // boot record are history. Removing any leftover boot record from a
+        // replaced settled transaction (for example after HostCommitted,
+        // Restored, or an older launcher that wrote Idle without removing it)
+        // prevents a later Superseded journal from failing blocks_apply().
+        // Cleaning other participants' roots without their `upgrade-stage.lock`
+        // is safe: `HostLock` serializes all same-pair work, `stage` refuses a
+        // different install pair, and matching `(earlier_tx, earlier_gen)`
+        // ensures no foreign transaction's boot record can be removed.
         remove_bindings_except(data_root, &[Some(name.as_str())]);
+        if let Some((earlier_tx, earlier_gen, earlier_roots)) = replaced_settled {
+            remove_settled_boot_record(data_root, &earlier_tx, earlier_gen);
+            for participant_root in earlier_roots {
+                if participant_root != data_root && check_root(&participant_root).is_ok() {
+                    remove_settled_boot_record(&participant_root, &earlier_tx, earlier_gen);
+                }
+            }
+        }
         Ok(Self { path, record })
     }
 
@@ -1281,6 +1329,139 @@ pub(crate) mod tests {
         settled.sequence += 1;
         journal::write_record(prepared.path(), &settled).unwrap();
         assert!(stage(&lock, &root, "tx-next", plan).is_ok());
+    }
+
+    #[test]
+    fn staging_over_settled_journal_removes_only_matching_boot_record() {
+        let (_dir, root) = root();
+        let peer_valid = root.join("peer-valid");
+        let peer_loose = root.join("peer-loose");
+        std::fs::create_dir(&peer_valid).unwrap();
+        std::fs::create_dir(&peer_loose).unwrap();
+        std::fs::set_permissions(&peer_valid, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&peer_loose, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        let mut input = input_in(&root);
+        let mut p2 = input.participants[0].clone();
+        p2.instance_id = "peer-valid".into();
+        p2.data_root = peer_valid.clone();
+        p2.identity_root = peer_valid.clone();
+        let mut p3 = input.participants[0].clone();
+        p3.instance_id = "peer-loose".into();
+        p3.data_root = peer_loose.clone();
+        p3.identity_root = peer_loose.clone();
+        input.participants.push(p2);
+        input.participants.push(p3);
+
+        let prepared = prepared_in(&root, input);
+        let plan = prepared.record().plan.clone();
+        let lock = HostLock::acquire(&plan).unwrap();
+
+        let mk_boot = |tx: &str, generation: u64| journal::BootRecord {
+            schema_version: 1,
+            record_kind: "boot".into(),
+            transaction_id: tx.into(),
+            generation,
+            instance_id: "alice".into(),
+            attempt: 1,
+            pid: 100,
+            process_start: 1,
+            boot_id: "boot-a".into(),
+            started_at_ns: 1,
+            deadline_ns: 2,
+        };
+
+        // 1. Replacing an Idle journal removes matching boot records in both
+        //    the primary root and valid participant roots, while skipping
+        //    participant roots that fail check_root. A subsequent Superseded
+        //    journal then does not block apply.
+        let mut settled = prepared.record().clone();
+        settled.phase = Phase::Idle;
+        settled.sequence += 1;
+        journal::write_record(prepared.path(), &settled).unwrap();
+        let boot_path = root.join(journal::BOOT_FILE_NAME);
+        let peer_valid_boot = peer_valid.join(journal::BOOT_FILE_NAME);
+        let peer_loose_boot = peer_loose.join(journal::BOOT_FILE_NAME);
+        let matching = mk_boot(&settled.transaction_id, settled.generation);
+        journal::write_record(&boot_path, &matching).unwrap();
+        journal::write_record(&peer_valid_boot, &matching).unwrap();
+        journal::write_record(&peer_loose_boot, &matching).unwrap();
+
+        let next = stage(&lock, &root, "tx-next", plan.clone()).unwrap();
+        assert!(!boot_path.exists());
+        assert!(!peer_valid_boot.exists());
+        assert!(
+            peer_loose_boot.exists(),
+            "participant root failing check_root must not be modified"
+        );
+        let mut superseded = next.record().clone();
+        superseded.phase = Phase::Superseded;
+        superseded.sequence += 1;
+        journal::write_record(next.path(), &superseded).unwrap();
+        assert!(
+            !journal::read_boot_records(&root).blocks_apply(),
+            "superseded journal after cleaned prior boot record must not block apply"
+        );
+
+        // 2. HostCommitted and Restored settled journals also clean matching boot records.
+        for (idx, phase) in [Phase::HostCommitted, Phase::Restored]
+            .into_iter()
+            .enumerate()
+        {
+            let cur = stage(&lock, &root, &format!("tx-phase-{idx}"), plan.clone()).unwrap();
+            let mut s = cur.record().clone();
+            s.phase = phase;
+            s.sequence += 1;
+            journal::write_record(cur.path(), &s).unwrap();
+            journal::write_record(&boot_path, &mk_boot(&s.transaction_id, s.generation)).unwrap();
+            let replaced = stage(&lock, &root, &format!("tx-after-{idx}"), plan.clone()).unwrap();
+            assert!(
+                !boot_path.exists(),
+                "phase {phase:?} must clean matching boot record"
+            );
+            let mut done = replaced.record().clone();
+            done.phase = Phase::Idle;
+            done.sequence += 1;
+            journal::write_record(replaced.path(), &done).unwrap();
+        }
+
+        // 3. Same transaction_id with mismatched generation is preserved.
+        let cur = stage(&lock, &root, "tx-gen", plan.clone()).unwrap();
+        let mut s = cur.record().clone();
+        s.phase = Phase::Idle;
+        s.sequence += 1;
+        journal::write_record(cur.path(), &s).unwrap();
+        journal::write_record(&boot_path, &mk_boot(&s.transaction_id, s.generation + 1)).unwrap();
+        let cur = stage(&lock, &root, "tx-gen-next", plan.clone()).unwrap();
+        assert!(boot_path.exists(), "mismatched generation must stay intact");
+        std::fs::remove_file(&boot_path).unwrap();
+
+        // 4. Corrupt boot record is preserved.
+        let mut s = cur.record().clone();
+        s.phase = Phase::Idle;
+        s.sequence += 1;
+        journal::write_record(cur.path(), &s).unwrap();
+        std::fs::write(&boot_path, b"not json").unwrap();
+        let cur = stage(&lock, &root, "tx-corrupt-next", plan.clone()).unwrap();
+        assert!(boot_path.exists(), "corrupt boot record must stay intact");
+        std::fs::remove_file(&boot_path).unwrap();
+
+        // 5. Symlinked boot record and its target are preserved.
+        let mut s = cur.record().clone();
+        s.phase = Phase::Idle;
+        s.sequence += 1;
+        journal::write_record(cur.path(), &s).unwrap();
+        let target = root.join("outside-boot.json");
+        journal::write_record(&target, &mk_boot(&s.transaction_id, s.generation)).unwrap();
+        std::os::unix::fs::symlink(&target, &boot_path).unwrap();
+        let _last = stage(&lock, &root, "tx-symlink-next", plan).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&boot_path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "symlinked boot record must stay intact"
+        );
+        assert!(target.exists(), "symlink target must never be removed");
     }
 
     /// #2065 review: two concurrent runs. The second waits for the host

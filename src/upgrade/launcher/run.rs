@@ -320,27 +320,69 @@ pub(super) fn retire(host: &recovery::Host, path: &Path, trial: &mut Trial) -> i
     })
 }
 
-/// Under the host lock with the journal HostCommitted: write `Idle` when
-/// every participant's trial record of this transaction is Committed. A
-/// trial that is missing, of another transaction or not yet Committed
-/// leaves the journal HostCommitted; that participant's own retire settles
-/// it later. The write is the journal's atomic replace (file and directory
-/// synced); a crash before it leaves HostCommitted, which the next retire
-/// on any participant's start settles.
+/// Under the host lock with the journal HostCommitted: remove each
+/// participant's matching `upgrade-boot.json` and write `Idle` when every
+/// running participant's trial record of this transaction is Committed
+/// (skipping participants with `!was_running`, matching `commit::host_commit`).
+/// Removing the boot record before writing `Idle` ensures a crash or failed
+/// unlink leaves the journal `HostCommitted`, so the next start retries
+/// `retire` instead of stranding a stale boot record across a later
+/// `Superseded` transaction. A running participant's trial that is missing,
+/// of another transaction or not yet Committed leaves the journal
+/// HostCommitted; that participant's own retire settles it later.
 fn settle_idle(
     host: &recovery::Host,
     record: &mut journal::JournalRecord,
     binding: &Binding,
 ) -> io::Result<()> {
     for participant in &host.plan().participants {
+        if !participant.was_running {
+            continue;
+        }
         let path = coordinator::trial_path(participant);
         match Trial::load(&path, binding, &participant.instance_id) {
             Ok(trial) if trial.phase == Phase::Committed => {}
             _ => return Ok(()),
         }
     }
+    for participant in &host.plan().participants {
+        remove_matching_boot_record(
+            &participant.data_root,
+            &record.transaction_id,
+            record.generation,
+        )?;
+    }
     record.phase = journal::Phase::Idle;
     host.save_settled(record)
+}
+
+/// Remove `upgrade-boot.json` in `root` when it is a regular file belonging
+/// to `(tx_id, generation)`. Missing, symlinked, corrupt, or foreign-tx files
+/// are left intact so fail-closed startup checks continue to detect anomalies;
+/// an unlink I/O error propagates so `settle_idle` retries on the next start.
+fn remove_matching_boot_record(root: &Path, tx_id: &str, generation: u64) -> io::Result<()> {
+    let boot_path = root.join(journal::BOOT_FILE_NAME);
+    let meta = match std::fs::symlink_metadata(&boot_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !meta.is_file() {
+        return Ok(());
+    }
+    let Ok(bytes) = journal::read_auxiliary_record(&boot_path) else {
+        return Ok(());
+    };
+    if let journal::RecordRead::Boot(boot) = journal::classify_record(&bytes, "boot") {
+        if boot.transaction_id == tx_id && boot.generation == generation {
+            match std::fs::remove_file(&boot_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// ADR 0094 S4: never overlap a surviving process of an earlier start.
